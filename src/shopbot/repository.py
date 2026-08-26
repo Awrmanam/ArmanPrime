@@ -14,15 +14,18 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .db import (
     AuditRow,
+    ButtonRow,
     CategoryRow,
     ConfigRow,
     ConsentRow,
     CustomerCardRow,
     DeliveryRow,
+    EmojiRow,
     KYCRow,
     MerchantCardRow,
     OrderRow,
     OutboxRow,
+    PageRow,
     PaymentRow,
     ProductRow,
     QuoteRow,
@@ -155,6 +158,33 @@ class ShopRepository:
             .order_by(TermsRow.version.desc())
             .limit(1)
         )
+
+    async def has_current_consent(self, telegram_id: int, session: AsyncSession) -> bool:
+        user = await self.user(telegram_id, session)
+        terms = await self.current_terms(session)
+        if not terms:
+            return False
+        return bool(
+            await session.scalar(
+                select(ConsentRow.id).where(
+                    ConsentRow.user_id == user.id, ConsentRow.terms_id == terms.id
+                )
+            )
+        )
+
+    async def customer_orders(self, telegram_id: int) -> list[OrderRow]:
+        async with self.sessions.begin() as session:
+            user = await self.user(telegram_id, session)
+            return list(
+                (
+                    await session.scalars(
+                        select(OrderRow)
+                        .where(OrderRow.user_id == user.id)
+                        .order_by(OrderRow.created_at.desc())
+                        .limit(20)
+                    )
+                ).all()
+            )
 
     async def publish_terms(self, actor: int, title: str, body: str) -> TermsRow:
         self.owner(actor)
@@ -382,6 +412,198 @@ class ShopRepository:
                 session.add(ConfigRow(key="pricing.global", value=config, updated_at=self.now()))
             await self.audit(session, actor, "pricing.update", "global")
 
+    async def create_category(
+        self,
+        actor: int,
+        title: str,
+        description: str | None,
+        position: int,
+        custom_emoji_id: str | None = None,
+    ) -> CategoryRow:
+        self.owner(actor)
+        if not title.strip() or position < 0:
+            raise InvalidState("INVALID_CATEGORY")
+        async with self.sessions.begin() as session:
+            row = CategoryRow(
+                title=title.strip(),
+                description=description or None,
+                active=True,
+                position=position,
+                custom_emoji_id=custom_emoji_id or None,
+            )
+            session.add(row)
+            await self.audit(session, actor, "category.create", str(row.id))
+            return row
+
+    async def update_category(self, actor: int, category_id: UUID, **changes) -> CategoryRow:
+        self.owner(actor)
+        allowed = {"title", "description", "active", "position", "custom_emoji_id"}
+        if set(changes) - allowed:
+            raise InvalidState("INVALID_CATEGORY_FIELDS")
+        async with self.sessions.begin() as session:
+            row = await session.get(CategoryRow, category_id, with_for_update=True)
+            if not row:
+                raise InvalidState("CATEGORY_NOT_FOUND")
+            for key, value in changes.items():
+                setattr(row, key, value)
+            await self.audit(session, actor, "category.update", str(row.id))
+            return row
+
+    async def create_product(self, actor: int, category_id: UUID, values: dict) -> ProductRow:
+        self.owner(actor)
+        title = str(values.get("title", "")).strip()
+        base_usd = decimal_value(values.get("base_price_usd", "0"))
+        stock = int(values.get("stock", 0))
+        if not title or base_usd < 0 or stock < 0:
+            raise InvalidState("INVALID_PRODUCT")
+        async with self.sessions.begin() as session:
+            if not await session.get(CategoryRow, category_id):
+                raise InvalidState("CATEGORY_NOT_FOUND")
+            row = ProductRow(
+                category_id=category_id,
+                title=title,
+                description=str(values.get("description", "")),
+                base_price_usd=base_usd,
+                fixed_price_toman=(
+                    int(values["fixed_price_toman"]) if values.get("fixed_price_toman") else None
+                ),
+                duration=values.get("duration"),
+                plan_type=values.get("plan_type"),
+                activation_method=values.get("activation_method"),
+                warranty_text=values.get("warranty_text"),
+                warranty_days=int(values.get("warranty_days", 0)),
+                delivery_minutes=int(values.get("delivery_minutes", 0)),
+                stock=stock,
+                reserved=0,
+                unlimited_stock=bool(values.get("unlimited_stock", False)),
+                requires_kyc=bool(values.get("requires_kyc", True)),
+                active=True,
+                position=int(values.get("position", 0)),
+                custom_emoji_id=values.get("custom_emoji_id"),
+                pricing_override=values.get("pricing_override"),
+            )
+            session.add(row)
+            await self.audit(session, actor, "product.create", str(row.id))
+            return row
+
+    async def update_product(self, actor: int, product_id: UUID, changes: dict) -> ProductRow:
+        self.owner(actor)
+        allowed = {
+            "title",
+            "description",
+            "base_price_usd",
+            "fixed_price_toman",
+            "duration",
+            "plan_type",
+            "activation_method",
+            "warranty_text",
+            "warranty_days",
+            "delivery_minutes",
+            "stock",
+            "unlimited_stock",
+            "requires_kyc",
+            "active",
+            "position",
+            "custom_emoji_id",
+            "pricing_override",
+        }
+        if set(changes) - allowed:
+            raise InvalidState("INVALID_PRODUCT_FIELDS")
+        async with self.sessions.begin() as session:
+            row = await session.get(ProductRow, product_id, with_for_update=True)
+            if not row:
+                raise InvalidState("PRODUCT_NOT_FOUND")
+            for key, value in changes.items():
+                setattr(row, key, decimal_value(value) if key == "base_price_usd" else value)
+            await self.audit(session, actor, "product.update", str(row.id))
+            return row
+
+    async def create_merchant_card(
+        self, actor: int, bank: str, holder: str, pan: str, priority: int, daily_limit: int
+    ) -> MerchantCardRow:
+        self.owner(actor)
+        digits = "".join(item for item in pan if item.isdigit())
+        if len(digits) != 16 or priority < 0 or daily_limit < 0:
+            raise InvalidState("INVALID_MERCHANT_CARD")
+        async with self.sessions.begin() as session:
+            row = MerchantCardRow(
+                bank_name=bank.strip(),
+                holder_name=holder.strip(),
+                encrypted_pan=self.vault.encrypt(digits),
+                masked_pan=mask_pan(digits),
+                priority=priority,
+                daily_limit=daily_limit,
+                active=True,
+            )
+            session.add(row)
+            await self.audit(session, actor, "merchant_card.create", str(row.id), row.masked_pan)
+            return row
+
+    async def update_merchant_card(
+        self, actor: int, card_id: UUID, *, active: bool, priority: int, daily_limit: int
+    ) -> MerchantCardRow:
+        self.owner(actor)
+        if priority < 0 or daily_limit < 0:
+            raise InvalidState("INVALID_MERCHANT_CARD")
+        async with self.sessions.begin() as session:
+            row = await session.get(MerchantCardRow, card_id, with_for_update=True)
+            if not row:
+                raise InvalidState("MERCHANT_CARD_NOT_FOUND")
+            row.active, row.priority, row.daily_limit = active, priority, daily_limit
+            await self.audit(session, actor, "merchant_card.update", str(row.id), row.masked_pan)
+            return row
+
+    async def upsert_page(self, actor: int, slug: str, content: str) -> PageRow:
+        self.owner(actor)
+        async with self.sessions.begin() as session:
+            row = await session.scalar(select(PageRow).where(PageRow.slug == slug))
+            if row:
+                row.text = content
+            else:
+                row = PageRow(slug=slug, text=content)
+                session.add(row)
+            await self.audit(session, actor, "page.upsert", slug)
+            return row
+
+    async def create_page_button(
+        self,
+        actor: int,
+        page_id: UUID,
+        text_value: str,
+        action: str,
+        row: int,
+        position: int,
+        style: str,
+        custom_emoji_id: str | None = None,
+    ) -> ButtonRow:
+        self.owner(actor)
+        if style not in {"default", "primary", "success", "danger"}:
+            raise InvalidState("INVALID_BUTTON_STYLE")
+        async with self.sessions.begin() as session:
+            button = ButtonRow(
+                page_id=page_id,
+                text=text_value,
+                action=action,
+                row=row,
+                position=position,
+                style=style,
+                custom_emoji_id=custom_emoji_id,
+                active=True,
+            )
+            session.add(button)
+            await self.audit(session, actor, "button.create", str(button.id))
+            return button
+
+    async def register_emoji(self, actor: int, name: str, custom_emoji_id: str) -> EmojiRow:
+        self.owner(actor)
+        if not custom_emoji_id.isdigit() or not name.strip():
+            raise InvalidState("INVALID_CUSTOM_EMOJI")
+        async with self.sessions.begin() as session:
+            row = EmojiRow(name=name.strip(), custom_emoji_id=custom_emoji_id, active=True)
+            session.add(row)
+            await self.audit(session, actor, "emoji.register", str(row.id))
+            return row
+
     async def submit_customer_card(
         self, telegram_id: int, bank: str, pan: str, evidence_file_id: str
     ) -> CustomerCardRow:
@@ -509,12 +731,41 @@ class ShopRepository:
                 )
                 if existing:
                     return existing
+                today = self.now().replace(hour=0, minute=0, second=0, microsecond=0)
+                merchants = list(
+                    (
+                        await session.scalars(
+                            select(MerchantCardRow)
+                            .where(MerchantCardRow.active.is_(True))
+                            .order_by(MerchantCardRow.priority)
+                            .with_for_update()
+                        )
+                    ).all()
+                )
+                merchant = None
+                for candidate in merchants:
+                    allocated = await session.scalar(
+                        select(func.coalesce(func.sum(OrderRow.amount_toman), 0)).where(
+                            OrderRow.merchant_card_id == candidate.id,
+                            OrderRow.created_at >= today,
+                        )
+                    )
+                    if (
+                        candidate.daily_limit == 0
+                        or allocated + quote.final_toman <= candidate.daily_limit
+                    ):
+                        merchant = candidate
+                        break
+                if not merchant:
+                    raise InvalidState("DESTINATION_LIMIT_REACHED")
                 quote.final_check_confirmed = True
                 order = OrderRow(
                     user_id=user.id,
                     quote_id=quote.id,
                     amount_toman=quote.final_toman,
                     status="AWAITING_PAYMENT",
+                    merchant_card_id=merchant.id,
+                    created_at=self.now(),
                 )
                 session.add(order)
                 await session.flush()
@@ -535,42 +786,45 @@ class ShopRepository:
                 or order.status != "AWAITING_PAYMENT"
             ):
                 raise AccessDenied("DESTINATION_FORBIDDEN")
-            merchant = await session.scalar(
-                select(MerchantCardRow)
-                .where(MerchantCardRow.active.is_(True))
-                .order_by(MerchantCardRow.priority)
-                .limit(1)
-            )
+            merchant = await session.get(MerchantCardRow, order.merchant_card_id)
             if not merchant:
                 raise InvalidState("DESTINATION_UNAVAILABLE")
             return self.vault.decrypt(merchant.encrypted_pan), merchant.holder_name
 
     async def requote(self, telegram_id: int, quote_id: UUID) -> QuoteRow:
-        async with self.sessions.begin() as session:
-            user = await self.user(telegram_id, session)
-            old = await session.scalar(
-                select(QuoteRow).where(QuoteRow.id == quote_id).with_for_update()
-            )
-            if not old or old.user_id != user.id or self.now() < old.expires_at:
-                raise AccessDenied("REQUOTE_FORBIDDEN")
-            old.status = "EXPIRED"
-            reservation = await session.scalar(
-                select(ReservationRow).where(
-                    ReservationRow.quote_id == old.id, ReservationRow.released_at.is_(None)
+        async with self.coordinator.lock(f"requote:{quote_id}"):
+            async with self.sessions.begin() as session:
+                user = await self.user(telegram_id, session)
+                old = await session.scalar(
+                    select(QuoteRow).where(QuoteRow.id == quote_id).with_for_update()
                 )
-            )
-            if reservation:
-                reservation.released_at = self.now()
-                product = await session.get(ProductRow, old.product_id, with_for_update=True)
-                if not product.unlimited_stock:
-                    product.reserved = max(0, product.reserved - reservation.quantity)
-            product_id, card_id, version = old.product_id, old.selected_card_id, old.version + 1
-        fresh = await self.create_quote(telegram_id, product_id, card_id)
-        async with self.sessions.begin() as session:
-            locked = await session.get(QuoteRow, fresh.id, with_for_update=True)
-            locked.version = version
-        fresh.version = version
-        return fresh
+                if not old or old.user_id != user.id or self.now() < old.expires_at:
+                    raise AccessDenied("REQUOTE_FORBIDDEN")
+                successor = await session.scalar(
+                    select(QuoteRow).where(QuoteRow.predecessor_quote_id == old.id)
+                )
+                if successor:
+                    return successor
+                old.status = "EXPIRED"
+                reservation = await session.scalar(
+                    select(ReservationRow).where(
+                        ReservationRow.quote_id == old.id,
+                        ReservationRow.released_at.is_(None),
+                    )
+                )
+                if reservation:
+                    reservation.released_at = self.now()
+                    product = await session.get(ProductRow, old.product_id, with_for_update=True)
+                    if not product.unlimited_stock:
+                        product.reserved = max(0, product.reserved - reservation.quantity)
+                product_id, card_id = old.product_id, old.selected_card_id
+                version = old.version + 1
+            fresh = await self.create_quote(telegram_id, product_id, card_id)
+            async with self.sessions.begin() as session:
+                locked = await session.get(QuoteRow, fresh.id, with_for_update=True)
+                locked.version, locked.predecessor_quote_id = version, quote_id
+            fresh.version, fresh.predecessor_quote_id = version, quote_id
+            return fresh
 
     async def submit_receipt(
         self, telegram_id: int, order_id: UUID, file_id: str, unique_id: str, file_type: str

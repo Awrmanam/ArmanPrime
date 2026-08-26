@@ -32,6 +32,23 @@ def markup(rows: list[list[Button]]) -> InlineKeyboardMarkup:
 def persistent_router(repo: ShopRepository) -> Router:
     router = Router(name="persistent-commerce")
 
+    async def home(message: Message, actor_id: int) -> None:
+        actions = {}
+        for action in ("catalog", "account", "begin_kyc", "begin_card", "my_orders"):
+            actions[action] = await repo.coordinator.issue_callback(action, actor_id)
+        await message.answer(
+            "صفحه اصلی",
+            reply_markup=markup(
+                [
+                    [Button("فروشگاه", actions["catalog"], "primary")],
+                    [Button("حساب کاربری", actions["account"])],
+                    [Button("احراز هویت", actions["begin_kyc"])],
+                    [Button("کارت‌های بانکی", actions["begin_card"])],
+                    [Button("سفارش‌های من", actions["my_orders"])],
+                ]
+            ),
+        )
+
     @router.message(Command("start"))
     async def start(message: Message) -> None:
         if not await repo.coordinator.rate_limit("start", message.from_user.id, 10, 60):
@@ -40,8 +57,12 @@ def persistent_router(repo: ShopRepository) -> Router:
         async with repo.sessions.begin() as session:
             await repo.user(message.from_user.id, session)
             terms = await repo.current_terms(session)
+            accepted = terms and await repo.has_current_consent(message.from_user.id, session)
         if not terms:
             await message.answer("فروشگاه هنوز راه‌اندازی نشده است.")
+            return
+        if accepted:
+            await home(message, message.from_user.id)
             return
         token = await repo.coordinator.issue_callback(
             "consent",
@@ -61,11 +82,7 @@ def persistent_router(repo: ShopRepository) -> Router:
             state = await repo.coordinator.resolve_callback(query.data, query.from_user.id)
             if state["a"] == "consent":
                 await repo.accept_terms(query.from_user.id, UUID(state["o"]))
-                home_token = await repo.coordinator.issue_callback("catalog", query.from_user.id)
-                await query.message.answer(
-                    "پذیرش قوانین ثبت شد.",
-                    reply_markup=markup([[Button("مشاهده محصولات", home_token, "primary")]]),
-                )
+                await home(query.message, query.from_user.id)
             elif state["a"] == "catalog":
                 rows = []
                 for category in await repo.categories():
@@ -78,6 +95,30 @@ def persistent_router(repo: ShopRepository) -> Router:
                 await query.message.answer(
                     "دسته‌بندی‌ها" if rows else "دسته فعالی وجود ندارد.",
                     reply_markup=markup(rows) if rows else None,
+                )
+            elif state["a"] == "account":
+                async with repo.sessions.begin() as session:
+                    user = await repo.user(query.from_user.id, session)
+                cards = await repo.verified_cards(query.from_user.id)
+                await query.message.answer(
+                    f"وضعیت KYC: {user.kyc_status}\nکارت‌های تأییدشده: {len(cards)}"
+                )
+            elif state["a"] == "my_orders":
+                orders = await repo.customer_orders(query.from_user.id)
+                text_value = (
+                    "\n".join(
+                        f"{item.id} | {item.status} | {item.amount_toman} تومان" for item in orders
+                    )
+                    or "سفارشی وجود ندارد."
+                )
+                await query.message.answer(text_value)
+            elif state["a"] in {"begin_kyc", "begin_card"}:
+                target = "kyc.document" if state["a"] == "begin_kyc" else "card.bank"
+                await repo.coordinator.redis.set(f"fsm:{query.from_user.id}", target, ex=900)
+                await query.message.answer(
+                    "تصویر یا فایل مدرک هویتی را ارسال کنید."
+                    if target == "kyc.document"
+                    else "نام بانک را ارسال کنید."
                 )
             elif state["a"] == "category":
                 rows = []
@@ -130,7 +171,19 @@ def persistent_router(repo: ShopRepository) -> Router:
                     reply_markup=markup([[Button("تأیید و ادامه", final, "success")]]),
                 )
             elif state["a"] == "final":
-                order = await repo.final_check(query.from_user.id, UUID(state["o"]))
+                quote_id = UUID(state["o"])
+                try:
+                    order = await repo.final_check(query.from_user.id, quote_id)
+                except AccessDenied:
+                    requote = await repo.coordinator.issue_callback(
+                        "requote", query.from_user.id, str(quote_id), one_time=True
+                    )
+                    await query.message.answer(
+                        "اعتبار قیمت تمام شده است.",
+                        reply_markup=markup([[Button("محاسبه قیمت جدید", requote, "primary")]]),
+                    )
+                    await query.answer()
+                    return
                 pan, holder = await repo.reveal_destination(query.from_user.id, order.id)
                 await repo.coordinator.redis.set(
                     f"receipt-order:{query.from_user.id}", str(order.id), ex=1800
@@ -138,6 +191,16 @@ def persistent_router(repo: ShopRepository) -> Router:
                 await query.message.answer(
                     f"کارت مقصد: {pan}\nصاحب کارت: {holder}\nمبلغ: {order.amount_toman} تومان\n"
                     "اکنون تصویر یا فایل رسید را ارسال کنید. رسید به‌تنهایی اثبات پرداخت نیست."
+                )
+            elif state["a"] == "requote":
+                quote = await repo.requote(query.from_user.id, UUID(state["o"]))
+                final = await repo.coordinator.issue_callback(
+                    "final", query.from_user.id, str(quote.id), quote.version, one_time=True
+                )
+                await query.message.answer(
+                    f"چک نهایی جدید\n{quote.snapshot['title']}\n"
+                    f"مبلغ: {quote.final_toman} تومان\nاعتبار: ۳۰ دقیقه",
+                    reply_markup=markup([[Button("تأیید و ادامه", final, "success")]]),
                 )
             elif state["a"] in {"admin.kyc", "admin.cards", "admin.orders", "admin.audit"}:
                 repo.owner(query.from_user.id)
@@ -185,18 +248,41 @@ def persistent_router(repo: ShopRepository) -> Router:
                                 caption=f"Order ID: {item.id}\nوضعیت: {item.status}\n"
                                 "رسید به‌تنهایی اثبات پرداخت نیست.",
                             )
-                        approve = await repo.coordinator.issue_callback(
-                            "admin.payment.approve", query.from_user.id, str(item.id), one_time=True
-                        )
-                        reject = await repo.coordinator.issue_callback(
-                            "admin.payment.reject", query.from_user.id, str(item.id), one_time=True
-                        )
-                        rows.extend(
-                            [
-                                [Button(f"تأیید پرداخت {item.id}", approve, "success")],
-                                [Button("رد پرداخت", reject, "danger")],
-                            ]
-                        )
+                        if item.status in {"AWAITING_RECONCILIATION", "MANUAL_REVIEW"}:
+                            approve = await repo.coordinator.issue_callback(
+                                "admin.payment.approve",
+                                query.from_user.id,
+                                str(item.id),
+                                one_time=True,
+                            )
+                            reject = await repo.coordinator.issue_callback(
+                                "admin.payment.reject",
+                                query.from_user.id,
+                                str(item.id),
+                                one_time=True,
+                            )
+                            rows.extend(
+                                [
+                                    [Button(f"تأیید پرداخت {item.id}", approve, "success")],
+                                    [Button("رد پرداخت", reject, "danger")],
+                                ]
+                            )
+                        elif item.status == "READY_FOR_FULFILLMENT":
+                            claim = await repo.coordinator.issue_callback(
+                                "admin.order.claim", query.from_user.id, str(item.id), one_time=True
+                            )
+                            rows.append([Button(f"Claim {item.id}", claim, "primary")])
+                        elif (
+                            item.status == "PROCESSING"
+                            and item.assigned_admin_id == query.from_user.id
+                        ):
+                            deliver = await repo.coordinator.issue_callback(
+                                "admin.order.deliver",
+                                query.from_user.id,
+                                str(item.id),
+                                one_time=True,
+                            )
+                            rows.append([Button(f"ثبت تحویل {item.id}", deliver, "success")])
                 else:
                     events = await repo.audit_events(query.from_user.id)
                     text = (
@@ -217,6 +303,31 @@ def persistent_router(repo: ShopRepository) -> Router:
                     f"fsm:{query.from_user.id}", "admin.terms.title", ex=900
                 )
                 await query.message.answer("عنوان نسخه جدید قوانین را ارسال کنید.")
+            elif state["a"] in {
+                "admin.rate",
+                "admin.pricing",
+                "admin.category",
+                "admin.product",
+                "admin.merchant",
+                "admin.page",
+            }:
+                repo.owner(query.from_user.id)
+                await repo.coordinator.redis.set(f"fsm:{query.from_user.id}", state["a"], ex=900)
+                prompts = {
+                    "admin.rate": "نرخ صحیح USD/Toman را ارسال کنید.",
+                    "admin.pricing": (
+                        "تنظیم قیمت را به‌ترتیب mode|markup|target_margin|platform_fee|"
+                        "payment_fee|warranty_reserve|fixed_cost ارسال کنید."
+                    ),
+                    "admin.category": "عنوان|توضیح|ترتیب را ارسال کنید.",
+                    "admin.product": (
+                        "category_id|عنوان|توضیح|USD|مدت|پلن|فعال‌سازی|گارانتی|"
+                        "روز گارانتی|دقیقه تحویل|موجودی|unlimited را ارسال کنید."
+                    ),
+                    "admin.merchant": "بانک|صاحب کارت|PAN|اولویت|سقف روزانه را ارسال کنید.",
+                    "admin.page": "slug|متن صفحه را ارسال کنید.",
+                }
+                await query.message.answer(prompts[state["a"]])
             elif state["a"].startswith(("admin.kyc.", "admin.card.", "admin.payment.")):
                 repo.owner(query.from_user.id)
                 await repo.coordinator.redis.set(
@@ -225,6 +336,16 @@ def persistent_router(repo: ShopRepository) -> Router:
                     ex=900,
                 )
                 await query.message.answer("دلیل تصمیم دستی را ارسال کنید.")
+            elif state["a"] == "admin.order.claim":
+                repo.owner(query.from_user.id)
+                await repo.claim(query.from_user.id, UUID(state["o"]))
+                await query.message.answer("سفارش به شما Assign و وارد PROCESSING شد.")
+            elif state["a"] == "admin.order.deliver":
+                repo.owner(query.from_user.id)
+                await repo.coordinator.redis.set(
+                    f"fsm:{query.from_user.id}", f"admin.delivery:{state['o']}", ex=900
+                )
+                await query.message.answer("متن تحویل|لینک اختیاری را ارسال کنید.")
             await query.answer()
         except Exception:
             log.exception("callback rejected", extra={"telegram_id": query.from_user.id})
@@ -238,7 +359,20 @@ def persistent_router(repo: ShopRepository) -> Router:
             await message.answer("دسترسی مجاز نیست.")
             return
         actions = []
-        for action in ("terms", "kyc", "cards", "orders", "audit", "close"):
+        for action in (
+            "terms",
+            "rate",
+            "pricing",
+            "category",
+            "product",
+            "merchant",
+            "kyc",
+            "cards",
+            "orders",
+            "page",
+            "audit",
+            "close",
+        ):
             actions.append(
                 await repo.coordinator.issue_callback(
                     f"admin.{action}", message.from_user.id, one_time=False
@@ -249,11 +383,14 @@ def persistent_router(repo: ShopRepository) -> Router:
             reply_markup=markup(
                 [
                     [Button("قوانین", actions[0], "primary")],
-                    [Button("احراز هویت", actions[1], "default")],
-                    [Button("کارت‌ها", actions[2], "default")],
-                    [Button("سفارش‌ها", actions[3], "success")],
-                    [Button("Audit", actions[4], "default")],
-                    [Button("بازگشت", actions[5], "danger")],
+                    [Button("نرخ دلار", actions[1]), Button("قیمت‌گذاری", actions[2])],
+                    [Button("دسته", actions[3]), Button("محصول", actions[4])],
+                    [Button("کارت مقصد", actions[5])],
+                    [Button("احراز هویت", actions[6]), Button("کارت‌ها", actions[7])],
+                    [Button("سفارش‌ها", actions[8], "success")],
+                    [Button("صفحه‌ها", actions[9])],
+                    [Button("Audit", actions[10])],
+                    [Button("بازگشت", actions[11], "danger")],
                 ]
             ),
         )
@@ -266,6 +403,26 @@ def persistent_router(repo: ShopRepository) -> Router:
         await repo.coordinator.redis.set(f"fsm:{message.from_user.id}", "kyc.document", ex=900)
         await message.answer("تصویر یا فایل مدرک هویتی را ارسال کنید.")
 
+    @router.message(Command("admin_emoji"))
+    async def admin_emoji(message: Message) -> None:
+        try:
+            repo.owner(message.from_user.id)
+            parts = message.text.split(maxsplit=1)
+            source = message.reply_to_message
+            entities = list((source.entities if source else None) or [])
+            identifiers = [
+                entity.custom_emoji_id
+                for entity in entities
+                if entity.type == "custom_emoji" and entity.custom_emoji_id
+            ]
+            if len(parts) != 2 or not identifiers:
+                raise ValueError("NAME_AND_CUSTOM_EMOJI_REQUIRED")
+            emoji = await repo.register_emoji(message.from_user.id, parts[1], identifiers[0])
+            await message.answer(f"Premium Emoji ثبت شد: {emoji.name}")
+        except Exception:
+            log.exception("emoji registration failed")
+            await message.answer("فرمان را در پاسخ به پیام دارای Custom Emoji ارسال کنید.")
+
     @router.message(Command("card"))
     async def begin_card(message: Message) -> None:
         if not await repo.coordinator.rate_limit("card", message.from_user.id, 3, 3600):
@@ -277,7 +434,20 @@ def persistent_router(repo: ShopRepository) -> Router:
     @router.message(F.text)
     async def form_text(message: Message) -> None:
         state = await repo.coordinator.redis.get(f"fsm:{message.from_user.id}")
-        if state == "admin.terms.title":
+        if state and state.startswith("admin.delivery:"):
+            try:
+                repo.owner(message.from_user.id)
+                order_id = UUID(state.split(":", 1)[1])
+                content, *link = [item.strip() for item in message.text.split("|", 1)]
+                await repo.deliver(
+                    message.from_user.id, order_id, content, link[0] if link and link[0] else None
+                )
+                await repo.coordinator.redis.delete(f"fsm:{message.from_user.id}")
+                await message.answer("تحویل ثبت و اعلان مشتری در Outbox قرار گرفت.")
+            except Exception:
+                log.exception("delivery failed", extra={"telegram_id": message.from_user.id})
+                await message.answer("ثبت تحویل انجام نشد.")
+        elif state == "admin.terms.title":
             try:
                 repo.owner(message.from_user.id)
                 await repo.coordinator.redis.set(
@@ -303,6 +473,76 @@ def persistent_router(repo: ShopRepository) -> Router:
             except Exception:
                 log.exception("terms publication failed")
                 await message.answer("انتشار قوانین انجام نشد.")
+        elif state in {
+            "admin.rate",
+            "admin.pricing",
+            "admin.category",
+            "admin.product",
+            "admin.merchant",
+            "admin.page",
+        }:
+            try:
+                repo.owner(message.from_user.id)
+                values = [item.strip() for item in message.text.split("|")]
+                if state == "admin.rate":
+                    await repo.set_rate(message.from_user.id, int(values[0]))
+                elif state == "admin.pricing":
+                    if len(values) != 7:
+                        raise ValueError("FIELDS_REQUIRED")
+                    await repo.set_pricing(
+                        message.from_user.id,
+                        {
+                            "mode": values[0],
+                            "markup": values[1],
+                            "target_margin": values[2],
+                            "platform_fee": values[3],
+                            "payment_fee": values[4],
+                            "warranty_reserve": values[5],
+                            "fixed_cost_toman": int(values[6]),
+                        },
+                    )
+                elif state == "admin.category":
+                    title, description, position = values
+                    await repo.create_category(
+                        message.from_user.id, title, description, int(position)
+                    )
+                elif state == "admin.product":
+                    if len(values) != 12:
+                        raise ValueError("FIELDS_REQUIRED")
+                    await repo.create_product(
+                        message.from_user.id,
+                        UUID(values[0]),
+                        {
+                            "title": values[1],
+                            "description": values[2],
+                            "base_price_usd": values[3],
+                            "duration": values[4],
+                            "plan_type": values[5],
+                            "activation_method": values[6],
+                            "warranty_text": values[7],
+                            "warranty_days": int(values[8]),
+                            "delivery_minutes": int(values[9]),
+                            "stock": int(values[10]),
+                            "unlimited_stock": values[11].lower() == "true",
+                        },
+                    )
+                elif state == "admin.merchant":
+                    bank, holder, pan, priority, limit = values
+                    await repo.create_merchant_card(
+                        message.from_user.id, bank, holder, pan, int(priority), int(limit)
+                    )
+                    with contextlib.suppress(Exception):
+                        await message.delete()
+                elif state == "admin.page":
+                    slug, content = values
+                    await repo.upsert_page(message.from_user.id, slug, content)
+                await repo.coordinator.redis.delete(f"fsm:{message.from_user.id}")
+                await message.answer("تنظیم با موفقیت ثبت شد.")
+            except Exception:
+                log.exception(
+                    "admin configuration failed", extra={"telegram_id": message.from_user.id}
+                )
+                await message.answer("ورودی معتبر نیست؛ فرم را دوباره آغاز کنید.")
         elif state and state.startswith("admin."):
             try:
                 repo.owner(message.from_user.id)

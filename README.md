@@ -93,6 +93,11 @@ Redis و Outbox پایدار استفاده می‌کند؛ `ApplicationStore` �
 بدون Provider رسمی، Strong Card Match و `allowed_card` غیرفعال‌اند، کارت‌به‌کارت فقط Manual
 Reconciliation است و تصویر رسید هرگز اثبات پرداخت محسوب نمی‌شود.
 
+در MVP فعلی، `file_id` و `file_unique_id` تلگرام مرجع اصلی مدارک KYC، مالکیت کارت و رسید
+هستند. دانلود و آرشیو محلی رمزنگاری‌شده هنوز فعال نشده است و نباید ادعا شود. مرز
+`EvidenceStorage` برای افزودن Storage رمزنگاری‌شده محلی یا S3-compatible در آینده تعریف شده؛
+هیچ مدرکی زیر Web Root عمومی نوشته نمی‌شود و محتوای فایل وارد Log یا Audit نمی‌گردد.
+
 Polling هم‌زمان Health server را روی پورت 8080 اجرا می‌کند. Webhook فقط روی مسیر ثابت
 `/telegram/webhook`، با بررسی Header محرمانه Telegram، Update را به Dispatcher می‌دهد. Readiness
 واقعاً PostgreSQL و Redis را Probe می‌کند و در قطع وابستگی‌ها HTTP 503 برمی‌گرداند.

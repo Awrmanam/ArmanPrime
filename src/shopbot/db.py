@@ -194,6 +194,9 @@ class QuoteRow(Base):
     status: Mapped[str] = mapped_column(String(16), default="ACTIVE")
     version: Mapped[int] = mapped_column(Integer, default=1)
     final_check_confirmed: Mapped[bool] = mapped_column(Boolean, default=False)
+    predecessor_quote_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("price_quotes.id"), unique=True
+    )
 
 
 class ReservationRow(Base):
@@ -214,6 +217,8 @@ class OrderRow(Base):
     status: Mapped[str] = mapped_column(String(32), index=True)
     assigned_admin_id: Mapped[int | None] = mapped_column(BigInteger)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    merchant_card_id: Mapped[UUID] = mapped_column(ForeignKey("merchant_cards.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
 class PaymentRow(Base):

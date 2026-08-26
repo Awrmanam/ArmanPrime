@@ -1,3 +1,4 @@
+import asyncio
 import os
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -5,7 +6,8 @@ from decimal import Decimal
 import pytest
 from cryptography.fernet import Fernet
 from redis.asyncio import Redis
-from sqlalchemy import text
+from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 
 from shopbot.db import (
     CategoryRow,
@@ -129,6 +131,10 @@ async def test_gates_requote_reservation_and_duplicate_receipt(repository):
     quote = await repository.create_quote(200, product.id, card.id)
     order = await repository.final_check(200, quote.id)
     await repository.submit_receipt(200, order.id, "receipt", "duplicate", "photo")
+    second_quote = await repository.create_quote(200, product.id, card.id)
+    second_order = await repository.final_check(200, second_quote.id)
+    with pytest.raises(IntegrityError):
+        await repository.submit_receipt(200, second_order.id, "receipt-2", "duplicate", "document")
     async with repository.sessions.begin() as session:
         locked = await session.get(QuoteRow, quote.id, with_for_update=True)
         locked.expires_at = datetime.now(UTC) - timedelta(seconds=1)
@@ -146,6 +152,52 @@ async def test_claim_is_atomic(repository):
     order = await repository.final_check(200, quote.id)
     await repository.submit_receipt(200, order.id, "receipt", "claim-receipt", "photo")
     await repository.manual_reconcile(100, order.id, True, "manual statement match")
-    assert await repository.claim(100, order.id)
-    with pytest.raises(InvalidState, match="ALREADY_CLAIMED"):
-        await repository.claim(100, order.id)
+    results = await asyncio.gather(
+        repository.claim(100, order.id),
+        repository.claim(100, order.id),
+        return_exceptions=True,
+    )
+    assert sum(result is True for result in results) == 1
+    assert sum(isinstance(result, InvalidState) for result in results) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_requote_is_idempotent_and_allocation_is_fixed(repository):
+    product, card = await configure_checkout(repository)
+    quote = await repository.create_quote(200, product.id, card.id)
+    order = await repository.final_check(200, quote.id)
+    first_pan, _ = await repository.reveal_destination(200, order.id)
+    async with repository.sessions.begin() as session:
+        merchant_id = (await session.get(OrderRow, order.id)).merchant_card_id
+        merchant = await session.get(MerchantCardRow, merchant_id, with_for_update=True)
+        merchant.active = False
+        session.add(
+            MerchantCardRow(
+                bank_name="Other",
+                holder_name="Other",
+                encrypted_pan=repository.vault.encrypt("4000000000000002"),
+                masked_pan="**** 0002",
+                priority=0,
+                daily_limit=0,
+            )
+        )
+    second_pan, _ = await repository.reveal_destination(200, order.id)
+    assert first_pan == second_pan
+    async with repository.sessions.begin() as session:
+        locked = await session.get(QuoteRow, quote.id, with_for_update=True)
+        locked.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    await repository.set_rate(100, 61_000)
+    first, second = await asyncio.gather(
+        repository.requote(200, quote.id), repository.requote(200, quote.id)
+    )
+    assert first.id == second.id and first.version == 2
+    async with repository.sessions() as session:
+        persisted_product = await session.get(ProductRow, product.id)
+        successors = list(
+            (
+                await session.scalars(
+                    select(QuoteRow).where(QuoteRow.predecessor_quote_id == quote.id)
+                )
+            ).all()
+        )
+        assert len(successors) == 1 and persisted_product.reserved == 1
