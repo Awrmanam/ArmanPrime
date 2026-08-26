@@ -245,6 +245,8 @@ class OutboxRow(Base):
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    dead_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class AuditRow(Base):

@@ -86,25 +86,58 @@ class Product:
 
 @dataclass(frozen=True)
 class PricingRule:
-    platform_fee_percent: Decimal = Decimal(0)
-    payment_fee_percent: Decimal = Decimal(0)
+    platform_fee_percent: Decimal = Decimal("0")
+    payment_fee_percent: Decimal = Decimal("0")
     fixed_cost_toman: int = 0
-    warranty_reserve_percent: Decimal = Decimal(0)
+    warranty_reserve_percent: Decimal = Decimal("0")
     markup_percent: Decimal | None = None
     target_margin_percent: Decimal | None = None
+    fixed_price_toman: int | None = None
 
 
-def calculate_price(base_usd: Decimal, rate: int, rule: PricingRule) -> int:
-    converted = base_usd * rate
-    percent = rule.platform_fee_percent + rule.payment_fee_percent + rule.warranty_reserve_percent
-    landed = converted + converted * percent / 100 + rule.fixed_cost_toman
-    if rule.target_margin_percent is not None:
-        if rule.target_margin_percent >= 100:
-            raise ValueError("target margin must be below 100")
-        result = landed / (1 - rule.target_margin_percent / 100)
-    else:
-        result = landed * (1 + (rule.markup_percent or 0) / 100)
-    return int(result.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+def decimal_value(value: Decimal | int | str) -> Decimal:
+    """Normalize external numerics without ever constructing Decimal from a float."""
+    if isinstance(value, float):
+        raise TypeError("float values are not accepted; normalize from their source string")
+    return value if isinstance(value, Decimal) else Decimal(str(value))
+
+
+def calculate_price(base_usd: Decimal | int | str, rate: int, rule: PricingRule) -> int:
+    one, hundred = Decimal("1"), Decimal("100")
+    if rule.fixed_price_toman is not None:
+        if rule.fixed_price_toman < 0:
+            raise ValueError("fixed price cannot be negative")
+        return int(rule.fixed_price_toman)
+    base = decimal_value(base_usd)
+    if base < 0 or rate <= 0 or rule.fixed_cost_toman < 0:
+        raise ValueError("base price, rate, and fixed costs must be valid")
+    fees = tuple(
+        decimal_value(item)
+        for item in (
+            rule.platform_fee_percent,
+            rule.payment_fee_percent,
+            rule.warranty_reserve_percent,
+        )
+    )
+    markup = decimal_value(rule.markup_percent or Decimal("0"))
+    margin = (
+        decimal_value(rule.target_margin_percent)
+        if rule.target_margin_percent is not None
+        else None
+    )
+    if any(item < 0 or item >= hundred for item in fees) or markup < 0:
+        raise ValueError("fees, reserve, and markup percentages must be non-negative")
+    if margin is not None and not Decimal("0") <= margin < hundred:
+        raise ValueError("target margin must satisfy 0 <= margin < 100")
+    converted = base * decimal_value(rate)
+    landed = converted + converted * sum(fees, Decimal("0")) / hundred
+    landed += decimal_value(rule.fixed_cost_toman)
+    result = (
+        landed / (one - margin / hundred)
+        if margin is not None
+        else landed * (one + markup / hundred)
+    )
+    return int(result.quantize(one, rounding=ROUND_HALF_UP))
 
 
 @dataclass

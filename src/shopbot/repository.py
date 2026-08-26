@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
+import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
-from decimal import ROUND_HALF_UP, Decimal
 from hashlib import sha256
 from uuid import UUID
 
@@ -13,8 +14,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .db import (
     AuditRow,
+    CategoryRow,
+    ConfigRow,
     ConsentRow,
     CustomerCardRow,
+    DeliveryRow,
+    KYCRow,
+    MerchantCardRow,
     OrderRow,
     OutboxRow,
     PaymentRow,
@@ -25,6 +31,7 @@ from .db import (
     TermsRow,
     UserRow,
 )
+from .domain import PricingRule, calculate_price, decimal_value
 from .security import Vault, mask_pan, pan_fingerprint
 
 
@@ -49,6 +56,50 @@ class RedisCoordinator:
 
     async def consume_callback(self, token_hash: str, ttl: int = 1800) -> bool:
         return bool(await self.redis.set(f"cb:{token_hash}", "1", ex=ttl, nx=True))
+
+    async def issue_callback(
+        self,
+        action: str,
+        actor_id: int,
+        object_id: str = "",
+        version: int = 1,
+        *,
+        one_time: bool = False,
+        ttl: int = 1800,
+    ) -> str:
+        opaque = secrets.token_urlsafe(12)
+        token = f"c1.{opaque}"
+        state = json.dumps(
+            {
+                "a": action,
+                "u": actor_id,
+                "o": object_id,
+                "v": version,
+                "once": one_time,
+            },
+            separators=(",", ":"),
+        )
+        await self.redis.set(f"callback:{opaque}", state, ex=ttl)
+        if len(token.encode()) > 64:
+            raise AssertionError("callback_data exceeds Telegram limit")
+        return token
+
+    async def resolve_callback(self, token: str, actor_id: int) -> dict:
+        if not token.startswith("c1.") or len(token.encode()) > 64:
+            raise AccessDenied("CALLBACK_INVALID")
+        opaque = token[3:]
+        key = f"callback:{opaque}"
+        raw = await self.redis.get(key)
+        if not raw:
+            raise AccessDenied("CALLBACK_EXPIRED")
+        state = json.loads(raw)
+        if state["u"] != actor_id:
+            raise AccessDenied("CALLBACK_OWNER_REQUIRED")
+        if state["once"]:
+            deleted = await self.redis.delete(key)
+            if deleted != 1:
+                raise AccessDenied("CALLBACK_REPLAYED")
+        return state
 
     @asynccontextmanager
     async def lock(self, name: str, timeout: int = 15) -> AsyncIterator[None]:
@@ -131,6 +182,206 @@ class ShopRepository:
             session.add(ConsentRow(user_id=user.id, terms_id=terms_id, accepted_at=self.now()))
             await self.audit(session, telegram_id, "terms.accept", str(terms_id))
 
+    async def categories(self) -> list[CategoryRow]:
+        async with self.sessions() as session:
+            return list(
+                (
+                    await session.scalars(
+                        select(CategoryRow)
+                        .where(CategoryRow.active.is_(True))
+                        .order_by(CategoryRow.position, CategoryRow.title)
+                    )
+                ).all()
+            )
+
+    async def products(self, category_id: UUID) -> list[ProductRow]:
+        async with self.sessions() as session:
+            return list(
+                (
+                    await session.scalars(
+                        select(ProductRow)
+                        .where(ProductRow.category_id == category_id, ProductRow.active.is_(True))
+                        .order_by(ProductRow.position, ProductRow.title)
+                    )
+                ).all()
+            )
+
+    async def product(self, product_id: UUID) -> ProductRow | None:
+        async with self.sessions() as session:
+            return await session.scalar(
+                select(ProductRow).where(ProductRow.id == product_id, ProductRow.active.is_(True))
+            )
+
+    async def verified_cards(self, telegram_id: int) -> list[CustomerCardRow]:
+        async with self.sessions.begin() as session:
+            user = await self.user(telegram_id, session)
+            return list(
+                (
+                    await session.scalars(
+                        select(CustomerCardRow)
+                        .where(
+                            CustomerCardRow.user_id == user.id, CustomerCardRow.status == "VERIFIED"
+                        )
+                        .order_by(CustomerCardRow.verified_at)
+                    )
+                ).all()
+            )
+
+    async def submit_kyc(
+        self, telegram_id: int, file_id: str, unique_id: str, file_type: str
+    ) -> KYCRow:
+        async with self.sessions.begin() as session:
+            user = await self.user(telegram_id, session)
+            user.kyc_status = "PENDING"
+            row = KYCRow(
+                user_id=user.id,
+                status="PENDING",
+                file_id=file_id,
+                file_unique_id=unique_id,
+                file_type=file_type,
+                evidence_level="FORMAT_VALID",
+                created_at=self.now(),
+            )
+            session.add(row)
+            await self.audit(session, telegram_id, "kyc.submit", str(row.id))
+            return row
+
+    async def review_kyc(
+        self, actor: int, submission_id: UUID, approved: bool, reason: str
+    ) -> None:
+        self.owner(actor)
+        async with self.sessions.begin() as session:
+            row = await session.scalar(
+                select(KYCRow).where(KYCRow.id == submission_id).with_for_update()
+            )
+            if not row or not reason.strip():
+                raise InvalidState("KYC_AND_REASON_REQUIRED")
+            user = await session.get(UserRow, row.user_id, with_for_update=True)
+            row.status = user.kyc_status = "VERIFIED" if approved else "REJECTED"
+            row.evidence_level = "MANUALLY_REVIEWED"
+            row.reviewer_id, row.reason, row.reviewed_at = actor, reason, self.now()
+            await self.audit(
+                session, actor, "kyc.manual_review", str(row.id), f"decision={row.status}"
+            )
+
+    async def review_card(self, actor: int, card_id: UUID, approved: bool, reason: str) -> None:
+        self.owner(actor)
+        if not reason.strip():
+            raise InvalidState("REASON_REQUIRED")
+        async with self.sessions.begin() as session:
+            card = await session.scalar(
+                select(CustomerCardRow).where(CustomerCardRow.id == card_id).with_for_update()
+            )
+            if not card:
+                raise InvalidState("CARD_NOT_FOUND")
+            card.status = "VERIFIED" if approved else "REJECTED"
+            card.verified_by, card.verified_at = actor, self.now() if approved else None
+            await self.audit(
+                session,
+                actor,
+                "customer_card.manual_review",
+                str(card.id),
+                f"decision={card.status}",
+            )
+
+    async def kyc_queue(self, actor: int) -> list[KYCRow]:
+        self.owner(actor)
+        async with self.sessions() as session:
+            return list(
+                (
+                    await session.scalars(
+                        select(KYCRow)
+                        .where(KYCRow.status.in_(("PENDING", "UNDER_REVIEW")))
+                        .order_by(KYCRow.created_at)
+                        .limit(50)
+                    )
+                ).all()
+            )
+
+    async def card_queue(self, actor: int) -> list[CustomerCardRow]:
+        self.owner(actor)
+        async with self.sessions() as session:
+            return list(
+                (
+                    await session.scalars(
+                        select(CustomerCardRow)
+                        .where(CustomerCardRow.status == "PENDING_VERIFICATION")
+                        .limit(50)
+                    )
+                ).all()
+            )
+
+    async def order_queue(self, actor: int) -> list[OrderRow]:
+        self.owner(actor)
+        async with self.sessions() as session:
+            return list(
+                (
+                    await session.scalars(
+                        select(OrderRow)
+                        .where(
+                            OrderRow.status.in_(
+                                (
+                                    "AWAITING_RECONCILIATION",
+                                    "MANUAL_REVIEW",
+                                    "READY_FOR_FULFILLMENT",
+                                    "PROCESSING",
+                                )
+                            )
+                        )
+                        .limit(50)
+                    )
+                ).all()
+            )
+
+    async def payment_for_order(self, actor: int, order_id: UUID) -> PaymentRow | None:
+        self.owner(actor)
+        async with self.sessions() as session:
+            return await session.scalar(select(PaymentRow).where(PaymentRow.order_id == order_id))
+
+    async def audit_events(self, actor: int, limit: int = 30) -> list[AuditRow]:
+        self.owner(actor)
+        async with self.sessions() as session:
+            return list(
+                (
+                    await session.scalars(
+                        select(AuditRow).order_by(AuditRow.at.desc()).limit(min(limit, 100))
+                    )
+                ).all()
+            )
+
+    async def set_rate(self, actor: int, rate: int) -> RateRow:
+        self.owner(actor)
+        if rate <= 0:
+            raise InvalidState("INVALID_RATE")
+        async with self.sessions.begin() as session:
+            row = RateRow(usd_to_toman=rate, source="manual", created_at=self.now())
+            session.add(row)
+            await self.audit(session, actor, "currency.rate", "USD_TOMAN", str(rate))
+            return row
+
+    async def set_pricing(self, actor: int, config: dict) -> None:
+        self.owner(actor)
+        # Constructing a rule validates all externally supplied percentage strings.
+        rule = PricingRule(
+            platform_fee_percent=decimal_value(config.get("platform_fee", "0")),
+            payment_fee_percent=decimal_value(config.get("payment_fee", "0")),
+            warranty_reserve_percent=decimal_value(config.get("warranty_reserve", "0")),
+            markup_percent=decimal_value(config.get("markup", "0")),
+            target_margin_percent=(
+                decimal_value(config["target_margin"])
+                if config.get("mode") == "target_margin"
+                else None
+            ),
+        )
+        calculate_price("1", 1, rule)
+        async with self.sessions.begin() as session:
+            row = await session.get(ConfigRow, "pricing.global")
+            if row:
+                row.value, row.updated_at = config, self.now()
+            else:
+                session.add(ConfigRow(key="pricing.global", value=config, updated_at=self.now()))
+            await self.audit(session, actor, "pricing.update", "global")
+
     async def submit_customer_card(
         self, telegram_id: int, bank: str, pan: str, evidence_file_id: str
     ) -> CustomerCardRow:
@@ -186,18 +437,26 @@ class ShopRepository:
                 )
                 if not rate:
                     raise InvalidState("RATE_NOT_CONFIGURED")
-                config = {"markup": "0", "fees": "0", "warranty_reserve": "0"}
+                pricing = await session.get(ConfigRow, "pricing.global")
+                if not pricing:
+                    raise InvalidState("PRICING_NOT_CONFIGURED")
+                config = dict(pricing.value)
                 override = product.pricing_override or {}
                 config.update(override)
-                converted = product.base_price_usd * rate.usd_to_toman
-                percent = (
-                    Decimal(config["markup"])
-                    + Decimal(config["fees"])
-                    + Decimal(config["warranty_reserve"])
+                rule = PricingRule(
+                    platform_fee_percent=decimal_value(config.get("platform_fee", "0")),
+                    payment_fee_percent=decimal_value(config.get("payment_fee", "0")),
+                    fixed_cost_toman=int(config.get("fixed_cost_toman", 0)),
+                    warranty_reserve_percent=decimal_value(config.get("warranty_reserve", "0")),
+                    markup_percent=decimal_value(config.get("markup", "0")),
+                    target_margin_percent=(
+                        decimal_value(config["target_margin"])
+                        if config.get("mode") == "target_margin"
+                        else None
+                    ),
+                    fixed_price_toman=product.fixed_price_toman,
                 )
-                final = product.fixed_price_toman or int(
-                    (converted * (1 + percent / 100)).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
-                )
+                final = calculate_price(product.base_price_usd, rate.usd_to_toman, rule)
                 now = self.now()
                 quote = QuoteRow(
                     user_id=user.id,
@@ -261,6 +520,57 @@ class ShopRepository:
                 await session.flush()
                 session.add(PaymentRow(order_id=order.id, status="AWAITING_PAYMENT"))
                 return order
+
+    async def reveal_destination(self, telegram_id: int, order_id: UUID) -> tuple[str, str]:
+        async with self.sessions() as session:
+            user = await session.scalar(select(UserRow).where(UserRow.telegram_id == telegram_id))
+            order = await session.get(OrderRow, order_id)
+            if not user or not order or order.user_id != user.id:
+                raise AccessDenied("ORDER_OWNER_REQUIRED")
+            quote = await session.get(QuoteRow, order.quote_id)
+            if (
+                not quote.final_check_confirmed
+                or quote.status != "ACTIVE"
+                or self.now() >= quote.expires_at
+                or order.status != "AWAITING_PAYMENT"
+            ):
+                raise AccessDenied("DESTINATION_FORBIDDEN")
+            merchant = await session.scalar(
+                select(MerchantCardRow)
+                .where(MerchantCardRow.active.is_(True))
+                .order_by(MerchantCardRow.priority)
+                .limit(1)
+            )
+            if not merchant:
+                raise InvalidState("DESTINATION_UNAVAILABLE")
+            return self.vault.decrypt(merchant.encrypted_pan), merchant.holder_name
+
+    async def requote(self, telegram_id: int, quote_id: UUID) -> QuoteRow:
+        async with self.sessions.begin() as session:
+            user = await self.user(telegram_id, session)
+            old = await session.scalar(
+                select(QuoteRow).where(QuoteRow.id == quote_id).with_for_update()
+            )
+            if not old or old.user_id != user.id or self.now() < old.expires_at:
+                raise AccessDenied("REQUOTE_FORBIDDEN")
+            old.status = "EXPIRED"
+            reservation = await session.scalar(
+                select(ReservationRow).where(
+                    ReservationRow.quote_id == old.id, ReservationRow.released_at.is_(None)
+                )
+            )
+            if reservation:
+                reservation.released_at = self.now()
+                product = await session.get(ProductRow, old.product_id, with_for_update=True)
+                if not product.unlimited_stock:
+                    product.reserved = max(0, product.reserved - reservation.quantity)
+            product_id, card_id, version = old.product_id, old.selected_card_id, old.version + 1
+        fresh = await self.create_quote(telegram_id, product_id, card_id)
+        async with self.sessions.begin() as session:
+            locked = await session.get(QuoteRow, fresh.id, with_for_update=True)
+            locked.version = version
+        fresh.version = version
+        return fresh
 
     async def submit_receipt(
         self, telegram_id: int, order_id: UUID, file_id: str, unique_id: str, file_type: str
@@ -346,6 +656,42 @@ class ShopRepository:
                 raise InvalidState("ALREADY_CLAIMED")
             await self.audit(session, actor, "order.claim", str(order_id))
             return True
+
+    async def deliver(
+        self, actor: int, order_id: UUID, content: str, activation_link: str | None = None
+    ) -> None:
+        self.owner(actor)
+        if not content.strip():
+            raise InvalidState("DELIVERY_CONTENT_REQUIRED")
+        async with self.sessions.begin() as session:
+            order = await session.scalar(
+                select(OrderRow).where(OrderRow.id == order_id).with_for_update()
+            )
+            if not order or order.status != "PROCESSING" or order.assigned_admin_id != actor:
+                raise AccessDenied("CLAIMING_ADMIN_REQUIRED")
+            user = await session.get(UserRow, order.user_id)
+            session.add(
+                DeliveryRow(
+                    order_id=order.id,
+                    text=content,
+                    activation_link=activation_link,
+                    delivered_at=self.now(),
+                )
+            )
+            order.status = "DELIVERED"
+            session.add(
+                OutboxRow(
+                    kind="ORDER_DELIVERED",
+                    chat_id=user.telegram_id,
+                    payload={
+                        "order_id": str(order.id),
+                        "content": content,
+                        "activation_link": activation_link,
+                    },
+                    available_at=self.now(),
+                )
+            )
+            await self.audit(session, actor, "order.deliver", str(order.id))
 
     async def expire_quotes(self) -> int:
         async with self.sessions.begin() as session:
