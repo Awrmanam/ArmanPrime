@@ -6,8 +6,8 @@ if [[ -e .env ]]; then echo '.env already exists; refusing to overwrite' >&2; ex
 NON_INTERACTIVE=${INSTALL_NON_INTERACTIVE:-false}
 if [[ $NON_INTERACTIVE == true ]]; then
   : "${BOT_TOKEN:?BOT_TOKEN required}" "${ADMIN_ID:?ADMIN_ID required}" "${ORDER_CHAT:?ORDER_CHAT required}"
-  SUPPORT_USERNAME=${SUPPORT_USERNAME:-}; TIMEZONE=${TIMEZONE:-UTC}; RUN_MODE=${RUN_MODE:-webhook}
-  WEBHOOK_URL=${WEBHOOK_URL:-http://localhost:8080/test}; MONEY_UNIT=${MONEY_UNIT:-toman}
+  SUPPORT_USERNAME=${SUPPORT_USERNAME:-}; TIMEZONE=${TIMEZONE:-UTC}; RUN_MODE=${RUN_MODE:-polling}
+  WEBHOOK_URL=${WEBHOOK_URL:-}; MONEY_UNIT=${MONEY_UNIT:-toman}
   MANUAL_USD_RATE=${MANUAL_USD_RATE:-}; CURRENCY_PROVIDER=${CURRENCY_PROVIDER:-}
   MIN_MARGIN=${MIN_MARGIN:-0}; KYC_MODE=${KYC_MODE:-manual}; CARD_POLICY=${CARD_POLICY:-single}
   CARD_COOLDOWN=${CARD_COOLDOWN:-7}; STRONG_MATCH=${STRONG_MATCH:-manual_review}
@@ -50,8 +50,9 @@ read -rp 'Document retention days [90]: ' RETENTION; RETENTION=${RETENTION:-90}
 read -rp 'Required membership channel (optional): ' MEMBERSHIP_CHANNEL
 read -rp 'Brand name (optional): ' BRAND_NAME
 fi
-secret(){ python3 -c 'import secrets; print(secrets.token_urlsafe(48))'; }
-POSTGRES_PASSWORD=$(secret); ENCRYPTION_KEY=$(python3 -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())' 2>/dev/null || secret)
+secret(){ openssl rand -base64 48 | tr -d '\n'; }
+command -v openssl >/dev/null || { echo 'openssl is required' >&2; exit 1; }
+POSTGRES_PASSWORD=$(secret); ENCRYPTION_KEY=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '\n')
 umask 077
 cat >.env <<EOF
 BOT_TOKEN=$BOT_TOKEN
@@ -61,6 +62,7 @@ SUPPORT_USERNAME=$SUPPORT_USERNAME
 TIMEZONE=$TIMEZONE
 RUN_MODE=$RUN_MODE
 WEBHOOK_URL=$WEBHOOK_URL
+WEBHOOK_SECRET=$(secret)
 MONEY_UNIT=$MONEY_UNIT
 MANUAL_USD_RATE=$MANUAL_USD_RATE
 CURRENCY_PROVIDER=$CURRENCY_PROVIDER
@@ -89,6 +91,8 @@ docker compose build
 docker compose up -d db redis
 docker compose run --rm app alembic upgrade head
 docker compose up -d
-for _ in {1..30}; do curl -fsS http://127.0.0.1:8080/health/live >/dev/null && break; sleep 2; done
-curl -fsS http://127.0.0.1:8080/health/live >/dev/null
+for _ in {1..60}; do curl -fsS http://127.0.0.1:8080/health/ready >/dev/null && break; sleep 2; done
+if ! curl -fsS http://127.0.0.1:8080/health/ready >/dev/null; then
+  docker compose logs --tail=200 app >&2; exit 1
+fi
 echo 'Installation complete. Send /setup to the bot; no catalog, terms, price, or brand was seeded.'

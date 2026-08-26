@@ -285,6 +285,20 @@ class PaymentService:
         order.status = OrderStatus.READY_FOR_FULFILLMENT
         await self.notifications.fulfillment_ready(order)
 
+    async def manual_reconcile(
+        self, payment: Payment, order: Order, approved: bool, actor_id: int, reason: str
+    ) -> None:
+        """Manual evidence decision; deliberately separate from provider verification."""
+        if not actor_id or not reason.strip():
+            raise ForbiddenError("MANUAL_ACTOR_AND_REASON_REQUIRED")
+        if approved:
+            payment.status = PaymentStatus.VERIFIED
+            order.status = OrderStatus.READY_FOR_FULFILLMENT
+            await self.notifications.fulfillment_ready(order)
+        else:
+            payment.status = PaymentStatus.REJECTED
+            order.status = OrderStatus.MANUAL_REVIEW
+
     @staticmethod
     def claim(order: Order, admin_id: int, now: datetime) -> None:
         if order.status != OrderStatus.READY_FOR_FULFILLMENT or order.assigned_admin_id:

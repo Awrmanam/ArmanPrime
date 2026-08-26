@@ -1,36 +1,31 @@
 import asyncio
 
 import uvicorn
-from aiogram import Bot, Dispatcher
 
-from .bot import build_router
 from .config import settings
-from .security import CallbackSigner, Vault
-from .store import ApplicationStore
+from .runtime import create_app
 
 
 async def polling() -> None:
-    token = settings.bot_token.get_secret_value()
-    if not token:
-        raise RuntimeError("BOT_TOKEN is required")
-    bot = Bot(token)
-    encryption_key = settings.encryption_key.get_secret_value().encode()
-    callback_key = settings.callback_key.get_secret_value().encode()
-    if not encryption_key or not callback_key:
-        raise RuntimeError("ENCRYPTION_KEY and CALLBACK_KEY are required")
-    store = ApplicationStore(settings.admin_telegram_user_id, Vault({"v1": encryption_key}, "v1"))
-    dispatcher = Dispatcher()
-    dispatcher.include_router(build_router(store, CallbackSigner(callback_key)))
+    app = create_app(settings)
+    runtime = app.state.runtime
+    server = uvicorn.Server(
+        uvicorn.Config(app, host="0.0.0.0", port=8080, log_level="info")  # noqa: S104
+    )
+    health_task = asyncio.create_task(server.serve())
     try:
-        await dispatcher.start_polling(bot)
+        await runtime.bot.delete_webhook(drop_pending_updates=False)
+        await runtime.dispatcher.start_polling(runtime.bot)
     finally:
-        await bot.session.close()
+        server.should_exit = True
+        await health_task
 
 
 def run() -> None:
     if settings.run_mode == "webhook":
         uvicorn.run("shopbot.api:app", host="0.0.0.0", port=8080)  # noqa: S104
     else:
+        # Polling owns Telegram updates; a companion health server is started by Compose.
         asyncio.run(polling())
 
 

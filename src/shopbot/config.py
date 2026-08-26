@@ -12,9 +12,10 @@ class Settings(BaseSettings):
     encryption_key: SecretStr = SecretStr("")
     hmac_key: SecretStr = SecretStr("")
     callback_key: SecretStr = SecretStr("")
-    price_quote_ttl_minutes: int = Field(default=30, ge=1, le=1440)
+    price_quote_ttl_minutes: int = Field(default=30, ge=30, le=30)
     run_mode: str = "polling"
     webhook_url: str = ""
+    webhook_secret: SecretStr = SecretStr("")
     brand_name: str = ""
     feature_wallet: bool = False
     feature_referrals: bool = False

@@ -144,7 +144,7 @@ def build_router(store: ApplicationStore, signer: CallbackSigner) -> Router:
             "/admin_emoji NAME (در پاسخ به پیام دارای Custom Emoji)\n"
             "/admin_kyc TELEGRAM_ID | STATUS | دلیل\n/admin_cards\n"
             "/admin_card CARD_ID | STATUS\n/admin_merchant بانک | صاحب | PAN | PRIORITY | LIMIT\n"
-            "/admin_orders\n/admin_verify ORDER_ID | REFERENCE | match/mismatch\n"
+            "/admin_orders\n/admin_verify ORDER_ID | approve/reject | دلیل\n"
             "/admin_claim ORDER_ID\n/admin_deliver ORDER_ID | متن | لینک\n/admin_audit"
             "\nProvider: بدون Provider رسمی، کارت‌به‌کارت فقط Manual Reconciliation است؛ "
             "Strong Match و allowed_card غیرفعال‌اند و رسید اثبات پرداخت نیست."
@@ -302,10 +302,12 @@ def build_router(store: ApplicationStore, signer: CallbackSigner) -> Router:
     @router.message(Command("admin_verify"))
     async def admin_verify(message: Message, command: CommandObject) -> None:
         store.require_owner(message.from_user.id)
-        order_id, reference, match = args(command, 3)
+        order_id, decision, reason = args(command, 3)
         order = store.orders[UUID(order_id)]
         payment = store.payments[order.id]
-        await store.payment_service.verify(payment, order, reference, True, match == "match")
+        await store.payment_service.manual_reconcile(
+            payment, order, decision == "approve", message.from_user.id, reason
+        )
         await message.answer(f"نتیجه: {payment.status}")
 
     @router.message(Command("admin_claim"))
