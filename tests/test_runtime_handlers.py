@@ -1,0 +1,352 @@
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+from uuid import uuid4
+
+import pytest
+
+from shopbot.repository import AccessDenied
+from shopbot.runtime import persistent_router
+
+
+class RedisFake:
+    def __init__(self):
+        self.values = {}
+
+    async def set(self, key, value, **_):
+        self.values[key] = value
+        return True
+
+    async def get(self, key):
+        return self.values.get(key)
+
+    async def delete(self, *keys):
+        return sum(self.values.pop(key, None) is not None for key in keys)
+
+
+class CoordinatorFake:
+    def __init__(self):
+        self.redis = RedisFake()
+        self.state = {}
+        self.counter = 0
+
+    async def rate_limit(self, *_):
+        return True
+
+    async def issue_callback(self, action, actor, object_id="", version=1, **_):
+        self.counter += 1
+        token = f"c1.token{self.counter}"
+        self.state[token] = {"a": action, "u": actor, "o": object_id, "v": version}
+        assert len(token.encode()) <= 64
+        return token
+
+    async def resolve_callback(self, token, actor):
+        state = self.state[token]
+        if state["u"] != actor:
+            raise AccessDenied
+        return state
+
+
+class SessionsFake:
+    @asynccontextmanager
+    async def begin(self):
+        yield SimpleNamespace()
+
+
+class RepoFake:
+    def __init__(self):
+        self.coordinator = CoordinatorFake()
+        self.sessions = SessionsFake()
+        self.vault = SimpleNamespace(
+            encrypt=lambda value: f"enc:{value}", decrypt=lambda value: value.removeprefix("enc:")
+        )
+        self.terms = None
+        self.accepted = False
+        self.owner_id = 1
+
+    def owner(self, actor):
+        if actor != self.owner_id:
+            raise AccessDenied
+
+    async def user(self, actor, _session):
+        return SimpleNamespace(id=uuid4(), telegram_id=actor, kyc_status="VERIFIED")
+
+    async def current_terms(self, _session):
+        return self.terms
+
+    async def has_current_consent(self, *_):
+        return self.accepted
+
+    async def accept_terms(self, *_):
+        self.accepted = True
+
+    async def categories(self):
+        return [SimpleNamespace(id=uuid4(), title="Category", custom_emoji_id="123")]
+
+    async def products(self, category_id):
+        return [
+            SimpleNamespace(
+                id=uuid4(), category_id=category_id, title="Product", custom_emoji_id=None
+            )
+        ]
+
+    async def product(self, product_id):
+        return SimpleNamespace(
+            id=product_id,
+            title="Product",
+            description="Description",
+            duration="30 days",
+            plan_type="Plan",
+            activation_method="Link",
+            warranty_text="Warranty",
+            delivery_minutes=60,
+        )
+
+    async def verified_cards(self, _):
+        return [SimpleNamespace(id=uuid4(), bank_name="Bank", masked_pan="**** 1111")]
+
+    async def customer_orders(self, _):
+        return [SimpleNamespace(id=uuid4(), status="PROCESSING", amount_toman=100)]
+
+    async def create_quote(self, *_):
+        now = datetime.now(UTC)
+        return SimpleNamespace(
+            id=uuid4(),
+            version=1,
+            snapshot={"title": "Product"},
+            final_toman=100,
+            created_at=now,
+            expires_at=now + timedelta(minutes=30),
+        )
+
+    async def final_check(self, *_):
+        return SimpleNamespace(id=uuid4(), amount_toman=100)
+
+    async def reveal_destination(self, *_):
+        return "5555555555554444", "Holder"
+
+    async def requote(self, *_):
+        return await self.create_quote()
+
+    async def kyc_queue(self, _):
+        return [SimpleNamespace(id=uuid4())]
+
+    async def card_queue(self, _):
+        return [SimpleNamespace(id=uuid4(), bank_name="Bank", masked_pan="**** 1111")]
+
+    async def order_queue(self, _):
+        return [
+            SimpleNamespace(id=uuid4(), status="AWAITING_RECONCILIATION", assigned_admin_id=None)
+        ]
+
+    async def payment_for_order(self, *_):
+        return SimpleNamespace(receipt_file_id="receipt-file")
+
+    async def audit_events(self, _):
+        return [SimpleNamespace(at=datetime.now(UTC), action="test", target="safe")]
+
+    async def submit_kyc(self, *args):
+        return SimpleNamespace(id=uuid4())
+
+    async def submit_customer_card(self, _, bank, pan, __):
+        assert len(pan) == 16
+        return SimpleNamespace(bank_name=bank, masked_pan="**** " + pan[-4:])
+
+    async def submit_receipt(self, *_):
+        return SimpleNamespace(status="AWAITING_RECONCILIATION")
+
+    publish_terms = AsyncMock(return_value=SimpleNamespace(version=2))
+    set_rate = AsyncMock()
+    set_pricing = AsyncMock()
+    create_category = AsyncMock()
+    create_product = AsyncMock()
+    create_merchant_card = AsyncMock()
+    upsert_page = AsyncMock()
+    review_kyc = AsyncMock()
+    review_card = AsyncMock()
+    manual_reconcile = AsyncMock()
+    claim = AsyncMock(return_value=True)
+    deliver = AsyncMock()
+    register_emoji = AsyncMock(return_value=SimpleNamespace(name="premium"))
+
+
+class MessageFake:
+    def __init__(self, actor=2, text="", photo=None, document=None):
+        self.from_user = SimpleNamespace(id=actor)
+        self.text, self.photo, self.document = text, photo, document
+        self.reply_to_message = None
+        self.answers = []
+        self.deleted = False
+
+    async def answer(self, text, **kwargs):
+        self.answers.append((text, kwargs))
+        return self
+
+    async def answer_photo(self, file_id, **kwargs):
+        self.answers.append((file_id, kwargs))
+
+    async def delete(self):
+        self.deleted = True
+
+
+class QueryFake:
+    def __init__(self, token, message, actor=2):
+        self.data, self.message = token, message
+        self.from_user = SimpleNamespace(id=actor)
+        self.answers = []
+
+    async def answer(self, text=None, **kwargs):
+        self.answers.append((text, kwargs))
+
+
+def handler(router, observer, name):
+    return next(
+        item.callback
+        for item in getattr(router, observer).handlers
+        if item.callback.__name__ == name
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_terms_consent_and_home_screens():
+    repo = RepoFake()
+    router = persistent_router(repo)
+    start = handler(router, "message", "start")
+    message = MessageFake()
+    await start(message)
+    assert "راه‌اندازی" in message.answers[-1][0]
+    repo.terms = SimpleNamespace(id=uuid4(), version=1, title="Terms", pages=["Body"])
+    await start(message)
+    keyboard = message.answers[-1][1]["reply_markup"]
+    token = keyboard.inline_keyboard[0][0].callback_data
+    callback = handler(router, "callback_query", "callback")
+    await callback(QueryFake(token, message))
+    assert any("صفحه اصلی" in answer[0] for answer in message.answers)
+    await start(message)
+    assert message.answers[-1][0] == "صفحه اصلی"
+
+
+@pytest.mark.asyncio
+async def test_customer_callback_navigation_and_checkout():
+    repo, message = RepoFake(), MessageFake()
+    router = persistent_router(repo)
+    callback = handler(router, "callback_query", "callback")
+
+    async def dispatch(action, object_id=""):
+        token = await repo.coordinator.issue_callback(action, 2, object_id)
+        await callback(QueryFake(token, message))
+        return message.answers[-1]
+
+    catalog = await dispatch("catalog")
+    category_token = catalog[1]["reply_markup"].inline_keyboard[0][0].callback_data
+    await callback(QueryFake(category_token, message))
+    product_token = message.answers[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data
+    await callback(QueryFake(product_token, message))
+    buy_token = message.answers[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data
+    await callback(QueryFake(buy_token, message))
+    card_token = message.answers[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data
+    await callback(QueryFake(card_token, message))
+    final_token = message.answers[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data
+    await callback(QueryFake(final_token, message))
+    assert "کارت مقصد" in message.answers[-1][0]
+    await dispatch("account")
+    assert "VERIFIED" in message.answers[-1][0]
+    await dispatch("my_orders")
+    assert "PROCESSING" in message.answers[-1][0]
+    await dispatch("begin_kyc")
+    assert await repo.coordinator.redis.get("fsm:2") == "kyc.document"
+    await dispatch("begin_card")
+    assert await repo.coordinator.redis.get("fsm:2") == "card.bank"
+
+
+@pytest.mark.asyncio
+async def test_admin_rbac_menu_queues_and_decision_forms():
+    repo = RepoFake()
+    router = persistent_router(repo)
+    admin = handler(router, "message", "admin")
+    denied = MessageFake(actor=2)
+    await admin(denied)
+    assert "مجاز نیست" in denied.answers[-1][0]
+    owner = MessageFake(actor=1)
+    await admin(owner)
+    assert owner.answers[-1][1]["reply_markup"].inline_keyboard
+    callback = handler(router, "callback_query", "callback")
+    for action in (
+        "admin.kyc",
+        "admin.cards",
+        "admin.orders",
+        "admin.audit",
+        "admin.terms",
+        "admin.rate",
+        "admin.pricing",
+        "admin.category",
+        "admin.product",
+        "admin.merchant",
+        "admin.page",
+    ):
+        token = await repo.coordinator.issue_callback(action, 1)
+        await callback(QueryFake(token, owner, actor=1))
+    assert any("صف بررسی" in item[0] for item in owner.answers)
+    token = await repo.coordinator.issue_callback("admin.payment.approve", 1, str(uuid4()))
+    await callback(QueryFake(token, owner, actor=1))
+    assert "دلیل" in owner.answers[-1][0]
+
+
+@pytest.mark.asyncio
+async def test_user_and_admin_text_fsm_and_uploads():
+    repo = RepoFake()
+    router = persistent_router(repo)
+    form = handler(router, "message", "form_text")
+    upload = handler(router, "message", "uploaded_file")
+    message = MessageFake(text="Bank")
+    await repo.coordinator.redis.set("fsm:2", "card.bank")
+    await form(message)
+    message.text = "4111111111111111"
+    await form(message)
+    assert message.deleted
+    photo = SimpleNamespace(file_id="photo", file_unique_id="photo-unique")
+    message.photo, message.text = [photo], ""
+    await upload(message)
+    assert "**** 1111" in message.answers[-1][0]
+    await repo.coordinator.redis.set("fsm:2", "kyc.document")
+    message.photo = [SimpleNamespace(file_id="kyc", file_unique_id="kyc-unique")]
+    await upload(message)
+    await repo.coordinator.redis.set("receipt-order:2", str(uuid4()))
+    message.photo = [SimpleNamespace(file_id="receipt", file_unique_id="receipt-unique")]
+    await upload(message)
+    assert "اثبات پرداخت نیست" in message.answers[-1][0]
+
+
+@pytest.mark.asyncio
+async def test_admin_text_forms_claim_delivery_and_emoji():
+    repo, owner = RepoFake(), MessageFake(actor=1)
+    router = persistent_router(repo)
+    form = handler(router, "message", "form_text")
+    for state, value in (
+        ("admin.rate", "50000"),
+        ("admin.pricing", "markup|10|0|1|2|3|100"),
+        ("admin.category", "Title|Description|1"),
+        ("admin.product", f"{uuid4()}|Title|Description|10|30d|plan|link|warranty|7|60|1|false"),
+        ("admin.merchant", "Bank|Holder|5555555555554444|1|100000"),
+        ("admin.page", "home|Welcome"),
+    ):
+        await repo.coordinator.redis.set("fsm:1", state)
+        owner.text = value
+        await form(owner)
+        assert "موفقیت" in owner.answers[-1][0]
+    callback = handler(router, "callback_query", "callback")
+    token = await repo.coordinator.issue_callback("admin.order.claim", 1, str(uuid4()))
+    await callback(QueryFake(token, owner, actor=1))
+    token = await repo.coordinator.issue_callback("admin.order.deliver", 1, str(uuid4()))
+    await callback(QueryFake(token, owner, actor=1))
+    owner.text = "content|https://example.invalid"
+    await form(owner)
+    assert "تحویل" in owner.answers[-1][0]
+    emoji_handler = handler(router, "message", "admin_emoji")
+    owner.text = "/admin_emoji premium"
+    owner.reply_to_message = SimpleNamespace(
+        entities=[SimpleNamespace(type="custom_emoji", custom_emoji_id="123456")]
+    )
+    await emoji_handler(owner)
+    assert "Premium Emoji" in owner.answers[-1][0]

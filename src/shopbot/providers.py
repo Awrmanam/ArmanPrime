@@ -15,12 +15,14 @@ class PaymentCapabilities:
 class PaymentProvider(Protocol):
     capabilities: PaymentCapabilities
 
-    async def verify_server_to_server(self, reference: str, amount: int) -> bool: ...
+    async def verify_server_to_server(
+        self, reference: str, amount: int
+    ) -> bool: ...  # pragma: no cover
 
 
 class KYCProvider(Protocol):
-    async def verify(self, encrypted_submission_id: str) -> str: ...
+    async def verify(self, encrypted_submission_id: str) -> str: ...  # pragma: no cover
 
 
 class CurrencyProvider(Protocol):
-    async def usd_to_toman(self) -> tuple[int, str]: ...
+    async def usd_to_toman(self) -> tuple[int, str]: ...  # pragma: no cover

@@ -665,50 +665,56 @@ class Runtime:
 
         while True:
             try:
-                async with self.repo.sessions.begin() as session:
-                    row = await session.scalar(
-                        select(OutboxRow)
-                        .where(
-                            OutboxRow.sent_at.is_(None),
-                            OutboxRow.dead_at.is_(None),
-                            OutboxRow.available_at <= self.repo.now(),
-                        )
-                        .order_by(OutboxRow.available_at)
-                        .with_for_update(skip_locked=True)
-                        .limit(1)
-                    )
-                    if row:
-                        try:
-                            if row.payload.get("receipt_file_id"):
-                                await self.bot.send_photo(
-                                    row.chat_id,
-                                    row.payload["receipt_file_id"],
-                                    caption=f"{row.kind}\nOrder ID: {row.payload['order_id']}\n"
-                                    "رسید به‌تنهایی اثبات پرداخت نیست.",
-                                )
-                            else:
-                                body = f"{row.kind}\nOrder ID: {row.payload['order_id']}"
-                                if row.kind == "ORDER_DELIVERED":
-                                    body += f"\n\n{row.payload['content']}"
-                                    if row.payload.get("activation_link"):
-                                        body += f"\n{row.payload['activation_link']}"
-                                await self.bot.send_message(
-                                    row.chat_id,
-                                    body,
-                                )
-                            row.sent_at = self.repo.now()
-                        except Exception as exc:
-                            row.attempts += 1
-                            row.last_error = type(exc).__name__
-                            if row.attempts >= 8:
-                                row.dead_at = self.repo.now()
-                            else:
-                                delay = min(300, 2 ** min(row.attempts, 8))
-                                row.available_at = self.repo.now() + timedelta(seconds=delay)
+                await self.process_outbox_once(select, OutboxRow)
                 await self.repo.expire_quotes()
             except Exception:
                 log.exception("background worker iteration failed")
             await asyncio.sleep(2)
+
+    async def process_outbox_once(self, select_fn=None, row_type=None) -> bool:
+        if select_fn is None or row_type is None:
+            from sqlalchemy import select as select_fn
+
+            from .db import OutboxRow as row_type
+        async with self.repo.sessions.begin() as session:
+            row = await session.scalar(
+                select_fn(row_type)
+                .where(
+                    row_type.sent_at.is_(None),
+                    row_type.dead_at.is_(None),
+                    row_type.available_at <= self.repo.now(),
+                )
+                .order_by(row_type.available_at)
+                .with_for_update(skip_locked=True)
+                .limit(1)
+            )
+            if not row:
+                return False
+            try:
+                if row.payload.get("receipt_file_id"):
+                    await self.bot.send_photo(
+                        row.chat_id,
+                        row.payload["receipt_file_id"],
+                        caption=f"{row.kind}\nOrder ID: {row.payload['order_id']}\n"
+                        "رسید به‌تنهایی اثبات پرداخت نیست.",
+                    )
+                else:
+                    body = f"{row.kind}\nOrder ID: {row.payload['order_id']}"
+                    if row.kind == "ORDER_DELIVERED":
+                        body += f"\n\n{row.payload['content']}"
+                        if row.payload.get("activation_link"):
+                            body += f"\n{row.payload['activation_link']}"
+                    await self.bot.send_message(row.chat_id, body)
+                row.sent_at = self.repo.now()
+            except Exception as exc:
+                row.attempts += 1
+                row.last_error = type(exc).__name__
+                if row.attempts >= 8:
+                    row.dead_at = self.repo.now()
+                else:
+                    delay = min(300, 2 ** min(row.attempts, 8))
+                    row.available_at = self.repo.now() + timedelta(seconds=delay)
+            return True
 
     async def close(self) -> None:
         if self.worker:

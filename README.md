@@ -87,8 +87,8 @@ primary، success یا danger است.
 
 این نسخه تا زمانی که Workflow رسمی CI سبز نشده و Migration و Docker روی زیرساخت دارای Docker
 اجرا نشده‌اند **Production-ready نیست**. مسیر Runtime از `ShopRepository` تراکنشی، PostgreSQL،
-Redis و Outbox پایدار استفاده می‌کند؛ `ApplicationStore` فقط برای تست‌های واحد قدیمی باقی مانده
-و در `main.py` یا `runtime.py` وارد نمی‌شود. Migration دوم موجودیت‌های MVP و فیلدهای تجاری را
+Redis و Outbox پایدار استفاده می‌کند. پیاده‌سازی قدیمی `ApplicationStore` حذف شده و تنها مسیر
+تجاری برنامه `main.py → runtime.py → ShopRepository` است. Migration دوم موجودیت‌های MVP و فیلدهای تجاری را
 اضافه می‌کند. اجرای واقعی Migration در محیط فعلی به‌دلیل نبود Docker هنوز تأیید نشده است.
 بدون Provider رسمی، Strong Card Match و `allowed_card` غیرفعال‌اند، کارت‌به‌کارت فقط Manual
 Reconciliation است و تصویر رسید هرگز اثبات پرداخت محسوب نمی‌شود.
