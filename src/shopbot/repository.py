@@ -924,6 +924,21 @@ class ShopRepository:
             if not order or order.status != "PROCESSING" or order.assigned_admin_id != actor:
                 raise AccessDenied("CLAIMING_ADMIN_REQUIRED")
             user = await session.get(UserRow, order.user_id)
+            quote = await session.get(QuoteRow, order.quote_id)
+            reservation = await session.scalar(
+                select(ReservationRow).where(
+                    ReservationRow.quote_id == quote.id,
+                    ReservationRow.released_at.is_(None),
+                )
+            )
+            if reservation:
+                product = await session.get(
+                    ProductRow, reservation.product_id, with_for_update=True
+                )
+                if not product.unlimited_stock:
+                    product.stock -= reservation.quantity
+                    product.reserved = max(0, product.reserved - reservation.quantity)
+                reservation.released_at = self.now()
             session.add(
                 DeliveryRow(
                     order_id=order.id,

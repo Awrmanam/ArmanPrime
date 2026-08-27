@@ -350,12 +350,26 @@ async def test_rejection_missing_gates_expiration_and_delivery_guards(repository
     await repository.review_kyc(100, kyc.id, False, "invalid identity evidence")
     card = await repository.submit_customer_card(200, "Bank", "4000000000000002", "evidence")
     await repository.review_card(100, card.id, False, "ownership evidence rejected")
-    with pytest.raises(InvalidState):
-        await repository.deliver(100, uuid4(), "content")
-    with pytest.raises(InvalidState):
-        await repository.deliver(100, uuid4(), "")
-
     product, card = await configure_checkout(repository)
+
+    payable_quote = await repository.create_quote(200, product.id, card.id)
+    payable_order = await repository.final_check(200, payable_quote.id)
+    await repository.submit_receipt(
+        200, payable_order.id, "delivery-receipt", "delivery-receipt-unique", "photo"
+    )
+    await repository.manual_reconcile(100, payable_order.id, True, "manual bank statement review")
+    with pytest.raises(AccessDenied, match="CLAIMING_ADMIN_REQUIRED"):
+        await repository.deliver(100, payable_order.id, "content before claim")
+    with pytest.raises(InvalidState, match="DELIVERY_CONTENT_REQUIRED"):
+        await repository.deliver(100, payable_order.id, "")
+    await repository.claim(100, payable_order.id)
+    await repository.deliver(100, payable_order.id, "claimed delivery")
+    async with repository.sessions() as session:
+        delivered = await session.get(OrderRow, payable_order.id)
+        delivered_product = await session.get(ProductRow, product.id)
+        assert delivered.status == "DELIVERED" and delivered.assigned_admin_id == 100
+        assert delivered_product.stock == 1 and delivered_product.reserved == 0
+
     quote = await repository.create_quote(200, product.id, card.id)
     async with repository.sessions.begin() as session:
         locked = await session.get(QuoteRow, quote.id, with_for_update=True)
