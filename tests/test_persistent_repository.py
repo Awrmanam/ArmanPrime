@@ -315,21 +315,38 @@ async def test_owner_crud_validation_pages_buttons_emojis_and_audit(repository):
         100, product.id, {"active": False, "stock": 5, "base_price_usd": "11.5"}
     )
     assert not product.active and product.stock == 5
+    assert [item.id for item in await repository.owner_categories(100)] == [category.id]
+    assert [item.id for item in await repository.owner_products(100, category.id)] == [product.id]
+    archived = await repository.archive_category(100, category.id)
+    assert archived.active is False
     with pytest.raises(InvalidState):
         await repository.create_product(100, uuid4(), {"title": "x", "base_price_usd": "1"})
     merchant = await repository.create_merchant_card(
         100, "Bank", "Holder", "5555555555554444", 2, 100_000
     )
     merchant = await repository.update_merchant_card(
-        100, merchant.id, active=False, priority=1, daily_limit=200_000
+        100,
+        merchant.id,
+        active=False,
+        priority=1,
+        daily_limit=200_000,
+        bank_name="Updated Bank",
+        holder_name="Updated Holder",
     )
-    assert not merchant.active and merchant.daily_limit == 200_000
+    assert not merchant.active and merchant.bank_name == "Updated Bank"
+    assert [item.id for item in await repository.owner_merchant_cards(100)] == [merchant.id]
     page = await repository.upsert_page(100, "home", "Welcome")
     page = await repository.upsert_page(100, "home", "Updated")
     button = await repository.create_page_button(
         100, page.id, "Buy", "catalog", 0, 0, "primary", "123"
     )
     assert page.text == "Updated" and button.style == "primary"
+    button = await repository.update_page_button(
+        100, button.id, {"text": "Orders", "action": "my_orders", "style": "success"}
+    )
+    assert button.text == "Orders" and button.style == "success"
+    assert [item.id for item in await repository.pages(100)] == [page.id]
+    assert [item.id for item in await repository.page_buttons(100, page.id)] == [button.id]
     with pytest.raises(InvalidState):
         await repository.create_page_button(100, page.id, "X", "x", 0, 0, "purple")
     emoji = await repository.register_emoji(100, "premium", "123456")

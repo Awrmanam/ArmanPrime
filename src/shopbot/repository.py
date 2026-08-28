@@ -224,6 +224,42 @@ class ShopRepository:
                 ).all()
             )
 
+    async def owner_categories(self, actor: int) -> list[CategoryRow]:
+        self.owner(actor)
+        async with self.sessions() as session:
+            return list(
+                (
+                    await session.scalars(
+                        select(CategoryRow).order_by(CategoryRow.position, CategoryRow.title)
+                    )
+                ).all()
+            )
+
+    async def owner_products(self, actor: int, category_id: UUID | None = None) -> list[ProductRow]:
+        self.owner(actor)
+        async with self.sessions() as session:
+            statement = select(ProductRow)
+            if category_id:
+                statement = statement.where(ProductRow.category_id == category_id)
+            return list(
+                (
+                    await session.scalars(statement.order_by(ProductRow.position, ProductRow.title))
+                ).all()
+            )
+
+    async def owner_merchant_cards(self, actor: int) -> list[MerchantCardRow]:
+        self.owner(actor)
+        async with self.sessions() as session:
+            return list(
+                (
+                    await session.scalars(
+                        select(MerchantCardRow).order_by(
+                            MerchantCardRow.priority, MerchantCardRow.bank_name
+                        )
+                    )
+                ).all()
+            )
+
     async def products(self, category_id: UUID) -> list[ProductRow]:
         async with self.sessions() as session:
             return list(
@@ -440,6 +476,12 @@ class ShopRepository:
         allowed = {"title", "description", "active", "position", "custom_emoji_id"}
         if set(changes) - allowed:
             raise InvalidState("INVALID_CATEGORY_FIELDS")
+        if "title" in changes and not str(changes["title"]).strip():
+            raise InvalidState("INVALID_CATEGORY")
+        if "position" in changes and int(changes["position"]) < 0:
+            raise InvalidState("INVALID_CATEGORY")
+        if changes.get("custom_emoji_id") and not str(changes["custom_emoji_id"]).isdigit():
+            raise InvalidState("INVALID_CATEGORY")
         async with self.sessions.begin() as session:
             row = await session.get(CategoryRow, category_id, with_for_update=True)
             if not row:
@@ -447,6 +489,23 @@ class ShopRepository:
             for key, value in changes.items():
                 setattr(row, key, value)
             await self.audit(session, actor, "category.update", str(row.id))
+            return row
+
+    async def archive_category(self, actor: int, category_id: UUID) -> CategoryRow:
+        self.owner(actor)
+        async with self.sessions.begin() as session:
+            row = await session.get(CategoryRow, category_id, with_for_update=True)
+            if not row:
+                raise InvalidState("CATEGORY_NOT_FOUND")
+            active_products = await session.scalar(
+                select(func.count(ProductRow.id)).where(
+                    ProductRow.category_id == category_id, ProductRow.active.is_(True)
+                )
+            )
+            if active_products:
+                raise InvalidState("CATEGORY_HAS_ACTIVE_PRODUCTS")
+            row.active = False
+            await self.audit(session, actor, "category.archive", str(row.id))
             return row
 
     async def create_product(self, actor: int, category_id: UUID, values: dict) -> ProductRow:
@@ -489,6 +548,7 @@ class ShopRepository:
     async def update_product(self, actor: int, product_id: UUID, changes: dict) -> ProductRow:
         self.owner(actor)
         allowed = {
+            "category_id",
             "title",
             "description",
             "base_price_usd",
@@ -509,10 +569,24 @@ class ShopRepository:
         }
         if set(changes) - allowed:
             raise InvalidState("INVALID_PRODUCT_FIELDS")
+        if "title" in changes and not str(changes["title"]).strip():
+            raise InvalidState("INVALID_PRODUCT")
+        for field in ("stock", "position", "warranty_days", "delivery_minutes"):
+            if field in changes and int(changes[field]) < 0:
+                raise InvalidState("INVALID_PRODUCT")
+        if "base_price_usd" in changes and decimal_value(changes["base_price_usd"]) < 0:
+            raise InvalidState("INVALID_PRODUCT")
+        if changes.get("custom_emoji_id") and not str(changes["custom_emoji_id"]).isdigit():
+            raise InvalidState("INVALID_PRODUCT")
         async with self.sessions.begin() as session:
             row = await session.get(ProductRow, product_id, with_for_update=True)
             if not row:
                 raise InvalidState("PRODUCT_NOT_FOUND")
+            if "category_id" in changes:
+                category_id = UUID(str(changes["category_id"]))
+                if not await session.get(CategoryRow, category_id):
+                    raise InvalidState("CATEGORY_NOT_FOUND")
+                changes["category_id"] = category_id
             for key, value in changes.items():
                 setattr(row, key, decimal_value(value) if key == "base_price_usd" else value)
             await self.audit(session, actor, "product.update", str(row.id))
@@ -540,7 +614,15 @@ class ShopRepository:
             return row
 
     async def update_merchant_card(
-        self, actor: int, card_id: UUID, *, active: bool, priority: int, daily_limit: int
+        self,
+        actor: int,
+        card_id: UUID,
+        *,
+        active: bool,
+        priority: int,
+        daily_limit: int,
+        bank_name: str | None = None,
+        holder_name: str | None = None,
     ) -> MerchantCardRow:
         self.owner(actor)
         if priority < 0 or daily_limit < 0:
@@ -549,7 +631,26 @@ class ShopRepository:
             row = await session.get(MerchantCardRow, card_id, with_for_update=True)
             if not row:
                 raise InvalidState("MERCHANT_CARD_NOT_FOUND")
+            if not active and row.active:
+                payable = await session.scalar(
+                    select(func.count(OrderRow.id)).where(
+                        OrderRow.merchant_card_id == card_id,
+                        OrderRow.status.in_(
+                            {"AWAITING_PAYMENT", "AWAITING_RECONCILIATION", "MANUAL_REVIEW"}
+                        ),
+                    )
+                )
+                if payable:
+                    raise InvalidState("MERCHANT_CARD_HAS_PAYABLE_ORDERS")
             row.active, row.priority, row.daily_limit = active, priority, daily_limit
+            if bank_name is not None:
+                if not bank_name.strip():
+                    raise InvalidState("INVALID_MERCHANT_CARD")
+                row.bank_name = bank_name.strip()
+            if holder_name is not None:
+                if not holder_name.strip():
+                    raise InvalidState("INVALID_MERCHANT_CARD")
+                row.holder_name = holder_name.strip()
             await self.audit(session, actor, "merchant_card.update", str(row.id), row.masked_pan)
             return row
 
@@ -565,6 +666,24 @@ class ShopRepository:
             await self.audit(session, actor, "page.upsert", slug)
             return row
 
+    async def pages(self, actor: int) -> list[PageRow]:
+        self.owner(actor)
+        async with self.sessions() as session:
+            return list((await session.scalars(select(PageRow).order_by(PageRow.slug))).all())
+
+    async def page_buttons(self, actor: int, page_id: UUID) -> list[ButtonRow]:
+        self.owner(actor)
+        async with self.sessions() as session:
+            return list(
+                (
+                    await session.scalars(
+                        select(ButtonRow)
+                        .where(ButtonRow.page_id == page_id)
+                        .order_by(ButtonRow.row, ButtonRow.position)
+                    )
+                ).all()
+            )
+
     async def create_page_button(
         self,
         actor: int,
@@ -577,7 +696,25 @@ class ShopRepository:
         custom_emoji_id: str | None = None,
     ) -> ButtonRow:
         self.owner(actor)
-        if style not in {"default", "primary", "success", "danger"}:
+        valid_target = (
+            action.startswith("https://")
+            or action
+            in {
+                "catalog",
+                "account",
+                "my_orders",
+                "begin_kyc",
+                "begin_card",
+            }
+            or action.startswith("page:")
+        )
+        if (
+            style not in {"default", "primary", "success", "danger"}
+            or not text_value.strip()
+            or row < 0
+            or position < 0
+            or not valid_target
+        ):
             raise InvalidState("INVALID_BUTTON_STYLE")
         async with self.sessions.begin() as session:
             button = ButtonRow(
@@ -592,6 +729,47 @@ class ShopRepository:
             )
             session.add(button)
             await self.audit(session, actor, "button.create", str(button.id))
+            return button
+
+    async def update_page_button(self, actor: int, button_id: UUID, changes: dict) -> ButtonRow:
+        self.owner(actor)
+        allowed = {"text", "action", "row", "position", "style", "custom_emoji_id", "active"}
+        if set(changes) - allowed:
+            raise InvalidState("INVALID_BUTTON_FIELDS")
+        async with self.sessions.begin() as session:
+            button = await session.get(ButtonRow, button_id, with_for_update=True)
+            if not button:
+                raise InvalidState("BUTTON_NOT_FOUND")
+            candidate = {
+                "text_value": changes.get("text", button.text),
+                "action": changes.get("action", button.action),
+                "row": int(changes.get("row", button.row)),
+                "position": int(changes.get("position", button.position)),
+                "style": changes.get("style", button.style),
+            }
+            valid_target = (
+                candidate["action"].startswith("https://")
+                or candidate["action"]
+                in {
+                    "catalog",
+                    "account",
+                    "my_orders",
+                    "begin_kyc",
+                    "begin_card",
+                }
+                or candidate["action"].startswith("page:")
+            )
+            if (
+                not str(candidate["text_value"]).strip()
+                or candidate["style"] not in {"default", "primary", "success", "danger"}
+                or candidate["row"] < 0
+                or candidate["position"] < 0
+                or not valid_target
+            ):
+                raise InvalidState("INVALID_BUTTON_FIELDS")
+            for key, value in changes.items():
+                setattr(button, key, value)
+            await self.audit(session, actor, "button.update", str(button.id))
             return button
 
     async def register_emoji(self, actor: int, name: str, custom_emoji_id: str) -> EmojiRow:

@@ -84,6 +84,30 @@ class RepoFake:
     async def categories(self):
         return [SimpleNamespace(id=uuid4(), title="Category", custom_emoji_id="123")]
 
+    async def owner_categories(self, _):
+        return [SimpleNamespace(id=uuid4(), title="Category", active=True, custom_emoji_id="123")]
+
+    async def owner_products(self, _):
+        return [SimpleNamespace(id=uuid4(), title="Product", active=True)]
+
+    async def owner_merchant_cards(self, _):
+        return [
+            SimpleNamespace(
+                id=uuid4(),
+                bank_name="Bank",
+                masked_pan="**** 4444",
+                active=True,
+                priority=1,
+                daily_limit=1000,
+            )
+        ]
+
+    async def pages(self, _):
+        return [SimpleNamespace(id=uuid4(), slug="home")]
+
+    async def page_buttons(self, _, page_id):
+        return [SimpleNamespace(id=uuid4(), page_id=page_id, text="Catalog", active=True)]
+
     async def products(self, category_id):
         return [
             SimpleNamespace(
@@ -163,6 +187,11 @@ class RepoFake:
     create_product = AsyncMock()
     create_merchant_card = AsyncMock()
     upsert_page = AsyncMock()
+    update_category = AsyncMock()
+    update_product = AsyncMock()
+    update_merchant_card = AsyncMock()
+    create_page_button = AsyncMock(return_value=SimpleNamespace(text="Catalog"))
+    update_page_button = AsyncMock()
     review_kyc = AsyncMock()
     review_card = AsyncMock()
     manual_reconcile = AsyncMock()
@@ -311,6 +340,33 @@ async def test_admin_rbac_menu_queues_and_decision_forms():
     await callback(QueryFake(token, owner, actor=1))
     assert "دلیل" in owner.answers[-1][0]
 
+    for action in ("admin.category.toggle", "admin.product.toggle"):
+        token = await repo.coordinator.issue_callback(action, 1, f"{uuid4()}:0")
+        await callback(QueryFake(token, owner, actor=1))
+        assert "تغییر" in owner.answers[-1][0]
+    merchant_id = uuid4()
+    repo.owner_merchant_cards = AsyncMock(
+        return_value=[
+            SimpleNamespace(
+                id=merchant_id,
+                active=True,
+                priority=1,
+                daily_limit=1000,
+            )
+        ]
+    )
+    token = await repo.coordinator.issue_callback("admin.merchant.toggle", 1, f"{merchant_id}:0")
+    await callback(QueryFake(token, owner, actor=1))
+    assert "تغییر" in owner.answers[-1][0]
+
+    page_id = uuid4()
+    token = await repo.coordinator.issue_callback("admin.page.buttons", 1, str(page_id))
+    await callback(QueryFake(token, owner, actor=1))
+    assert "دکمه‌های صفحه" in owner.answers[-1][0]
+    token = await repo.coordinator.issue_callback("admin.button.create", 1, str(page_id))
+    await callback(QueryFake(token, owner, actor=1))
+    assert await repo.coordinator.redis.get("fsm:1") == f"admin.button:{page_id}"
+
 
 @pytest.mark.asyncio
 async def test_user_and_admin_text_fsm_and_uploads():
@@ -359,6 +415,10 @@ async def test_admin_text_forms_claim_delivery_and_emoji():
         owner.text = value
         await form(owner)
         assert "موفقیت" in owner.answers[-1][0]
+    await repo.coordinator.redis.set("fsm:1", f"admin.button:{uuid4()}")
+    owner.text = "Catalog|catalog|0|0|primary|-"
+    await form(owner)
+    assert "دکمه ثبت" in owner.answers[-1][0]
     callback = handler(router, "callback_query", "callback")
     token = await repo.coordinator.issue_callback("admin.order.claim", 1, str(uuid4()))
     await callback(QueryFake(token, owner, actor=1))

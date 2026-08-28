@@ -309,6 +309,162 @@ def persistent_router(repo: ShopRepository) -> Router:
                     await query.message.answer("صف بررسی", reply_markup=markup(rows))
                 elif state["a"] != "admin.audit":
                     await query.message.answer("صف بررسی خالی است.")
+            elif state["a"] in {"admin.category", "admin.product", "admin.merchant"}:
+                repo.owner(query.from_user.id)
+                rows = []
+                entity = state["a"].split(".")[-1]
+                if entity == "category":
+                    items = await repo.owner_categories(query.from_user.id)
+                elif entity == "product":
+                    items = await repo.owner_products(query.from_user.id)
+                else:
+                    items = await repo.owner_merchant_cards(query.from_user.id)
+                for item in items:
+                    toggle = await repo.coordinator.issue_callback(
+                        f"admin.{entity}.toggle",
+                        query.from_user.id,
+                        f"{item.id}:{int(not item.active)}",
+                        one_time=True,
+                    )
+                    label = getattr(item, "title", None) or (
+                        f"{item.bank_name} — {item.masked_pan}"
+                    )
+                    rows.append(
+                        [
+                            Button(label, toggle, "success" if item.active else "danger"),
+                        ]
+                    )
+                    edit = await repo.coordinator.issue_callback(
+                        f"admin.{entity}.edit", query.from_user.id, str(item.id), one_time=True
+                    )
+                    rows.append([Button("ویرایش", edit)])
+                create = await repo.coordinator.issue_callback(
+                    f"admin.{entity}.create", query.from_user.id, one_time=True
+                )
+                rows.append([Button("ایجاد مورد جدید", create, "primary")])
+                await query.message.answer("مدیریت", reply_markup=markup(rows))
+            elif state["a"] == "admin.page":
+                repo.owner(query.from_user.id)
+                rows = []
+                for page in await repo.pages(query.from_user.id):
+                    buttons = await repo.coordinator.issue_callback(
+                        "admin.page.buttons", query.from_user.id, str(page.id), one_time=False
+                    )
+                    rows.append([Button(f"{page.slug} — مدیریت دکمه‌ها", buttons)])
+                create = await repo.coordinator.issue_callback(
+                    "admin.page.create", query.from_user.id, one_time=True
+                )
+                rows.append([Button("ایجاد/ویرایش صفحه", create, "primary")])
+                await query.message.answer("صفحه‌ها", reply_markup=markup(rows))
+            elif state["a"] == "admin.page.create":
+                repo.owner(query.from_user.id)
+                await repo.coordinator.redis.set(f"fsm:{query.from_user.id}", "admin.page", ex=900)
+                await query.message.answer("slug|متن صفحه را ارسال کنید.")
+            elif state["a"] == "admin.page.buttons":
+                repo.owner(query.from_user.id)
+                page_id = UUID(state["o"])
+                rows = []
+                for item in await repo.page_buttons(query.from_user.id, page_id):
+                    toggle = await repo.coordinator.issue_callback(
+                        "admin.button.toggle",
+                        query.from_user.id,
+                        f"{item.id}:{int(not item.active)}",
+                        one_time=True,
+                    )
+                    rows.append([Button(item.text, toggle, "success" if item.active else "danger")])
+                    edit = await repo.coordinator.issue_callback(
+                        "admin.button.edit", query.from_user.id, str(item.id), one_time=True
+                    )
+                    rows.append([Button("ویرایش دکمه", edit)])
+                create = await repo.coordinator.issue_callback(
+                    "admin.button.create", query.from_user.id, str(page_id), one_time=True
+                )
+                rows.append([Button("ساخت دکمه", create, "primary")])
+                await query.message.answer("دکمه‌های صفحه", reply_markup=markup(rows))
+            elif state["a"] == "admin.button.create":
+                repo.owner(query.from_user.id)
+                await repo.coordinator.redis.set(
+                    f"fsm:{query.from_user.id}", f"admin.button:{state['o']}", ex=900
+                )
+                await query.message.answer(
+                    "متن|target|row|position|style|custom_emoji_id یا - را ارسال کنید."
+                )
+            elif state["a"] == "admin.button.edit":
+                repo.owner(query.from_user.id)
+                await repo.coordinator.redis.set(
+                    f"fsm:{query.from_user.id}", f"admin.button.edit:{state['o']}", ex=900
+                )
+                await query.message.answer(
+                    "متن|target|row|position|style|custom_emoji_id یا -|active را ارسال کنید."
+                )
+            elif state["a"] == "admin.button.toggle":
+                repo.owner(query.from_user.id)
+                object_id, active_value = state["o"].split(":", 1)
+                await repo.update_page_button(
+                    query.from_user.id,
+                    UUID(object_id),
+                    {"active": bool(int(active_value))},
+                )
+                await query.message.answer("وضعیت دکمه تغییر کرد.")
+            elif state["a"] in {
+                "admin.category.create",
+                "admin.product.create",
+                "admin.merchant.create",
+            }:
+                repo.owner(query.from_user.id)
+                target = state["a"].removesuffix(".create")
+                await repo.coordinator.redis.set(f"fsm:{query.from_user.id}", target, ex=900)
+                prompts = {
+                    "admin.category": "عنوان|توضیح|ترتیب|custom_emoji_id یا - را ارسال کنید.",
+                    "admin.product": (
+                        "category_id|عنوان|توضیح|USD|مدت|پلن|فعال‌سازی|گارانتی|"
+                        "روز گارانتی|دقیقه تحویل|موجودی|unlimited|KYC|ترتیب|"
+                        "fixed_toman یا -|custom_emoji_id یا - را ارسال کنید."
+                    ),
+                    "admin.merchant": "بانک|صاحب کارت|PAN|اولویت|سقف روزانه را ارسال کنید.",
+                }
+                await query.message.answer(prompts[target])
+            elif state["a"].startswith(
+                ("admin.category.toggle", "admin.product.toggle", "admin.merchant.toggle")
+            ):
+                repo.owner(query.from_user.id)
+                object_id, active_value = state["o"].split(":", 1)
+                active = bool(int(active_value))
+                if state["a"].startswith("admin.category"):
+                    await repo.update_category(query.from_user.id, UUID(object_id), active=active)
+                elif state["a"].startswith("admin.product"):
+                    await repo.update_product(
+                        query.from_user.id, UUID(object_id), {"active": active}
+                    )
+                else:
+                    cards = await repo.owner_merchant_cards(query.from_user.id)
+                    current = next(item for item in cards if item.id == UUID(object_id))
+                    await repo.update_merchant_card(
+                        query.from_user.id,
+                        current.id,
+                        active=active,
+                        priority=current.priority,
+                        daily_limit=current.daily_limit,
+                    )
+                await query.message.answer("وضعیت با موفقیت تغییر کرد.")
+            elif state["a"].startswith(
+                ("admin.category.edit", "admin.product.edit", "admin.merchant.edit")
+            ):
+                repo.owner(query.from_user.id)
+                target = state["a"].removesuffix(".edit")
+                await repo.coordinator.redis.set(
+                    f"fsm:{query.from_user.id}", f"{target}.edit:{state['o']}", ex=900
+                )
+                prompts = {
+                    "admin.category": "عنوان|توضیح|ترتیب|custom_emoji_id یا - را ارسال کنید.",
+                    "admin.product": (
+                        "category_id|عنوان|توضیح|USD|مدت|پلن|فعال‌سازی|گارانتی|روز گارانتی|"
+                        "دقیقه تحویل|موجودی|unlimited|KYC|ترتیب|fixed_toman یا -|"
+                        "custom_emoji_id یا - را ارسال کنید."
+                    ),
+                    "admin.merchant": "بانک|صاحب کارت|اولویت|سقف روزانه|active را ارسال کنید.",
+                }
+                await query.message.answer(prompts[target])
             elif state["a"] == "admin.terms":
                 repo.owner(query.from_user.id)
                 await repo.coordinator.redis.set(
@@ -318,10 +474,6 @@ def persistent_router(repo: ShopRepository) -> Router:
             elif state["a"] in {
                 "admin.rate",
                 "admin.pricing",
-                "admin.category",
-                "admin.product",
-                "admin.merchant",
-                "admin.page",
             }:
                 repo.owner(query.from_user.id)
                 await repo.coordinator.redis.set(f"fsm:{query.from_user.id}", state["a"], ex=900)
@@ -331,13 +483,6 @@ def persistent_router(repo: ShopRepository) -> Router:
                         "تنظیم قیمت را به‌ترتیب mode|markup|target_margin|platform_fee|"
                         "payment_fee|warranty_reserve|fixed_cost ارسال کنید."
                     ),
-                    "admin.category": "عنوان|توضیح|ترتیب را ارسال کنید.",
-                    "admin.product": (
-                        "category_id|عنوان|توضیح|USD|مدت|پلن|فعال‌سازی|گارانتی|"
-                        "روز گارانتی|دقیقه تحویل|موجودی|unlimited را ارسال کنید."
-                    ),
-                    "admin.merchant": "بانک|صاحب کارت|PAN|اولویت|سقف روزانه را ارسال کنید.",
-                    "admin.page": "slug|متن صفحه را ارسال کنید.",
                 }
                 await query.message.answer(prompts[state["a"]])
             elif state["a"].startswith(("admin.kyc.", "admin.card.", "admin.payment.")):
@@ -518,6 +663,53 @@ def persistent_router(repo: ShopRepository) -> Router:
             except Exception:
                 log.exception("emoji registration failed")
                 await message.answer("پیام باید پاسخ به یک Premium Custom Emoji معتبر باشد.")
+        elif state and state.startswith("admin.button.edit:"):
+            try:
+                repo.owner(message.from_user.id)
+                button_id = UUID(state.rsplit(":", 1)[1])
+                values = [item.strip() for item in message.text.split("|")]
+                if len(values) != 7:
+                    raise ValueError("FIELDS_REQUIRED")
+                await repo.update_page_button(
+                    message.from_user.id,
+                    button_id,
+                    {
+                        "text": values[0],
+                        "action": values[1],
+                        "row": int(values[2]),
+                        "position": int(values[3]),
+                        "style": values[4],
+                        "custom_emoji_id": values[5] if values[5] != "-" else None,
+                        "active": values[6].lower() == "true",
+                    },
+                )
+                await repo.coordinator.redis.delete(f"fsm:{message.from_user.id}")
+                await message.answer("ویرایش دکمه ثبت شد.")
+            except Exception:
+                log.exception("button edit failed", extra={"telegram_id": message.from_user.id})
+                await message.answer("تنظیمات ویرایش دکمه معتبر نیست.")
+        elif state and state.startswith("admin.button:"):
+            try:
+                repo.owner(message.from_user.id)
+                page_id = UUID(state.split(":", 1)[1])
+                values = [item.strip() for item in message.text.split("|")]
+                if len(values) != 6:
+                    raise ValueError("FIELDS_REQUIRED")
+                button = await repo.create_page_button(
+                    message.from_user.id,
+                    page_id,
+                    values[0],
+                    values[1],
+                    int(values[2]),
+                    int(values[3]),
+                    values[4],
+                    values[5] if values[5] != "-" else None,
+                )
+                await repo.coordinator.redis.delete(f"fsm:{message.from_user.id}")
+                await message.answer(f"دکمه ثبت شد: {button.text}")
+            except Exception:
+                log.exception("button creation failed", extra={"telegram_id": message.from_user.id})
+                await message.answer("تنظیمات دکمه معتبر نیست.")
         elif state == "admin.terms.title":
             try:
                 repo.owner(message.from_user.id)
@@ -573,13 +765,17 @@ def persistent_router(repo: ShopRepository) -> Router:
                         },
                     )
                 elif state == "admin.category":
-                    title, description, position = values
+                    if len(values) not in {3, 4}:
+                        raise ValueError("FIELDS_REQUIRED")
+                    title, description, position = values[:3]
+                    emoji_id = values[3] if len(values) == 4 and values[3] != "-" else None
                     await repo.create_category(
-                        message.from_user.id, title, description, int(position)
+                        message.from_user.id, title, description, int(position), emoji_id
                     )
                 elif state == "admin.product":
-                    if len(values) != 12:
+                    if len(values) not in {12, 16}:
                         raise ValueError("FIELDS_REQUIRED")
+                    expanded = len(values) == 16
                     await repo.create_product(
                         message.from_user.id,
                         UUID(values[0]),
@@ -595,6 +791,14 @@ def persistent_router(repo: ShopRepository) -> Router:
                             "delivery_minutes": int(values[9]),
                             "stock": int(values[10]),
                             "unlimited_stock": values[11].lower() == "true",
+                            "requires_kyc": values[12].lower() == "true" if expanded else True,
+                            "position": int(values[13]) if expanded else 0,
+                            "fixed_price_toman": (
+                                int(values[14]) if expanded and values[14] != "-" else None
+                            ),
+                            "custom_emoji_id": (
+                                values[15] if expanded and values[15] != "-" else None
+                            ),
                         },
                     )
                 elif state == "admin.merchant":
@@ -614,6 +818,66 @@ def persistent_router(repo: ShopRepository) -> Router:
                     "admin configuration failed", extra={"telegram_id": message.from_user.id}
                 )
                 await message.answer("ورودی معتبر نیست؛ فرم را دوباره آغاز کنید.")
+        elif state and state.startswith(
+            ("admin.category.edit:", "admin.product.edit:", "admin.merchant.edit:")
+        ):
+            try:
+                repo.owner(message.from_user.id)
+                action, object_id = state.rsplit(":", 1)
+                values = [item.strip() for item in message.text.split("|")]
+                if action == "admin.category.edit":
+                    if len(values) != 4:
+                        raise ValueError("FIELDS_REQUIRED")
+                    await repo.update_category(
+                        message.from_user.id,
+                        UUID(object_id),
+                        title=values[0],
+                        description=values[1] or None,
+                        position=int(values[2]),
+                        custom_emoji_id=values[3] if values[3] != "-" else None,
+                    )
+                elif action == "admin.product.edit":
+                    if len(values) != 16:
+                        raise ValueError("FIELDS_REQUIRED")
+                    await repo.update_product(
+                        message.from_user.id,
+                        UUID(object_id),
+                        {
+                            "category_id": UUID(values[0]),
+                            "title": values[1],
+                            "description": values[2],
+                            "base_price_usd": values[3],
+                            "duration": values[4],
+                            "plan_type": values[5],
+                            "activation_method": values[6],
+                            "warranty_text": values[7],
+                            "warranty_days": int(values[8]),
+                            "delivery_minutes": int(values[9]),
+                            "stock": int(values[10]),
+                            "unlimited_stock": values[11].lower() == "true",
+                            "requires_kyc": values[12].lower() == "true",
+                            "position": int(values[13]),
+                            "fixed_price_toman": int(values[14]) if values[14] != "-" else None,
+                            "custom_emoji_id": values[15] if values[15] != "-" else None,
+                        },
+                    )
+                else:
+                    if len(values) != 5:
+                        raise ValueError("FIELDS_REQUIRED")
+                    await repo.update_merchant_card(
+                        message.from_user.id,
+                        UUID(object_id),
+                        bank_name=values[0],
+                        holder_name=values[1],
+                        priority=int(values[2]),
+                        daily_limit=int(values[3]),
+                        active=values[4].lower() == "true",
+                    )
+                await repo.coordinator.redis.delete(f"fsm:{message.from_user.id}")
+                await message.answer("ویرایش با موفقیت ثبت شد.")
+            except Exception:
+                log.exception("admin edit failed", extra={"telegram_id": message.from_user.id})
+                await message.answer("ورودی ویرایش معتبر نیست.")
         elif state and state.startswith("admin."):
             try:
                 repo.owner(message.from_user.id)
@@ -806,22 +1070,23 @@ class Runtime:
 
 def create_app(settings: Settings) -> FastAPI:
     runtime = Runtime(settings)
-    app = FastAPI(title="Telegram commerce core", docs_url=None, redoc_url=None)
-    app.state.runtime = runtime
 
-    @app.on_event("startup")
-    async def startup() -> None:
+    @contextlib.asynccontextmanager
+    async def lifespan(_app: FastAPI):
         runtime.worker = asyncio.create_task(runtime.outbox_worker())
         if settings.run_mode == "webhook":
             await runtime.bot.set_webhook(
                 settings.webhook_url, secret_token=settings.webhook_secret.get_secret_value()
             )
+        try:
+            yield
+        finally:
+            if settings.run_mode == "webhook":
+                await runtime.bot.delete_webhook()
+            await runtime.close()
 
-    @app.on_event("shutdown")
-    async def shutdown() -> None:
-        if settings.run_mode == "webhook":
-            await runtime.bot.delete_webhook()
-        await runtime.close()
+    app = FastAPI(title="Telegram commerce core", docs_url=None, redoc_url=None, lifespan=lifespan)
+    app.state.runtime = runtime
 
     @app.get("/health/live")
     async def live() -> dict[str, str]:
