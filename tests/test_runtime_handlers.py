@@ -261,6 +261,24 @@ async def test_customer_callback_navigation_and_checkout():
 
 
 @pytest.mark.asyncio
+async def test_buy_gate_provides_actionable_kyc_and_card_buttons():
+    repo, message = RepoFake(), MessageFake()
+    repo.verified_cards = AsyncMock(return_value=[])
+    router = persistent_router(repo)
+    callback = handler(router, "callback_query", "callback")
+    token = await repo.coordinator.issue_callback("buy", 2, str(uuid4()))
+    await callback(QueryFake(token, message))
+    text_value, kwargs = message.answers[-1]
+    assert "KYC" in text_value
+    actions = {
+        repo.coordinator.state[button.callback_data]["a"]
+        for row in kwargs["reply_markup"].inline_keyboard
+        for button in row
+    }
+    assert actions == {"begin_kyc", "begin_card"}
+
+
+@pytest.mark.asyncio
 async def test_admin_rbac_menu_queues_and_decision_forms():
     repo = RepoFake()
     router = persistent_router(repo)
@@ -284,6 +302,7 @@ async def test_admin_rbac_menu_queues_and_decision_forms():
         "admin.product",
         "admin.merchant",
         "admin.page",
+        "admin.emoji",
     ):
         token = await repo.coordinator.issue_callback(action, 1)
         await callback(QueryFake(token, owner, actor=1))
@@ -317,6 +336,11 @@ async def test_user_and_admin_text_fsm_and_uploads():
     await upload(message)
     assert "اثبات پرداخت نیست" in message.answers[-1][0]
 
+    unsupported = handler(router, "message", "unsupported_message")
+    await repo.coordinator.redis.set("fsm:2", "kyc.document")
+    await unsupported(message)
+    assert "فقط تصویر" in message.answers[-1][0]
+
 
 @pytest.mark.asyncio
 async def test_admin_text_forms_claim_delivery_and_emoji():
@@ -340,9 +364,24 @@ async def test_admin_text_forms_claim_delivery_and_emoji():
     await callback(QueryFake(token, owner, actor=1))
     token = await repo.coordinator.issue_callback("admin.order.deliver", 1, str(uuid4()))
     await callback(QueryFake(token, owner, actor=1))
+    repo.deliver.reset_mock()
     owner.text = "content|https://example.invalid"
     await form(owner)
-    assert "تحویل" in owner.answers[-1][0]
+    assert "پیش‌نمایش تحویل" in owner.answers[-1][0]
+    assert not repo.deliver.await_count
+    confirm = owner.answers[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data
+    await callback(QueryFake(confirm, owner, actor=1))
+    assert repo.deliver.await_count == 1
+    assert "تحویل ثبت" in owner.answers[-1][0]
+
+    await repo.coordinator.redis.set("fsm:1", "admin.emoji")
+    owner.text = "inline-premium"
+    owner.reply_to_message = SimpleNamespace(
+        entities=[SimpleNamespace(type="custom_emoji", custom_emoji_id="123456")]
+    )
+    await form(owner)
+    assert "Premium Emoji" in owner.answers[-1][0]
+
     emoji_handler = handler(router, "message", "admin_emoji")
     owner.text = "/admin_emoji premium"
     owner.reply_to_message = SimpleNamespace(

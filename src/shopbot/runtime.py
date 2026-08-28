@@ -153,11 +153,23 @@ def persistent_router(repo: ShopRepository) -> Router:
                         "quote", query.from_user.id, f"{state['o']}:{card.id}", one_time=True
                     )
                     rows.append([Button(f"{card.bank_name} — {card.masked_pan}", token)])
+                has_verified_cards = bool(rows)
+                if not has_verified_cards:
+                    kyc = await repo.coordinator.issue_callback(
+                        "begin_kyc", query.from_user.id, one_time=False
+                    )
+                    card = await repo.coordinator.issue_callback(
+                        "begin_card", query.from_user.id, one_time=False
+                    )
+                    rows = [
+                        [Button("ارسال مدارک احراز هویت", kyc, "primary")],
+                        [Button("ثبت کارت بانکی", card)],
+                    ]
                 await query.message.answer(
                     "کارت مبدأ تأییدشده را انتخاب کنید."
-                    if rows
+                    if has_verified_cards
                     else "برای خرید، KYC و کارت بانکی تأییدشده لازم است.",
-                    reply_markup=markup(rows) if rows else None,
+                    reply_markup=markup(rows),
                 )
             elif state["a"] == "quote":
                 product_id, card_id = map(UUID, state["o"].split(":"))
@@ -346,6 +358,27 @@ def persistent_router(repo: ShopRepository) -> Router:
                     f"fsm:{query.from_user.id}", f"admin.delivery:{state['o']}", ex=900
                 )
                 await query.message.answer("متن تحویل|لینک اختیاری را ارسال کنید.")
+            elif state["a"] == "admin.delivery.confirm":
+                repo.owner(query.from_user.id)
+                draft_key = f"delivery-draft:{query.from_user.id}:{state['o']}"
+                draft = await repo.coordinator.redis.get(draft_key)
+                if not draft:
+                    raise AccessDenied("DELIVERY_DRAFT_EXPIRED")
+                content, _, activation_link = draft.partition("\0")
+                await repo.deliver(
+                    query.from_user.id,
+                    UUID(state["o"]),
+                    content,
+                    activation_link or None,
+                )
+                await repo.coordinator.redis.delete(draft_key, f"fsm:{query.from_user.id}")
+                await query.message.answer("تحویل ثبت و اعلان مشتری در Outbox قرار گرفت.")
+            elif state["a"] == "admin.emoji":
+                repo.owner(query.from_user.id)
+                await repo.coordinator.redis.set(f"fsm:{query.from_user.id}", "admin.emoji", ex=900)
+                await query.message.answer(
+                    "نام ایموجی را در پاسخ به پیامی دارای Premium Custom Emoji ارسال کنید."
+                )
             await query.answer()
         except Exception:
             log.exception("callback rejected", extra={"telegram_id": query.from_user.id})
@@ -370,6 +403,7 @@ def persistent_router(repo: ShopRepository) -> Router:
             "cards",
             "orders",
             "page",
+            "emoji",
             "audit",
             "close",
         ):
@@ -389,8 +423,9 @@ def persistent_router(repo: ShopRepository) -> Router:
                     [Button("احراز هویت", actions[6]), Button("کارت‌ها", actions[7])],
                     [Button("سفارش‌ها", actions[8], "success")],
                     [Button("صفحه‌ها", actions[9])],
-                    [Button("Audit", actions[10])],
-                    [Button("بازگشت", actions[11], "danger")],
+                    [Button("Premium Emoji", actions[10])],
+                    [Button("Audit", actions[11])],
+                    [Button("بازگشت", actions[12], "danger")],
                 ]
             ),
         )
@@ -439,14 +474,50 @@ def persistent_router(repo: ShopRepository) -> Router:
                 repo.owner(message.from_user.id)
                 order_id = UUID(state.split(":", 1)[1])
                 content, *link = [item.strip() for item in message.text.split("|", 1)]
-                await repo.deliver(
-                    message.from_user.id, order_id, content, link[0] if link and link[0] else None
+                if not content:
+                    raise ValueError("DELIVERY_CONTENT_REQUIRED")
+                activation_link = link[0] if link and link[0] else ""
+                await repo.coordinator.redis.set(
+                    f"delivery-draft:{message.from_user.id}:{order_id}",
+                    f"{content}\0{activation_link}",
+                    ex=900,
                 )
-                await repo.coordinator.redis.delete(f"fsm:{message.from_user.id}")
-                await message.answer("تحویل ثبت و اعلان مشتری در Outbox قرار گرفت.")
+                confirm = await repo.coordinator.issue_callback(
+                    "admin.delivery.confirm",
+                    message.from_user.id,
+                    str(order_id),
+                    one_time=True,
+                )
+                preview = f"پیش‌نمایش تحویل\n\n{content}"
+                if activation_link:
+                    preview += f"\n{activation_link}"
+                await message.answer(
+                    preview,
+                    reply_markup=markup([[Button("تأیید نهایی تحویل", confirm, "success")]]),
+                )
             except Exception:
                 log.exception("delivery failed", extra={"telegram_id": message.from_user.id})
                 await message.answer("ثبت تحویل انجام نشد.")
+        elif state == "admin.emoji":
+            try:
+                repo.owner(message.from_user.id)
+                source = message.reply_to_message
+                entities = list((source.entities if source else None) or [])
+                identifiers = [
+                    entity.custom_emoji_id
+                    for entity in entities
+                    if entity.type == "custom_emoji" and entity.custom_emoji_id
+                ]
+                if not message.text.strip() or not identifiers:
+                    raise ValueError("NAME_AND_CUSTOM_EMOJI_REQUIRED")
+                emoji = await repo.register_emoji(
+                    message.from_user.id, message.text.strip(), identifiers[0]
+                )
+                await repo.coordinator.redis.delete(f"fsm:{message.from_user.id}")
+                await message.answer(f"Premium Emoji ثبت شد: {emoji.name}")
+            except Exception:
+                log.exception("emoji registration failed")
+                await message.answer("پیام باید پاسخ به یک Premium Custom Emoji معتبر باشد.")
         elif state == "admin.terms.title":
             try:
                 repo.owner(message.from_user.id)
@@ -635,6 +706,13 @@ def persistent_router(repo: ShopRepository) -> Router:
         except Exception:
             log.exception("receipt submission failed", extra={"telegram_id": message.from_user.id})
             await message.answer("ثبت رسید انجام نشد؛ بعداً دوباره تلاش کنید.")
+
+    @router.message()
+    async def unsupported_message(message: Message) -> None:
+        state = await repo.coordinator.redis.get(f"fsm:{message.from_user.id}")
+        receipt_order = await repo.coordinator.redis.get(f"receipt-order:{message.from_user.id}")
+        if state in {"kyc.document", "card.evidence"} or receipt_order:
+            await message.answer("فقط تصویر یا فایل Document پشتیبانی می‌شود.")
 
     return router
 
