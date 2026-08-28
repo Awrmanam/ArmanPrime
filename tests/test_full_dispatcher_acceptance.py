@@ -30,9 +30,9 @@ class TelegramSession(BaseSession):
 
     async def make_request(self, bot, method, timeout=None):
         self.calls.append(method)
-        if isinstance(method, (AnswerCallbackQuery, DeleteMessage)):
+        if isinstance(method, AnswerCallbackQuery | DeleteMessage):
             return True
-        if isinstance(method, (SendMessage, SendPhoto)):
+        if isinstance(method, SendMessage | SendPhoto):
             self.sequence += 1
             return Message(
                 message_id=self.sequence,
