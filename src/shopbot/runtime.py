@@ -338,6 +338,15 @@ def persistent_router(repo: ShopRepository) -> Router:
                         f"admin.{entity}.edit", query.from_user.id, str(item.id), one_time=True
                     )
                     rows.append([Button("ویرایش", edit)])
+                    if entity == "product":
+                        pricing = await repo.coordinator.issue_callback(
+                            "admin.product.pricing",
+                            query.from_user.id,
+                            str(item.id),
+                            one_time=True,
+                        )
+                        current_mode = (item.pricing_override or {}).get("mode", "inherit")
+                        rows.append([Button(f"قیمت اختصاصی — {current_mode}", pricing, "primary")])
                 create = await repo.coordinator.issue_callback(
                     f"admin.{entity}.create", query.from_user.id, one_time=True
                 )
@@ -408,7 +417,6 @@ def persistent_router(repo: ShopRepository) -> Router:
                 await query.message.answer("وضعیت دکمه تغییر کرد.")
             elif state["a"] in {
                 "admin.category.create",
-                "admin.product.create",
                 "admin.merchant.create",
             }:
                 repo.owner(query.from_user.id)
@@ -416,14 +424,47 @@ def persistent_router(repo: ShopRepository) -> Router:
                 await repo.coordinator.redis.set(f"fsm:{query.from_user.id}", target, ex=900)
                 prompts = {
                     "admin.category": "عنوان|توضیح|ترتیب|custom_emoji_id یا - را ارسال کنید.",
-                    "admin.product": (
-                        "category_id|عنوان|توضیح|USD|مدت|پلن|فعال‌سازی|گارانتی|"
-                        "روز گارانتی|دقیقه تحویل|موجودی|unlimited|KYC|ترتیب|"
-                        "fixed_toman یا -|custom_emoji_id یا - را ارسال کنید."
-                    ),
                     "admin.merchant": "بانک|صاحب کارت|PAN|اولویت|سقف روزانه را ارسال کنید.",
                 }
                 await query.message.answer(prompts[target])
+            elif state["a"] == "admin.product.create":
+                repo.owner(query.from_user.id)
+                rows = []
+                for category in await repo.owner_categories(query.from_user.id):
+                    if not category.active:
+                        continue
+                    choose = await repo.coordinator.issue_callback(
+                        "admin.product.create.category",
+                        query.from_user.id,
+                        str(category.id),
+                        one_time=True,
+                    )
+                    rows.append([Button(category.title, choose)])
+                await query.message.answer(
+                    "ابتدا دسته محصول را انتخاب کنید." if rows else "ابتدا یک دسته فعال بسازید.",
+                    reply_markup=markup(rows) if rows else None,
+                )
+            elif state["a"] == "admin.product.create.category":
+                repo.owner(query.from_user.id)
+                await repo.coordinator.redis.set(
+                    f"fsm:{query.from_user.id}", f"admin.product:{state['o']}", ex=900
+                )
+                await query.message.answer(
+                    "عنوان|توضیح|USD|مدت|پلن|فعال‌سازی|گارانتی|روز گارانتی|"
+                    "دقیقه تحویل|موجودی|unlimited|KYC|ترتیب|fixed_toman یا -|"
+                    "custom_emoji_id یا - را ارسال کنید."
+                )
+            elif state["a"] == "admin.product.pricing":
+                repo.owner(query.from_user.id)
+                await repo.coordinator.redis.set(
+                    f"fsm:{query.from_user.id}",
+                    f"admin.product.pricing:{state['o']}",
+                    ex=900,
+                )
+                await query.message.answer(
+                    "mode|markup|target_margin|platform_fee|payment_fee|warranty_reserve|"
+                    "fixed_cost|fixed_toman یا - را ارسال کنید. برای حذف override، mode=inherit."
+                )
             elif state["a"].startswith(
                 ("admin.category.toggle", "admin.product.toggle", "admin.merchant.toggle")
             ):
@@ -663,6 +704,65 @@ def persistent_router(repo: ShopRepository) -> Router:
             except Exception:
                 log.exception("emoji registration failed")
                 await message.answer("پیام باید پاسخ به یک Premium Custom Emoji معتبر باشد.")
+        elif state and state.startswith("admin.product.pricing:"):
+            try:
+                repo.owner(message.from_user.id)
+                product_id = UUID(state.rsplit(":", 1)[1])
+                values = [item.strip() for item in message.text.split("|")]
+                if len(values) != 8:
+                    raise ValueError("FIELDS_REQUIRED")
+                await repo.set_product_pricing_override(
+                    message.from_user.id,
+                    product_id,
+                    {
+                        "mode": values[0],
+                        "markup": values[1],
+                        "target_margin": values[2],
+                        "platform_fee": values[3],
+                        "payment_fee": values[4],
+                        "warranty_reserve": values[5],
+                        "fixed_cost_toman": int(values[6]),
+                        "fixed_price_toman": int(values[7]) if values[7] != "-" else None,
+                    },
+                )
+                await repo.coordinator.redis.delete(f"fsm:{message.from_user.id}")
+                await message.answer("قانون قیمت اختصاصی محصول ثبت شد.")
+            except Exception:
+                log.exception("product pricing override failed")
+                await message.answer("قانون قیمت اختصاصی معتبر نیست.")
+        elif state and state.startswith("admin.product:"):
+            try:
+                repo.owner(message.from_user.id)
+                category_id = UUID(state.split(":", 1)[1])
+                values = [item.strip() for item in message.text.split("|")]
+                if len(values) != 15:
+                    raise ValueError("FIELDS_REQUIRED")
+                await repo.create_product(
+                    message.from_user.id,
+                    category_id,
+                    {
+                        "title": values[0],
+                        "description": values[1],
+                        "base_price_usd": values[2],
+                        "duration": values[3],
+                        "plan_type": values[4],
+                        "activation_method": values[5],
+                        "warranty_text": values[6],
+                        "warranty_days": int(values[7]),
+                        "delivery_minutes": int(values[8]),
+                        "stock": int(values[9]),
+                        "unlimited_stock": values[10].lower() == "true",
+                        "requires_kyc": values[11].lower() == "true",
+                        "position": int(values[12]),
+                        "fixed_price_toman": int(values[13]) if values[13] != "-" else None,
+                        "custom_emoji_id": values[14] if values[14] != "-" else None,
+                    },
+                )
+                await repo.coordinator.redis.delete(f"fsm:{message.from_user.id}")
+                await message.answer("محصول با موفقیت ثبت شد.")
+            except Exception:
+                log.exception("product creation failed")
+                await message.answer("مشخصات محصول معتبر نیست.")
         elif state and state.startswith("admin.button.edit:"):
             try:
                 repo.owner(message.from_user.id)

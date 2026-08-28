@@ -88,7 +88,7 @@ class RepoFake:
         return [SimpleNamespace(id=uuid4(), title="Category", active=True, custom_emoji_id="123")]
 
     async def owner_products(self, _):
-        return [SimpleNamespace(id=uuid4(), title="Product", active=True)]
+        return [SimpleNamespace(id=uuid4(), title="Product", active=True, pricing_override=None)]
 
     async def owner_merchant_cards(self, _):
         return [
@@ -190,6 +190,7 @@ class RepoFake:
     update_category = AsyncMock()
     update_product = AsyncMock()
     update_merchant_card = AsyncMock()
+    set_product_pricing_override = AsyncMock()
     create_page_button = AsyncMock(return_value=SimpleNamespace(text="Catalog"))
     update_page_button = AsyncMock()
     review_kyc = AsyncMock()
@@ -419,6 +420,10 @@ async def test_admin_text_forms_claim_delivery_and_emoji():
     owner.text = "Catalog|catalog|0|0|primary|-"
     await form(owner)
     assert "دکمه ثبت" in owner.answers[-1][0]
+    await repo.coordinator.redis.set("fsm:1", f"admin.product.pricing:{uuid4()}")
+    owner.text = "markup|12.5|0|1|2|3|100|-"
+    await form(owner)
+    assert "قیمت اختصاصی" in owner.answers[-1][0]
     callback = handler(router, "callback_query", "callback")
     token = await repo.coordinator.issue_callback("admin.order.claim", 1, str(uuid4()))
     await callback(QueryFake(token, owner, actor=1))

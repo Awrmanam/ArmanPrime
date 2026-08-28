@@ -208,6 +208,60 @@ async def test_concurrent_requote_is_idempotent_and_allocation_is_fixed(reposito
 
 
 @pytest.mark.asyncio
+async def test_product_override_freezes_quotes_and_daily_limit_is_concurrent(repository):
+    product, card = await configure_checkout(repository)
+    await repository.set_product_pricing_override(
+        100,
+        product.id,
+        {
+            "mode": "markup",
+            "markup": "40",
+            "target_margin": "0",
+            "platform_fee": "0",
+            "payment_fee": "0",
+            "warranty_reserve": "0",
+            "fixed_cost_toman": 0,
+        },
+    )
+    first = await repository.create_quote(200, product.id, card.id)
+    frozen_amount = first.final_toman
+    await repository.set_product_pricing_override(
+        100,
+        product.id,
+        {
+            "mode": "markup",
+            "markup": "0",
+            "target_margin": "0",
+            "platform_fee": "0",
+            "payment_fee": "0",
+            "warranty_reserve": "0",
+            "fixed_cost_toman": 0,
+        },
+    )
+    second = await repository.create_quote(200, product.id, card.id)
+    assert first.final_toman == frozen_amount
+    assert first.snapshot["pricing"]["markup"] == "40"
+    assert second.final_toman < frozen_amount
+
+    async with repository.sessions.begin() as session:
+        merchant = await session.scalar(select(MerchantCardRow).with_for_update())
+        merchant.daily_limit = frozen_amount
+    outcomes = await asyncio.gather(
+        repository.final_check(200, first.id),
+        repository.final_check(200, second.id),
+        return_exceptions=True,
+    )
+    orders = [item for item in outcomes if isinstance(item, OrderRow)]
+    failures = [item for item in outcomes if isinstance(item, InvalidState)]
+    assert len(orders) == 1 and len(failures) == 1
+    assert str(failures[0]) == "DESTINATION_LIMIT_REACHED"
+    async with repository.sessions() as session:
+        persisted = await session.get(QuoteRow, orders[0].quote_id)
+        assert persisted.snapshot["merchant_card_masked"] == "**** 4444"
+        assert "5555555555554444" not in repr(persisted.snapshot)
+
+
+@pytest.mark.asyncio
 async def test_outbox_text_photo_delivery_retry_and_dead_letter(repository):
     runtime = Runtime.__new__(Runtime)
     runtime.repo = repository

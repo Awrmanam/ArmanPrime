@@ -592,6 +592,63 @@ class ShopRepository:
             await self.audit(session, actor, "product.update", str(row.id))
             return row
 
+    async def set_product_pricing_override(
+        self, actor: int, product_id: UUID, values: dict | None
+    ) -> ProductRow:
+        """Persist a validated product-only rule without mutating existing quotes."""
+        self.owner(actor)
+        normalized = None
+        fixed_price = None
+        if values:
+            mode = str(values.get("mode", "inherit"))
+            if mode not in {"inherit", "markup", "target_margin"}:
+                raise InvalidState("INVALID_PRICING_MODE")
+            fixed_price = (
+                int(values["fixed_price_toman"])
+                if values.get("fixed_price_toman") not in {None, ""}
+                else None
+            )
+            if fixed_price is not None and fixed_price < 0:
+                raise InvalidState("INVALID_FIXED_PRICE")
+            if mode != "inherit":
+                normalized = {
+                    "mode": mode,
+                    "markup": str(decimal_value(values.get("markup", "0"))),
+                    "target_margin": str(decimal_value(values.get("target_margin", "0"))),
+                    "platform_fee": str(decimal_value(values.get("platform_fee", "0"))),
+                    "payment_fee": str(decimal_value(values.get("payment_fee", "0"))),
+                    "warranty_reserve": str(decimal_value(values.get("warranty_reserve", "0"))),
+                    "fixed_cost_toman": int(values.get("fixed_cost_toman", 0)),
+                }
+                rule = PricingRule(
+                    platform_fee_percent=decimal_value(normalized["platform_fee"]),
+                    payment_fee_percent=decimal_value(normalized["payment_fee"]),
+                    fixed_cost_toman=normalized["fixed_cost_toman"],
+                    warranty_reserve_percent=decimal_value(normalized["warranty_reserve"]),
+                    markup_percent=decimal_value(normalized["markup"]),
+                    target_margin_percent=(
+                        decimal_value(normalized["target_margin"])
+                        if mode == "target_margin"
+                        else None
+                    ),
+                    fixed_price_toman=fixed_price,
+                )
+                calculate_price("1", 1, rule)
+        async with self.sessions.begin() as session:
+            product = await session.get(ProductRow, product_id, with_for_update=True)
+            if not product:
+                raise InvalidState("PRODUCT_NOT_FOUND")
+            product.pricing_override = normalized
+            product.fixed_price_toman = fixed_price
+            await self.audit(
+                session,
+                actor,
+                "product.pricing_override",
+                str(product.id),
+                f"mode={normalized['mode'] if normalized else 'inherit'}",
+            )
+            return product
+
     async def create_merchant_card(
         self, actor: int, bank: str, holder: str, pan: str, priority: int, daily_limit: int
     ) -> MerchantCardRow:
@@ -926,6 +983,7 @@ class ShopRepository:
                         select(func.coalesce(func.sum(OrderRow.amount_toman), 0)).where(
                             OrderRow.merchant_card_id == candidate.id,
                             OrderRow.created_at >= today,
+                            OrderRow.status.not_in({"PAYMENT_EXPIRED", "CANCELLED", "REFUNDED"}),
                         )
                     )
                     if (
@@ -937,6 +995,11 @@ class ShopRepository:
                 if not merchant:
                     raise InvalidState("DESTINATION_LIMIT_REACHED")
                 quote.final_check_confirmed = True
+                quote.snapshot = {
+                    **quote.snapshot,
+                    "merchant_card_id": str(merchant.id),
+                    "merchant_card_masked": merchant.masked_pan,
+                }
                 order = OrderRow(
                     user_id=user.id,
                     quote_id=quote.id,
