@@ -71,7 +71,8 @@ jobs:
       - run: docker build -t shopbot:test .
       - name: Reject tracked secrets and local environment
         run: |
+          test ! -e .env
           ! git ls-files | grep -Fx .env
-          ! git grep -nE '([0-9]{16}|BOT_TOKEN=[^[:space:]]+|gh[pousr]_[A-Za-z0-9_]{20,})' -- ':!tests/**' ':!README.md'
+          ! git grep -nE '([0-9]{16}|BOT_TOKEN=[[:space:]]*[0-9]{5,15}:[A-Za-z0-9_-]{30,}|gh[pousr]_[A-Za-z0-9_]{20,})' -- ':!tests/**' ':!README.md'
       - uses: gitleaks/gitleaks-action@v2
         env: {GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'}
