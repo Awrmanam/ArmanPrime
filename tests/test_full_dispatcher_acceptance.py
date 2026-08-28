@@ -120,11 +120,15 @@ class TelegramDriver:
             ),
         )
 
-    def texts(self):
+    def message_texts(self):
         return [
             getattr(call, "text", None) or getattr(call, "caption", None) or ""
             for call in self.session.calls
+            if isinstance(call, SendMessage | SendPhoto)
         ]
+
+    def last_message_text(self):
+        return self.message_texts()[-1]
 
 
 @pytest.mark.asyncio
@@ -192,8 +196,8 @@ async def test_full_dispatcher_acceptance_persists_after_reconstruction():
     assert getattr(transport.calls[-1], "show_alert", False) is True
     await telegram.click(200, "Product")
     await telegram.click(200, "خرید")
-    assert "برای خرید، KYC" in telegram.texts()[-1]
-    assert "5555555555554444" not in "\n".join(telegram.texts())
+    assert "برای خرید، KYC" in telegram.last_message_text()
+    assert "5555555555554444" not in "\n".join(telegram.message_texts())
 
     await telegram.click(200, "ارسال مدارک احراز هویت")
     await telegram.send(200, photo_unique="kyc-evidence")
@@ -207,7 +211,7 @@ async def test_full_dispatcher_acceptance_persists_after_reconstruction():
     await telegram.send(200, "Customer Bank")
     await telegram.send(200, "4111111111111111")
     await telegram.send(200, photo_unique="card-evidence")
-    assert "4111111111111111" not in "\n".join(telegram.texts())
+    assert "4111111111111111" not in "\n".join(telegram.message_texts())
     await telegram.send(100, "/admin")
     await telegram.click(100, "کارت‌ها")
     await telegram.click(100, "تأیید Customer Bank")
@@ -219,9 +223,9 @@ async def test_full_dispatcher_acceptance_persists_after_reconstruction():
     await telegram.click(200, "Product")
     await telegram.click(200, "خرید")
     await telegram.click(200, "Customer Bank")
-    assert "اعتبار قیمت: ۳۰ دقیقه" in telegram.texts()[-1]
+    assert "اعتبار قیمت: ۳۰ دقیقه" in telegram.last_message_text()
     final_callback = await telegram.click(200, "تأیید و ادامه")
-    assert "5555555555554444" in telegram.texts()[-1]
+    assert "5555555555554444" in telegram.last_message_text()
     await telegram.click_data(200, final_callback)
     async with sessions() as session:
         assert await session.scalar(select(func.count(OrderRow.id))) == 1
@@ -250,7 +254,7 @@ async def test_full_dispatcher_acceptance_persists_after_reconstruction():
     worker.repo, worker.bot = repo, bot
     while await worker.process_outbox_once():
         pass
-    assert any("Delivery content" in item for item in telegram.texts())
+    assert any("Delivery content" in item for item in telegram.message_texts())
 
     await bot.session.close()
     await redis.aclose()
