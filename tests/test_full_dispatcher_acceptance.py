@@ -10,7 +10,21 @@ from cryptography.fernet import Fernet
 from redis.asyncio import Redis
 from sqlalchemy import func, select, text
 
-from shopbot.db import DeliveryRow, OrderRow, PaymentRow, UserRow, create_engine_and_session
+from shopbot.db import (
+    AuditRow,
+    CategoryRow,
+    ConfigRow,
+    DeliveryRow,
+    MerchantCardRow,
+    OrderRow,
+    PaymentRow,
+    ProductRow,
+    QuoteRow,
+    RateRow,
+    TermsRow,
+    UserRow,
+    create_engine_and_session,
+)
 from shopbot.repository import RedisCoordinator, ShopRepository
 from shopbot.runtime import Runtime, persistent_router
 from shopbot.security import Vault
@@ -261,11 +275,45 @@ async def test_full_dispatcher_acceptance_persists_after_reconstruction():
     await engine.dispose()
     new_engine, new_sessions = create_engine_and_session(DATABASE_URL)
     async with new_sessions() as session:
-        assert await session.scalar(select(func.count(UserRow.id))) == 2
+        customer = await session.scalar(select(UserRow).where(UserRow.telegram_id == 200))
+        owner_customer = await session.scalar(select(UserRow).where(UserRow.telegram_id == 100))
+        owner_audits = list(
+            (await session.scalars(select(AuditRow).where(AuditRow.actor_id == 100))).all()
+        )
+        terms = await session.scalar(select(TermsRow).where(TermsRow.published.is_(True)))
+        rate = await session.scalar(select(RateRow).order_by(RateRow.created_at.desc()))
+        pricing = await session.get(ConfigRow, "pricing.global")
+        category = await session.scalar(select(CategoryRow))
+        product = await session.scalar(select(ProductRow))
+        merchant = await session.scalar(select(MerchantCardRow))
+        quote = await session.scalar(select(QuoteRow))
         order = await session.scalar(select(OrderRow))
         payment = await session.scalar(select(PaymentRow))
         delivery = await session.scalar(select(DeliveryRow))
+        assert customer is not None and customer.kyc_status == "VERIFIED"
+        assert owner_customer is None  # Owner identity is configuration/RBAC, not a customer row.
+        assert owner_audits and {item.action for item in owner_audits} >= {
+            "terms.publish",
+            "currency.rate",
+            "pricing.update",
+            "category.create",
+            "product.create",
+            "merchant_card.create",
+        }
+        assert terms.title == "قوانین فروشگاه"
+        assert rate.usd_to_toman == 50_000
+        assert pricing.value["mode"] == "markup"
+        assert category.title == "Category" and product.title == "Product"
+        assert merchant.masked_pan == "**** 4444"
         assert order.status == "DELIVERED"
         assert payment.status == "VERIFIED"
         assert delivery.text == "Delivery content"
+        persisted_non_secret_data = repr(
+            [
+                [(item.action, item.target, item.detail) for item in owner_audits],
+                quote.snapshot,
+            ]
+        )
+        assert "5555555555554444" not in persisted_non_secret_data
+        assert "4111111111111111" not in persisted_non_secret_data
     await new_engine.dispose()
