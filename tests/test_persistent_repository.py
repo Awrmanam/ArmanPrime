@@ -391,8 +391,9 @@ async def test_owner_crud_validation_pages_buttons_emojis_and_audit(repository):
     assert [item.id for item in await repository.owner_merchant_cards(100)] == [merchant.id]
     page = await repository.upsert_page(100, "home", "Welcome")
     page = await repository.upsert_page(100, "home", "Updated")
+    emoji = await repository.register_emoji(100, "premium", "123456")
     button = await repository.create_page_button(
-        100, page.id, "Buy", "catalog", 0, 0, "primary", "123"
+        100, page.id, "Buy", "catalog", 0, 0, "primary", "premium"
     )
     assert page.text == "Updated" and button.style == "primary"
     button = await repository.update_page_button(
@@ -403,7 +404,6 @@ async def test_owner_crud_validation_pages_buttons_emojis_and_audit(repository):
     assert [item.id for item in await repository.page_buttons(100, page.id)] == [button.id]
     with pytest.raises(InvalidState):
         await repository.create_page_button(100, page.id, "X", "x", 0, 0, "purple")
-    emoji = await repository.register_emoji(100, "premium", "123456")
     assert emoji.custom_emoji_id == "123456"
     button = await repository.set_button_emoji(100, button.id, "premium")
     assert button.custom_emoji_id == "premium"

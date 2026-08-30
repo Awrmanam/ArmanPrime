@@ -246,7 +246,9 @@ def persistent_router(repo: ShopRepository) -> Router:
                 5: [("تأیید و ثبت", "confirm")],
             }
         elif kind == "pricing":
-            choices = {5: [("تأیید و ثبت", "confirm")]}
+            # Step five still collects the fixed cost. Confirmation belongs to
+            # the following preview step, after every pricing value is present.
+            choices = {6: [("تأیید و ثبت", "confirm")]}
         elif kind == "rate":
             choices = {1: [("تأیید نرخ", "confirm")]}
         elif kind == "terms":

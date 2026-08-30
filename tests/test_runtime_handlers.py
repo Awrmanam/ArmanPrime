@@ -1,3 +1,4 @@
+import json
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -124,7 +125,7 @@ class RepoFake:
         ]
 
     async def pages(self, _):
-        return [SimpleNamespace(id=uuid4(), slug="home")]
+        return [SimpleNamespace(id=uuid4(), slug="home", title="Home")]
 
     async def page_buttons(self, _, page_id):
         return [
@@ -438,7 +439,17 @@ async def test_admin_rbac_menu_queues_and_decision_forms():
     assert page_button.icon_custom_emoji_id == "123456"
     token = await repo.coordinator.issue_callback("admin.button.create", 1, str(page_id))
     await callback(QueryFake(token, owner, actor=1))
-    assert await repo.coordinator.redis.get("fsm:1") == f"admin.button:{page_id}"
+    assert await repo.coordinator.redis.get("fsm:1") == "admin.wizard"
+    draft = json.loads(await repo.coordinator.redis.get("admin-draft:1"))
+    assert draft == {
+        "kind": "button",
+        "step": 0,
+        "data": {"page_id": str(page_id)},
+    }
+    wizard_callback = owner.answers[-1][1]["reply_markup"].inline_keyboard[-1][0].callback_data
+    assert (await repo.coordinator.resolve_callback(wizard_callback, 1))["a"] == (
+        "admin.wizard.back"
+    )
 
     category_id = uuid4()
     token = await repo.coordinator.issue_callback(
