@@ -5,15 +5,10 @@ docker compose version >/dev/null
 if [[ -e .env ]]; then echo '.env already exists; refusing to overwrite' >&2; exit 1; fi
 NON_INTERACTIVE=${INSTALL_NON_INTERACTIVE:-false}
 if [[ $NON_INTERACTIVE == true ]]; then
-  : "${BOT_TOKEN:?BOT_TOKEN required}" "${ADMIN_ID:?ADMIN_ID required}" "${ORDER_CHAT:?ORDER_CHAT required}"
-  SUPPORT_USERNAME=${SUPPORT_USERNAME:-}; TIMEZONE=${TIMEZONE:-UTC}; RUN_MODE=${RUN_MODE:-polling}
-  WEBHOOK_URL=${WEBHOOK_URL:-}; MONEY_UNIT=${MONEY_UNIT:-toman}
-  MANUAL_USD_RATE=${MANUAL_USD_RATE:-}; CURRENCY_PROVIDER=${CURRENCY_PROVIDER:-}
-  MIN_MARGIN=${MIN_MARGIN:-0}; KYC_MODE=${KYC_MODE:-manual}; CARD_POLICY=${CARD_POLICY:-single}
-  CARD_COOLDOWN=${CARD_COOLDOWN:-7}; STRONG_MATCH=${STRONG_MATCH:-manual_review}
-  FIRST_LIMIT=${FIRST_LIMIT:-0}; DAILY_LIMIT=${DAILY_LIMIT:-0}; PAYMENT_PROVIDER=${PAYMENT_PROVIDER:-}
-  SECURE_PATH=${SECURE_PATH:-/var/lib/shopbot/secure}; RETENTION=${RETENTION:-90}
-  MEMBERSHIP_CHANNEL=${MEMBERSHIP_CHANNEL:-}; BRAND_NAME=${BRAND_NAME:-}
+  : "${BOT_TOKEN:?BOT_TOKEN required}" "${ADMIN_ID:?ADMIN_ID required}"
+  ORDER_CHAT=${ORDER_CHAT:-$ADMIN_ID}; RUN_MODE=${RUN_MODE:-polling}
+  WEBHOOK_URL=${WEBHOOK_URL:-}
+  SECURE_PATH=${SECURE_PATH:-/var/lib/shopbot/secure}; BRAND_NAME=${BRAND_NAME:-}
 else
 read -rsp 'Bot token: ' BOT_TOKEN; echo
 fi
@@ -29,26 +24,8 @@ PY
 fi
 if [[ $NON_INTERACTIVE != true ]]; then
 read -rp 'Admin Telegram user ID: ' ADMIN_ID
-read -rp 'Order notification chat ID: ' ORDER_CHAT
-read -rp 'Support username (optional): ' SUPPORT_USERNAME
-read -rp 'Timezone [UTC]: ' TIMEZONE; TIMEZONE=${TIMEZONE:-UTC}
-read -rp 'Mode polling/webhook [polling]: ' RUN_MODE; RUN_MODE=${RUN_MODE:-polling}
-WEBHOOK_URL=''; [[ $RUN_MODE == webhook ]] && read -rp 'HTTPS webhook URL: ' WEBHOOK_URL
-read -rp 'Money unit toman/rial [toman]: ' MONEY_UNIT; MONEY_UNIT=${MONEY_UNIT:-toman}
-read -rp 'Manual USD rate (blank = configure in bot): ' MANUAL_USD_RATE
-read -rp 'Currency provider (optional): ' CURRENCY_PROVIDER
-read -rp 'Minimum margin percent [0]: ' MIN_MARGIN; MIN_MARGIN=${MIN_MARGIN:-0}
-read -rp 'KYC mode [manual]: ' KYC_MODE; KYC_MODE=${KYC_MODE:-manual}
-read -rp 'Customer card policy single/multiple [single]: ' CARD_POLICY; CARD_POLICY=${CARD_POLICY:-single}
-read -rp 'Card replacement cooldown days [7]: ' CARD_COOLDOWN; CARD_COOLDOWN=${CARD_COOLDOWN:-7}
-read -rp 'Strong match policy [manual_review]: ' STRONG_MATCH; STRONG_MATCH=${STRONG_MATCH:-manual_review}
-read -rp 'First purchase limit toman [0]: ' FIRST_LIMIT; FIRST_LIMIT=${FIRST_LIMIT:-0}
-read -rp 'Daily limit toman [0]: ' DAILY_LIMIT; DAILY_LIMIT=${DAILY_LIMIT:-0}
-read -rp 'Payment provider (optional): ' PAYMENT_PROVIDER
-read -rp 'Secure document path [/var/lib/shopbot/secure]: ' SECURE_PATH; SECURE_PATH=${SECURE_PATH:-/var/lib/shopbot/secure}
-read -rp 'Document retention days [90]: ' RETENTION; RETENTION=${RETENTION:-90}
-read -rp 'Required membership channel (optional): ' MEMBERSHIP_CHANNEL
-read -rp 'Brand name (optional): ' BRAND_NAME
+read -rp 'Order notification chat ID [same as Owner]: ' ORDER_CHAT; ORDER_CHAT=${ORDER_CHAT:-$ADMIN_ID}
+RUN_MODE=polling; WEBHOOK_URL=''; SECURE_PATH=/var/lib/shopbot/secure; BRAND_NAME=''
 fi
 secret(){ openssl rand -base64 48 | tr -d '\n'; }
 command -v openssl >/dev/null || { echo 'openssl is required' >&2; exit 1; }
@@ -58,26 +35,15 @@ cat >.env <<EOF
 BOT_TOKEN=$BOT_TOKEN
 ADMIN_TELEGRAM_USER_ID=$ADMIN_ID
 ORDER_NOTIFICATION_CHAT_ID=$ORDER_CHAT
-SUPPORT_USERNAME=$SUPPORT_USERNAME
-TIMEZONE=$TIMEZONE
 RUN_MODE=$RUN_MODE
 WEBHOOK_URL=$WEBHOOK_URL
 WEBHOOK_SECRET=$(secret)
-MONEY_UNIT=$MONEY_UNIT
-MANUAL_USD_RATE=$MANUAL_USD_RATE
-CURRENCY_PROVIDER=$CURRENCY_PROVIDER
-MIN_MARGIN_PERCENT=$MIN_MARGIN
-KYC_MODE=$KYC_MODE
-CUSTOMER_CARD_POLICY=$CARD_POLICY
-CARD_COOLDOWN_DAYS=$CARD_COOLDOWN
-STRONG_MATCH_POLICY=$STRONG_MATCH
-FIRST_PURCHASE_LIMIT_TOMAN=$FIRST_LIMIT
-DAILY_LIMIT_TOMAN=$DAILY_LIMIT
-PAYMENT_PROVIDER=$PAYMENT_PROVIDER
 SECURE_FILE_PATH=$SECURE_PATH
-DOCUMENT_RETENTION_DAYS=$RETENTION
-MEMBERSHIP_CHANNEL=$MEMBERSHIP_CHANNEL
 BRAND_NAME=$BRAND_NAME
+FEATURE_WALLET=false
+FEATURE_REFERRALS=false
+FEATURE_COOPERATION=false
+FEATURE_MEMBERSHIP_CHECK=false
 PRICE_QUOTE_TTL_MINUTES=30
 POSTGRES_PASSWORD=$POSTGRES_PASSWORD
 DATABASE_URL=postgresql+asyncpg://shop:$POSTGRES_PASSWORD@db:5432/shop
@@ -95,4 +61,4 @@ for _ in {1..60}; do curl -fsS http://127.0.0.1:8080/health/ready >/dev/null && 
 if ! curl -fsS http://127.0.0.1:8080/health/ready >/dev/null; then
   docker compose logs --tail=200 app >&2; exit 1
 fi
-echo 'Installation complete. Send /setup to the bot; no catalog, terms, price, or brand was seeded.'
+echo 'Installation complete. Send /admin to the bot; no catalog, terms, price, or brand was seeded.'

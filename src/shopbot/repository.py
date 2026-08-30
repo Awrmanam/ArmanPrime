@@ -186,6 +186,30 @@ class ShopRepository:
                 ).all()
             )
 
+    async def setup_status(self, actor: int) -> dict[str, bool]:
+        self.owner(actor)
+        async with self.sessions() as session:
+            return {
+                "terms": bool(await self.current_terms(session)),
+                "rate": bool(await session.scalar(select(RateRow.id).limit(1))),
+                "pricing": bool(await session.get(ConfigRow, "pricing.global")),
+                "merchant": bool(
+                    await session.scalar(
+                        select(MerchantCardRow.id).where(MerchantCardRow.active.is_(True)).limit(1)
+                    )
+                ),
+                "category": bool(
+                    await session.scalar(
+                        select(CategoryRow.id).where(CategoryRow.active.is_(True)).limit(1)
+                    )
+                ),
+                "product": bool(
+                    await session.scalar(
+                        select(ProductRow.id).where(ProductRow.active.is_(True)).limit(1)
+                    )
+                ),
+            }
+
     async def publish_terms(self, actor: int, title: str, body: str) -> TermsRow:
         self.owner(actor)
         async with self.sessions.begin() as session:

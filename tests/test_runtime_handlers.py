@@ -84,6 +84,16 @@ class RepoFake:
     async def current_terms(self, _session):
         return self.terms
 
+    async def setup_status(self, _):
+        return {
+            "terms": bool(self.terms),
+            "rate": False,
+            "pricing": False,
+            "merchant": False,
+            "category": False,
+            "product": False,
+        }
+
     async def has_current_consent(self, *_):
         return self.accepted
 
@@ -372,6 +382,13 @@ async def test_admin_rbac_menu_queues_and_decision_forms():
     owner = MessageFake(actor=1)
     await admin(owner)
     assert owner.answers[-1][1]["reply_markup"].inline_keyboard
+    dashboard_labels = [
+        button.text
+        for row in owner.answers[-1][1]["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    assert any("قوانین فروشگاه" in label and "نیازمند تنظیم" in label for label in dashboard_labels)
+    assert "وضعیت آمادگی فروشگاه" in owner.answers[-1][0]
     callback = handler(router, "callback_query", "callback")
     for action in (
         "admin.kyc",
@@ -455,7 +472,7 @@ async def test_admin_close_cancel_and_commands_clear_actor_state():
         key.endswith(":1") or key.startswith("delivery-draft:1:")
         for key in repo.coordinator.redis.values
     )
-    assert owner.answers[-1][0] == "پنل مدیریت"
+    assert owner.answers[-1][0].startswith("پنل مدیریت")
 
     await repo.coordinator.redis.set("fsm:1", "admin.emoji")
     admin = handler(router, "message", "admin")

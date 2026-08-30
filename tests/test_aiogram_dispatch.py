@@ -62,6 +62,9 @@ class RepoFake:
         self.terms = None
         self.accepted = False
 
+    def owner(self, _actor):
+        raise AccessDenied("OWNER_REQUIRED")
+
     async def user(self, actor, _session):
         return SimpleNamespace(telegram_id=actor)
 

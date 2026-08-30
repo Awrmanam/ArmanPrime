@@ -37,13 +37,19 @@ def _button_feature_rejected(exc: TelegramBadRequest) -> bool:
 
 async def answer_keyboard(message: Message, text_value: str, rows: list[list[Button]]) -> Message:
     """Send a rich keyboard, retrying once only for unsupported Bot API button fields."""
+
+    async def send(reply_markup: InlineKeyboardMarkup) -> Message:
+        if getattr(getattr(message, "from_user", None), "is_bot", False):
+            return await message.edit_text(text_value, reply_markup=reply_markup)
+        return await message.answer(text_value, reply_markup=reply_markup)
+
     try:
-        return await message.answer(text_value, reply_markup=markup(rows))
+        return await send(markup(rows))
     except TelegramBadRequest as exc:
         if not _button_feature_rejected(exc):
             raise
         plain_rows = [[Button(button.text, button.callback_data) for button in row] for row in rows]
-        return await message.answer(text_value, reply_markup=markup(plain_rows))
+        return await send(markup(plain_rows))
 
 
 def persistent_router(repo: ShopRepository) -> Router:
@@ -65,6 +71,11 @@ def persistent_router(repo: ShopRepository) -> Router:
 
     async def admin_home(message: Message, actor_id: int) -> None:
         repo.owner(actor_id)
+        status = await repo.setup_status(actor_id)
+
+        def mark(ready: bool) -> str:
+            return "کامل" if ready else "نیازمند تنظیم"
+
         names = (
             "terms",
             "rate",
@@ -86,15 +97,18 @@ def persistent_router(repo: ShopRepository) -> Router:
         ]
         await answer_keyboard(
             message,
-            "پنل مدیریت",
+            "پنل مدیریت\n\n"
+            f"وضعیت آمادگی فروشگاه: {'آماده فروش' if all(status.values()) else 'نیازمند تکمیل'}",
             [
-                [Button("قوانین", actions[0], "primary")],
-                [Button("نرخ دلار", actions[1]), Button("قیمت‌گذاری", actions[2])],
-                [Button("دسته", actions[3]), Button("محصول", actions[4])],
-                [Button("کارت مقصد", actions[5])],
+                [Button(f"قوانین فروشگاه — {mark(status['terms'])}", actions[0], "primary")],
+                [Button(f"نرخ دلار — {mark(status['rate'])}", actions[1])],
+                [Button(f"فرمول قیمت‌گذاری — {mark(status['pricing'])}", actions[2])],
+                [Button(f"کارت مقصد — {mark(status['merchant'])}", actions[5])],
+                [Button(f"دسته‌بندی — {mark(status['category'])}", actions[3])],
+                [Button(f"محصول — {mark(status['product'])}", actions[4])],
                 [Button("احراز هویت", actions[6]), Button("کارت‌ها", actions[7])],
                 [Button("سفارش‌ها", actions[8], "success")],
-                [Button("صفحه‌ها", actions[9])],
+                [Button("صفحات سفارشی", actions[9])],
                 [Button("Premium Emoji", actions[10])],
                 [Button("Audit", actions[11])],
                 [Button("بازگشت", actions[12], "danger")],
@@ -120,6 +134,13 @@ def persistent_router(repo: ShopRepository) -> Router:
     @router.message(Command("start"))
     async def start(message: Message) -> None:
         await clear_actor_state(message.from_user.id)
+        try:
+            repo.owner(message.from_user.id)
+        except AccessDenied:
+            pass
+        else:
+            await admin_home(message, message.from_user.id)
+            return
         if not await repo.coordinator.rate_limit("start", message.from_user.id, 10, 60):
             await message.answer("درخواست‌های شما بیش از حد مجاز است.")
             return
@@ -754,6 +775,10 @@ def persistent_router(repo: ShopRepository) -> Router:
             return
         await clear_actor_state(message.from_user.id)
         await admin_home(message, message.from_user.id)
+
+    @router.message(Command("setup"))
+    async def setup(message: Message) -> None:
+        await admin(message)
 
     @router.message(Command("cancel"))
     async def cancel(message: Message) -> None:
