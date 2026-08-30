@@ -37,12 +37,14 @@ class RuntimeFake:
             sessions=Sessions(db_fail),
             now=lambda: __import__("datetime").datetime.now(__import__("datetime").UTC),
             expire_quotes=AsyncMock(return_value=0),
+            active_currency_rates=AsyncMock(return_value=[]),
         )
         self.redis = AsyncMock()
         self.redis.ping.return_value = redis_ok
         self.bot = AsyncMock()
         self.dispatcher = AsyncMock()
         self.worker = None
+        self.fx_provider = None
         self.closed = False
 
     async def outbox_worker(self):
@@ -79,7 +81,9 @@ def test_health_live_ready_and_dependency_failures(monkeypatch):
     fake = RuntimeFake(settings())
     with TestClient(app_with(monkeypatch, fake)) as client:
         assert client.get("/health/live").json() == {"status": "ok"}
-        assert client.get("/health/ready").status_code == 200
+        response = client.get("/health/ready")
+        assert response.status_code == 200
+        assert response.json() == {"status": "ready", "currency": "ok"}
         fake.redis.ping.return_value = False
         assert client.get("/health/ready").status_code == 503
         fake.redis.ping.return_value = True

@@ -881,7 +881,7 @@ def persistent_router(repo: ShopRepository) -> Router:
                 index = step
                 field = fields.get(kind, [])[index]
                 if field:
-                    data[field] = "0" if kind == "pricing" else None
+                    data[field] = "0" if kind in {"pricing", "rate"} else None
                 await set_wizard(query.message, query.from_user.id, kind, step + 1, data)
             elif state["a"] == "admin.wizard.back":
                 draft = await load_draft(query.from_user.id)

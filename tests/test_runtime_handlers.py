@@ -582,6 +582,7 @@ async def test_user_and_admin_text_fsm_and_uploads():
 @pytest.mark.asyncio
 async def test_admin_text_forms_claim_delivery_and_emoji():
     repo, owner = RepoFake(), MessageFake(actor=1)
+    repo.set_currency_rate.reset_mock()
     router = persistent_router(repo)
     form = handler(router, "message", "form_text")
     callback = handler(router, "callback_query", "callback")
@@ -597,10 +598,19 @@ async def test_admin_text_forms_claim_delivery_and_emoji():
     await form(owner)
     skip = owner.answers[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data
     await callback(QueryFake(skip, owner, actor=1))
+    draft = json.loads(await repo.coordinator.redis.get("admin-draft:1"))
+    assert draft["data"] == {
+        "currency_code": "USD",
+        "rate": "50000",
+        "buffer_percent": "0",
+    }
+    replay = QueryFake(skip, owner, actor=1)
+    await callback(replay)
+    assert replay.answers[-1][1]["show_alert"] is True
     assert "پیش‌نمایش نرخ" in owner.answers[-1][0]
     confirm = owner.answers[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data
     await callback(QueryFake(confirm, owner, actor=1))
-    assert repo.set_currency_rate.await_count == 1
+    repo.set_currency_rate.assert_awaited_once_with(1, "USD", "50000", buffer_percent="0")
 
     await repo.coordinator.redis.set("fsm:1", "admin.emoji")
     owner.text = "inline-premium"

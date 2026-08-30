@@ -332,6 +332,7 @@ async def test_full_dispatcher_acceptance_persists_after_reconstruction():
         }
         assert terms.title == "قوانین فروشگاه"
         assert rate.usd_to_toman == 50_000
+        assert rate.currency_code == "USD" and rate.buffer_percent == 0
         assert pricing.value["mode"] == "markup"
         assert category.title == "Category" and product.title == "Product"
         assert merchant.masked_pan == "**** 4444"
