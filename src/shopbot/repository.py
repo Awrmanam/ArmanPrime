@@ -694,6 +694,86 @@ class ShopRepository:
             await self.audit(session, actor, "merchant_card.create", str(row.id), row.masked_pan)
             return row
 
+    async def create_merchant_card_encrypted(
+        self,
+        actor: int,
+        bank: str,
+        holder: str,
+        encrypted_pan: str,
+        masked_pan: str,
+        priority: int,
+        daily_limit: int,
+        active: bool,
+    ) -> MerchantCardRow:
+        """Persist a wizard card without bringing its plaintext PAN back from Redis."""
+        self.owner(actor)
+        if (
+            not bank.strip()
+            or not holder.strip()
+            or not encrypted_pan
+            or not masked_pan
+            or priority < 0
+            or daily_limit < 0
+        ):
+            raise InvalidState("INVALID_MERCHANT_CARD")
+        async with self.sessions.begin() as session:
+            row = MerchantCardRow(
+                bank_name=bank.strip(),
+                holder_name=holder.strip(),
+                encrypted_pan=encrypted_pan,
+                masked_pan=masked_pan,
+                priority=priority,
+                daily_limit=daily_limit,
+                active=active,
+            )
+            session.add(row)
+            await self.audit(session, actor, "merchant_card.create", str(row.id), masked_pan)
+            return row
+
+    async def admin_button_preferences(self, actor: int) -> dict:
+        self.owner(actor)
+        async with self.sessions() as session:
+            row = await session.get(ConfigRow, "admin.buttons")
+            return dict(row.value) if row else {}
+
+    async def set_admin_button_preference(self, actor: int, action: str, value: dict) -> None:
+        self.owner(actor)
+        allowed_actions = {
+            "terms",
+            "rate",
+            "pricing",
+            "merchant",
+            "category",
+            "product",
+            "kyc",
+            "cards",
+            "orders",
+            "page",
+            "emoji",
+            "audit",
+            "appearance",
+            "close",
+        }
+        style = value.get("style", "default")
+        if action not in allowed_actions or style not in {
+            "default",
+            "primary",
+            "success",
+            "danger",
+        }:
+            raise InvalidState("INVALID_ADMIN_BUTTON")
+        if not str(value.get("label", "")).strip() or int(value.get("row", 0)) < 0:
+            raise InvalidState("INVALID_ADMIN_BUTTON")
+        async with self.sessions.begin() as session:
+            row = await session.get(ConfigRow, "admin.buttons", with_for_update=True)
+            config = dict(row.value) if row else {}
+            config[action] = value
+            if row:
+                row.value, row.updated_at = config, self.now()
+            else:
+                session.add(ConfigRow(key="admin.buttons", value=config, updated_at=self.now()))
+            await self.audit(session, actor, "admin.button.appearance", action)
+
     async def update_merchant_card(
         self,
         actor: int,
@@ -742,9 +822,23 @@ class ShopRepository:
             if row:
                 row.text = content
             else:
-                row = PageRow(slug=slug, text=content)
+                row = PageRow(slug=slug, title=slug, text=content, active=True)
                 session.add(row)
             await self.audit(session, actor, "page.upsert", slug)
+            return row
+
+    async def create_page(
+        self, actor: int, slug: str, title: str, content: str, active: bool
+    ) -> PageRow:
+        self.owner(actor)
+        if not title.strip() or not content.strip() or not slug:
+            raise InvalidState("INVALID_PAGE")
+        async with self.sessions.begin() as session:
+            if await session.scalar(select(PageRow.id).where(PageRow.slug == slug)):
+                raise InvalidState("PAGE_KEY_EXISTS")
+            row = PageRow(slug=slug, title=title.strip(), text=content.strip(), active=active)
+            session.add(row)
+            await self.audit(session, actor, "page.create", str(row.id))
             return row
 
     async def pages(self, actor: int) -> list[PageRow]:
@@ -798,6 +892,12 @@ class ShopRepository:
         ):
             raise InvalidState("INVALID_BUTTON_STYLE")
         async with self.sessions.begin() as session:
+            if custom_emoji_id and not await session.scalar(
+                select(EmojiRow.id).where(
+                    EmojiRow.name == custom_emoji_id, EmojiRow.active.is_(True)
+                )
+            ):
+                raise InvalidState("ACTIVE_EMOJI_REQUIRED")
             button = ButtonRow(
                 page_id=page_id,
                 text=text_value,
@@ -848,6 +948,11 @@ class ShopRepository:
                 or not valid_target
             ):
                 raise InvalidState("INVALID_BUTTON_FIELDS")
+            emoji_key = changes.get("custom_emoji_id")
+            if emoji_key and not await session.scalar(
+                select(EmojiRow.id).where(EmojiRow.name == emoji_key, EmojiRow.active.is_(True))
+            ):
+                raise InvalidState("ACTIVE_EMOJI_REQUIRED")
             for key, value in changes.items():
                 setattr(button, key, value)
             await self.audit(session, actor, "button.update", str(button.id))

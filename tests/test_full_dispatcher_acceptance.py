@@ -169,36 +169,61 @@ async def test_full_dispatcher_acceptance_persists_after_reconstruction():
     dispatcher.include_router(persistent_router(repo))
     telegram = TelegramDriver(bot, dispatcher, transport)
 
-    async def admin_action(label, value):
-        await telegram.send(100, "/admin")
-        await telegram.click(100, label)
-        await telegram.send(100, value)
-
     await telegram.send(100, "/admin")
     await telegram.click(100, "قوانین")
     await telegram.send(100, "قوانین فروشگاه")
     await telegram.send(100, "متن لازم‌الاجرای قوانین")
-    await admin_action("نرخ دلار", "50000")
-    await admin_action("قیمت‌گذاری", "markup|10|0|1|1|1|100")
+    await telegram.click(100, "رد کردن")
+    await telegram.click(100, "انتشار قوانین")
+    await telegram.click(100, "نرخ دلار")
+    await telegram.send(100, "50000")
+    await telegram.click(100, "تأیید نرخ")
+    await telegram.click(100, "قیمت‌گذاری")
+    await telegram.click(100, "درصد افزایش")
+    await telegram.send(100, "10")
+    for value in ("1", "1", "1", "100"):
+        await telegram.send(100, value)
+    await telegram.click(100, "تأیید و ثبت")
 
     await telegram.send(100, "/admin")
     await telegram.click(100, "کارت مقصد")
     await telegram.click(100, "ایجاد مورد جدید")
-    await telegram.send(100, "Test Bank|Test Holder|5555555555554444|1|10000000")
+    await telegram.send(100, "5555555555554444")
+    await telegram.send(100, "Test Bank")
+    await telegram.send(100, "Test Holder")
+    await telegram.click(100, "اولویت ۱")
+    await telegram.click(100, "تعیین سقف")
+    await telegram.send(100, "10000000")
+    await telegram.click(100, "فعال")
+    await telegram.click(100, "تأیید و ثبت")
 
     await telegram.send(100, "/admin")
     await telegram.click(100, "دسته")
     await telegram.click(100, "ایجاد مورد جدید")
-    await telegram.send(100, "Category|Description|1")
+    await telegram.send(100, "Category")
+    await telegram.send(100, "Description")
+    await telegram.click(100, "فعال")
+    await telegram.click(100, "انتهای فهرست")
+    await telegram.click(100, "بدون آیکون")
+    await telegram.click(100, "تأیید و ثبت")
 
     await telegram.send(100, "/admin")
     await telegram.click(100, "محصول")
     await telegram.click(100, "ایجاد مورد جدید")
     await telegram.click(100, "Category")
-    await telegram.send(
-        100,
-        "Product|Full description|10|30 days|standard|link|manual warranty|7|60|2|false|true|1|-",
-    )
+    for value in ("Product", "Full description", "10"):
+        await telegram.send(100, value)
+    await telegram.click(100, "رد کردن")
+    for value in ("30 days", "standard", "link", "manual warranty", "7", "60"):
+        await telegram.send(100, value)
+    await telegram.click(100, "موجودی محدود")
+    await telegram.send(100, "2")
+    await telegram.click(100, "لازم است")
+    await telegram.click(100, "فعال")
+    await telegram.click(100, "انتهای فهرست")
+    await telegram.click(100, "بدون آیکون")
+    await telegram.click(100, "استفاده از قیمت‌گذاری عمومی")
+    await telegram.click(100, "تأیید و ثبت")
 
     await telegram.send(200, "/start")
     consent_callback = await telegram.click(200, "تأیید قوانین")
@@ -259,10 +284,11 @@ async def test_full_dispatcher_acceptance_persists_after_reconstruction():
     await telegram.send(100, "/admin")
     await telegram.click(100, "سفارش‌ها")
     await telegram.click(100, "ثبت تحویل")
-    await telegram.send(100, "Delivery content|https://example.invalid/activate")
+    await telegram.send(100, "Delivery content")
+    await telegram.send(100, "https://example.invalid/activate")
     async with sessions() as session:
         assert await session.scalar(select(func.count(DeliveryRow.order_id))) == 0
-    await telegram.click(100, "تأیید نهایی تحویل")
+    await telegram.click(100, "تأیید و ثبت")
 
     worker = Runtime.__new__(Runtime)
     worker.repo, worker.bot = repo, bot

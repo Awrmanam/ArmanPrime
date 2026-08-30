@@ -569,40 +569,19 @@ async def test_admin_text_forms_claim_delivery_and_emoji():
     repo, owner = RepoFake(), MessageFake(actor=1)
     router = persistent_router(repo)
     form = handler(router, "message", "form_text")
-    for state, value in (
-        ("admin.rate", "50000"),
-        ("admin.pricing", "markup|10|0|1|2|3|100"),
-        ("admin.category", "Title|Description|1"),
-        ("admin.product", f"{uuid4()}|Title|Description|10|30d|plan|link|warranty|7|60|1|false"),
-        ("admin.merchant", "Bank|Holder|5555555555554444|1|100000"),
-        ("admin.page", "home|Welcome"),
-    ):
-        await repo.coordinator.redis.set("fsm:1", state)
-        owner.text = value
-        await form(owner)
-        assert "موفقیت" in owner.answers[-1][0]
-    await repo.coordinator.redis.set("fsm:1", f"admin.button:{uuid4()}")
-    owner.text = "Catalog|catalog|0|0|primary"
-    await form(owner)
-    assert "دکمه ثبت" in owner.answers[-1][0]
-    await repo.coordinator.redis.set("fsm:1", f"admin.product.pricing:{uuid4()}")
-    owner.text = "markup|12.5|0|1|2|3|100|-"
-    await form(owner)
-    assert "قیمت اختصاصی" in owner.answers[-1][0]
     callback = handler(router, "callback_query", "callback")
-    token = await repo.coordinator.issue_callback("admin.order.claim", 1, str(uuid4()))
+    token = await repo.coordinator.issue_callback("admin.rate", 1)
     await callback(QueryFake(token, owner, actor=1))
-    token = await repo.coordinator.issue_callback("admin.order.deliver", 1, str(uuid4()))
-    await callback(QueryFake(token, owner, actor=1))
-    repo.deliver.reset_mock()
-    owner.text = "content|https://example.invalid"
+    owner.text = "not-a-number"
     await form(owner)
-    assert "پیش‌نمایش تحویل" in owner.answers[-1][0]
-    assert not repo.deliver.await_count
+    assert "معتبر نیست" in owner.answers[-1][0]
+    assert await repo.coordinator.redis.get("fsm:1") == "admin.wizard"
+    owner.text = "۵۰٬۰۰۰".replace("٬", "")
+    await form(owner)
+    assert "پیش‌نمایش نرخ" in owner.answers[-1][0]
     confirm = owner.answers[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data
     await callback(QueryFake(confirm, owner, actor=1))
-    assert repo.deliver.await_count == 1
-    assert "تحویل ثبت" in owner.answers[-1][0]
+    assert repo.set_rate.await_count == 1
 
     await repo.coordinator.redis.set("fsm:1", "admin.emoji")
     owner.text = "inline-premium"

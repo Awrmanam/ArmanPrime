@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
+import re
 from datetime import timedelta
-from uuid import UUID
+from decimal import Decimal, InvalidOperation
+from types import SimpleNamespace
+from uuid import UUID, uuid4
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -17,10 +21,25 @@ from sqlalchemy import text
 from .config import Settings
 from .db import create_engine_and_session
 from .repository import AccessDenied, RedisCoordinator, ShopRepository
-from .security import Vault
+from .security import Vault, mask_pan
 from .telegram_adapter import Button, extract_message_custom_emoji
 
 log = logging.getLogger(__name__)
+
+
+class EditablePanel:
+    """Minimal message facade used to edit the actor's single admin panel."""
+
+    def __init__(self, source: Message, chat_id: int, message_id: int):
+        self.bot = source.bot
+        self.chat = SimpleNamespace(id=chat_id)
+        self.message_id = message_id
+        self.from_user = SimpleNamespace(is_bot=True)
+
+    async def edit_text(self, text_value: str, **kwargs):
+        return await self.bot.edit_message_text(
+            chat_id=self.chat.id, message_id=self.message_id, text=text_value, **kwargs
+        )
 
 
 def markup(rows: list[list[Button]]) -> InlineKeyboardMarkup:
@@ -62,6 +81,7 @@ def persistent_router(repo: ShopRepository) -> Router:
             f"card-bank:{actor_id}",
             f"card-pan:{actor_id}",
             f"receipt-order:{actor_id}",
+            f"admin-draft:{actor_id}",
         ]
         scan_iter = getattr(repo.coordinator.redis, "scan_iter", None)
         if scan_iter:
@@ -69,9 +89,593 @@ def persistent_router(repo: ShopRepository) -> Router:
                 keys.append(key)
         await repo.coordinator.redis.delete(*keys)
 
+    def normalize_digits(value: str) -> str:
+        table = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+        return value.translate(table).strip()
+
+    def valid_card_number(digits: str) -> bool:
+        if len(digits) != 16 or not digits.isdigit():
+            return False
+        total = 0
+        for index, char in enumerate(digits):
+            value = int(char) * (2 if index % 2 == 0 else 1)
+            total += value - 9 if value > 9 else value
+        return total % 10 == 0
+
+    async def load_draft(actor: int) -> dict:
+        raw = await repo.coordinator.redis.get(f"admin-draft:{actor}")
+        return json.loads(raw) if raw else {}
+
+    async def save_draft(actor: int, draft: dict) -> None:
+        await repo.coordinator.redis.set(
+            f"admin-draft:{actor}", json.dumps(draft, ensure_ascii=False), ex=900
+        )
+
+    async def wizard_buttons(actor: int, *, skip: bool = False) -> list[Button]:
+        result = []
+        if skip:
+            token = await repo.coordinator.issue_callback("admin.wizard.skip", actor, one_time=True)
+            result.append(Button("رد کردن", token))
+        back = await repo.coordinator.issue_callback("admin.wizard.back", actor, one_time=True)
+        cancel = await repo.coordinator.issue_callback("admin.wizard.cancel", actor, one_time=True)
+        result.extend((Button("بازگشت", back), Button("لغو", cancel, "danger")))
+        return result
+
+    async def set_wizard(message: Message, actor: int, kind: str, step: int, data: dict) -> None:
+        repo.owner(actor)
+        await save_draft(actor, {"kind": kind, "step": step, "data": data})
+        await repo.coordinator.redis.set(f"fsm:{actor}", "admin.wizard", ex=900)
+        target = message
+        if getattr(getattr(message, "from_user", None), "is_bot", False):
+            if getattr(message, "message_id", None) and getattr(message, "chat", None):
+                await repo.coordinator.redis.set(
+                    f"admin-panel:{actor}",
+                    json.dumps({"chat": message.chat.id, "message": message.message_id}),
+                    ex=86400,
+                )
+        elif getattr(message, "bot", None):
+            stored_panel = await repo.coordinator.redis.get(f"admin-panel:{actor}")
+            if stored_panel:
+                panel = json.loads(stored_panel)
+                target = EditablePanel(message, panel["chat"], panel["message"])
+        await render_wizard(target, actor)
+
+    async def choice_rows(actor: int, choices: list[tuple[str, str]]) -> list[list[Button]]:
+        rows = []
+        for label, value in choices:
+            token = await repo.coordinator.issue_callback(
+                "admin.wizard.choice", actor, value, one_time=True
+            )
+            rows.append([Button(label, token)])
+        rows.append(await wizard_buttons(actor))
+        return rows
+
+    async def render_wizard(message: Message, actor: int) -> None:
+        draft = await load_draft(actor)
+        kind, step, data = draft["kind"], draft["step"], draft["data"]
+        if kind == "pricing" and step == 0:
+            await render_wizard_choice_or_preview(message, actor, kind, step, data)
+            return
+        if kind in {"merchant", "merchant_edit"} and step == 40:
+            await answer_keyboard(
+                message,
+                "مرحله ۵ از ۷\nسقف روزانه را به تومان وارد کنید.",
+                [await wizard_buttons(actor)],
+            )
+            return
+        if kind == "product" and step == 11:
+            await answer_keyboard(
+                message,
+                "مرحله ۱۲ از ۲۰\nتعداد موجودی را وارد کنید.",
+                [await wizard_buttons(actor)],
+            )
+            return
+        if kind == "product" and step == 160:
+            await answer_keyboard(
+                message,
+                "مرحله ۱۹ از ۲۰\nمقدار قیمت‌گذاری اختصاصی را وارد کنید.",
+                [await wizard_buttons(actor)],
+            )
+            return
+        if kind == "button" and step == 20:
+            await answer_keyboard(
+                message,
+                "مرحله ۳ از ۷\nنشانی کامل HTTPS را وارد کنید.",
+                [await wizard_buttons(actor)],
+            )
+            return
+        definitions = {
+            "terms": [("عنوان قوانین", False), ("متن کامل قوانین", False), ("صفحه تکمیلی", True)],
+            "rate": [("نرخ هر یک دلار را به تومان وارد کنید.", False)],
+            "merchant": [("شماره کارت مقصد", False), ("نام بانک", False), ("نام صاحب کارت", False)],
+            "merchant_edit": [("نام بانک", False), ("نام صاحب کارت", False)],
+            "category": [("عنوان دسته‌بندی", False), ("توضیح دسته‌بندی", True)],
+            "page": [("عنوان نمایشی صفحه", False), ("متن صفحه", False)],
+            "delivery": [("متن تحویل", False), ("پیوند فعال‌سازی", True)],
+            "button": [("متن دکمه", False)],
+            "appearance": [("برچسب فارسی دکمه", False)],
+            "product": [
+                ("عنوان محصول", False),
+                ("توضیح کامل محصول", False),
+                ("قیمت پایه دلاری", False),
+                ("قیمت ثابت تومانی", True),
+                ("مدت سرویس", True),
+                ("نوع یا پلن", True),
+                ("روش فعال‌سازی", True),
+                ("متن گارانتی", True),
+                ("مدت گارانتی به روز", True),
+                ("زمان تقریبی تحویل به دقیقه", False),
+            ],
+            "pricing": [
+                ("درصد روش انتخاب‌شده", False),
+                ("درصد هزینه پلتفرم", True),
+                ("درصد هزینه پرداخت", True),
+                ("درصد ذخیره گارانتی", True),
+                ("هزینه ثابت اضافه به تومان", True),
+            ],
+        }
+        text_steps = definitions.get(kind, [])
+        text_index = step - 1 if kind == "pricing" else step
+        if 0 <= text_index < len(text_steps):
+            title, optional = text_steps[text_index]
+            await answer_keyboard(
+                message,
+                f"{title}\n\nمرحله {step + 1} از {len(text_steps) + 2}\n"
+                "هر بار فقط همین مقدار را ارسال کنید.",
+                [await wizard_buttons(actor, skip=optional)],
+            )
+            return
+        await render_wizard_choice_or_preview(message, actor, kind, step, data)
+
+    async def render_wizard_choice_or_preview(
+        message: Message, actor: int, kind: str, step: int, data: dict
+    ) -> None:
+        if kind in {"merchant", "merchant_edit"}:
+            offset = 3 if kind == "merchant" else 2
+            choices = {
+                offset: [("اولویت ۱", "1"), ("اولویت ۲", "2"), ("اولویت ۳", "3")],
+                offset + 1: [("بدون سقف", "0"), ("تعیین سقف روزانه", "limit")],
+                offset + 2: [("فعال", "1"), ("غیرفعال", "0")],
+                offset + 3: [("تأیید و ثبت", "confirm")],
+            }
+        elif kind == "category":
+            choices = {
+                2: [("فعال", "1"), ("غیرفعال", "0")],
+                3: [("انتهای فهرست", "0"), ("ابتدای فهرست", "1")],
+                4: [("بدون آیکون", "")],
+                5: [("تأیید و ثبت", "confirm")],
+            }
+        elif kind == "pricing":
+            choices = {5: [("تأیید و ثبت", "confirm")]}
+        elif kind == "rate":
+            choices = {1: [("تأیید نرخ", "confirm")]}
+        elif kind == "terms":
+            choices = {3: [("انتشار قوانین", "confirm")]}
+        elif kind in {"page", "delivery", "button", "appearance", "product"}:
+            choices = {}
+        else:
+            choices = {}
+        if kind == "category" and step == 4:
+            choices[4] += [
+                (emoji.name, emoji.name) for emoji in await repo.emojis(actor, active_only=True)
+            ]
+        if step in choices and choices[step]:
+            if step == max(choices):
+                preview = wizard_preview(kind, data)
+                await answer_keyboard(message, preview, await choice_rows(actor, choices[step]))
+            else:
+                await answer_keyboard(
+                    message, "گزینه مناسب را انتخاب کنید.", await choice_rows(actor, choices[step])
+                )
+            return
+        # Wizard-specific continuations with inline choices.
+        if kind == "pricing" and step == 0:
+            await answer_keyboard(
+                message,
+                "مرحله ۱ از ۷\nروش قیمت‌گذاری را انتخاب کنید.",
+                await choice_rows(
+                    actor, [("درصد افزایش روی هزینه", "markup"), ("حاشیه سود هدف", "target_margin")]
+                ),
+            )
+        elif kind == "product" and step == 10:
+            await answer_keyboard(
+                message,
+                "مرحله ۱۱ از ۲۰\nنوع موجودی را انتخاب کنید.",
+                await choice_rows(
+                    actor, [("موجودی نامحدود", "unlimited"), ("موجودی محدود", "limited")]
+                ),
+            )
+        elif kind == "product" and step == 12:
+            await answer_keyboard(
+                message,
+                "مرحله ۱۴ از ۲۰\nآیا احراز هویت لازم است؟",
+                await choice_rows(actor, [("لازم است", "1"), ("لازم نیست", "0")]),
+            )
+        elif kind == "product" and step == 13:
+            await answer_keyboard(
+                message,
+                "مرحله ۱۵ از ۲۰\nوضعیت محصول",
+                await choice_rows(actor, [("فعال", "1"), ("غیرفعال", "0")]),
+            )
+        elif kind == "product" and step == 14:
+            await answer_keyboard(
+                message,
+                "مرحله ۱۶ از ۲۰\nجایگاه نمایش",
+                await choice_rows(actor, [("انتهای فهرست", "0"), ("ابتدای فهرست", "1")]),
+            )
+        elif kind == "product" and step == 15:
+            emoji_choices = [("بدون آیکون", "")] + [
+                (item.name, item.name) for item in await repo.emojis(actor, active_only=True)
+            ]
+            await answer_keyboard(
+                message,
+                "مرحله ۱۷ از ۲۰\nآیکون Premium Emoji",
+                await choice_rows(actor, emoji_choices),
+            )
+        elif kind == "product" and step == 16:
+            await answer_keyboard(
+                message,
+                "مرحله ۱۸ از ۲۰\nروش قیمت‌گذاری محصول",
+                await choice_rows(
+                    actor,
+                    [
+                        ("استفاده از قیمت‌گذاری عمومی", "inherit"),
+                        ("درصد اختصاصی", "markup"),
+                        ("حاشیه سود اختصاصی", "target_margin"),
+                        ("قیمت ثابت تومان", "fixed"),
+                    ],
+                ),
+            )
+        elif kind == "product" and step == 17:
+            await answer_keyboard(
+                message,
+                wizard_preview(kind, data),
+                await choice_rows(actor, [("تأیید و ثبت", "confirm")]),
+            )
+        elif kind == "page" and step == 2:
+            await answer_keyboard(
+                message,
+                "مرحله ۳ از ۶\nوضعیت صفحه",
+                await choice_rows(actor, [("فعال", "1"), ("غیرفعال", "0")]),
+            )
+        elif kind == "page" and step == 3:
+            await answer_keyboard(
+                message,
+                wizard_preview(kind, data),
+                await choice_rows(actor, [("تأیید و ثبت", "confirm")]),
+            )
+        elif kind == "appearance" and step == 1:
+            await answer_keyboard(
+                message,
+                "مرحله ۲ از ۶\nرنگ رسمی تلگرام",
+                await choice_rows(
+                    actor,
+                    [
+                        ("پیش‌فرض", "default"),
+                        ("اصلی", "primary"),
+                        ("موفق", "success"),
+                        ("خطر", "danger"),
+                    ],
+                ),
+            )
+        elif kind == "appearance" and step == 2:
+            emoji_choices = [("بدون آیکون", "")] + [
+                (item.name, item.name) for item in await repo.emojis(actor, active_only=True)
+            ]
+            await answer_keyboard(
+                message, "مرحله ۳ از ۶\nآیکون Registry", await choice_rows(actor, emoji_choices)
+            )
+        elif kind == "appearance" and step == 3:
+            await answer_keyboard(
+                message,
+                "مرحله ۴ از ۶\nردیف نمایش",
+                await choice_rows(actor, [(str(i + 1), str(i)) for i in range(6)]),
+            )
+        elif kind == "appearance" and step == 4:
+            await answer_keyboard(
+                message,
+                "مرحله ۵ از ۶\nترتیب در ردیف",
+                await choice_rows(actor, [(str(i + 1), str(i)) for i in range(4)]),
+            )
+        elif kind == "appearance" and step == 5:
+            await answer_keyboard(
+                message,
+                wizard_preview(kind, data),
+                await choice_rows(actor, [("تأیید و ثبت", "confirm")]),
+            )
+        elif kind == "button" and step == 1:
+            await answer_keyboard(
+                message,
+                "مرحله ۲ از ۷\nهدف دکمه",
+                await choice_rows(
+                    actor,
+                    [
+                        ("فروشگاه", "catalog"),
+                        ("حساب کاربری", "account"),
+                        ("سفارش‌های من", "my_orders"),
+                        ("نشانی اینترنتی امن", "url"),
+                    ],
+                ),
+            )
+        elif kind == "button" and step == 2:
+            await answer_keyboard(
+                message,
+                "مرحله ۴ از ۷\nسبک رسمی تلگرام",
+                await choice_rows(
+                    actor,
+                    [
+                        ("پیش‌فرض", "default"),
+                        ("اصلی", "primary"),
+                        ("موفق", "success"),
+                        ("خطر", "danger"),
+                    ],
+                ),
+            )
+        elif kind == "button" and step == 3:
+            emoji_choices = [("بدون آیکون", "")] + [
+                (item.name, item.name) for item in await repo.emojis(actor, active_only=True)
+            ]
+            await answer_keyboard(
+                message, "مرحله ۵ از ۷\nآیکون Registry", await choice_rows(actor, emoji_choices)
+            )
+        elif kind == "button" and step == 4:
+            await answer_keyboard(
+                message,
+                "مرحله ۶ از ۷\nجایگاه دکمه",
+                await choice_rows(actor, [("ردیف اول", "0"), ("ردیف بعد", "1")]),
+            )
+        elif kind == "button" and step == 5:
+            await answer_keyboard(
+                message,
+                wizard_preview(kind, data),
+                await choice_rows(actor, [("تأیید و ثبت", "confirm")]),
+            )
+        else:
+            preview = wizard_preview(kind, data)
+            await answer_keyboard(
+                message, preview, await choice_rows(actor, [("تأیید و ثبت", "confirm")])
+            )
+
+    def wizard_preview(kind: str, data: dict) -> str:
+        safe = {key: value for key, value in data.items() if key not in {"encrypted_pan"}}
+        labels = {
+            "terms": "پیش‌نمایش قوانین",
+            "rate": "پیش‌نمایش نرخ",
+            "pricing": "پیش‌نمایش فرمول قیمت‌گذاری",
+            "merchant": "پیش‌نمایش کارت مقصد",
+            "category": "پیش‌نمایش دسته‌بندی",
+            "product": "پیش‌نمایش محصول",
+            "page": "پیش‌نمایش صفحه سفارشی",
+            "button": "پیش‌نمایش دکمه",
+            "delivery": "پیش‌نمایش تحویل",
+            "appearance": "پیش‌نمایش ظاهر پنل",
+        }
+        return (
+            labels.get(kind, "پیش‌نمایش")
+            + "\n\n"
+            + "\n".join(f"{key}: {value}" for key, value in safe.items())
+        )
+
+    async def finish_wizard(message: Message, actor: int, draft: dict) -> None:
+        kind, data = draft["kind"], draft["data"]
+        if kind == "terms":
+            body = data["body"] + (f"\f{data['extra']}" if data.get("extra") else "")
+            await repo.publish_terms(actor, data["title"], body)
+        elif kind == "rate":
+            await repo.set_rate(actor, int(data["rate"]))
+        elif kind == "pricing":
+            config = {
+                "mode": data["mode"],
+                "markup": data["percent"] if data["mode"] == "markup" else "0",
+                "target_margin": data["percent"] if data["mode"] == "target_margin" else "0",
+                "platform_fee": data.get("platform_fee", "0"),
+                "payment_fee": data.get("payment_fee", "0"),
+                "warranty_reserve": data.get("warranty_reserve", "0"),
+                "fixed_cost_toman": int(data.get("fixed_cost_toman", 0)),
+            }
+            if data.get("product_id"):
+                await repo.set_product_pricing_override(actor, UUID(data["product_id"]), config)
+            else:
+                await repo.set_pricing(actor, config)
+        elif kind == "merchant":
+            await repo.create_merchant_card_encrypted(
+                actor,
+                data["bank"],
+                data["holder"],
+                data["encrypted_pan"],
+                data["masked_pan"],
+                int(data["priority"]),
+                int(data.get("daily_limit", 0)),
+                bool(data["active"]),
+            )
+        elif kind == "merchant_edit":
+            await repo.update_merchant_card(
+                actor,
+                UUID(data["editing_id"]),
+                bank_name=data["bank"],
+                holder_name=data["holder"],
+                priority=int(data["priority"]),
+                daily_limit=int(data.get("daily_limit", 0)),
+                active=bool(data["active"]),
+            )
+        elif kind == "category":
+            if data.get("editing_id"):
+                row = await repo.update_category(
+                    actor,
+                    UUID(data["editing_id"]),
+                    title=data["title"],
+                    description=data.get("description"),
+                    position=int(data["position"]),
+                    active=bool(data["active"]),
+                )
+            else:
+                row = await repo.create_category(
+                    actor, data["title"], data.get("description"), int(data["position"])
+                )
+            await repo.set_entity_emoji(actor, "category", row.id, data.get("emoji"))
+            if not data["active"]:
+                await repo.update_category(actor, row.id, active=False)
+        elif kind == "product":
+            values = {
+                "title": data["title"],
+                "description": data["description"],
+                "base_price_usd": data["base_price_usd"],
+                "fixed_price_toman": data.get("fixed_price_toman"),
+                "duration": data.get("duration"),
+                "plan_type": data.get("plan_type"),
+                "activation_method": data.get("activation_method"),
+                "warranty_text": data.get("warranty_text"),
+                "warranty_days": int(data.get("warranty_days", 0)),
+                "delivery_minutes": int(data["delivery_minutes"]),
+                "stock": int(data.get("stock", 0)),
+                "unlimited_stock": bool(data.get("unlimited_stock")),
+                "requires_kyc": bool(data.get("requires_kyc", True)),
+                "position": int(data.get("position", 0)),
+            }
+            pricing_mode = data.get("pricing_mode", "inherit")
+            if pricing_mode == "fixed":
+                values["fixed_price_toman"] = int(data["pricing_value"])
+            elif pricing_mode in {"markup", "target_margin"}:
+                values["pricing_override"] = {
+                    "mode": pricing_mode,
+                    "markup": data["pricing_value"] if pricing_mode == "markup" else "0",
+                    "target_margin": (
+                        data["pricing_value"] if pricing_mode == "target_margin" else "0"
+                    ),
+                    "platform_fee": "0",
+                    "payment_fee": "0",
+                    "warranty_reserve": "0",
+                    "fixed_cost_toman": 0,
+                }
+            if data.get("editing_id"):
+                values["category_id"] = UUID(data["category_id"])
+                values["active"] = bool(data.get("active", True))
+                row = await repo.update_product(actor, UUID(data["editing_id"]), values)
+            else:
+                row = await repo.create_product(actor, UUID(data["category_id"]), values)
+                if not data.get("active", True):
+                    row = await repo.update_product(actor, row.id, {"active": False})
+            await repo.set_entity_emoji(actor, "product", row.id, data.get("emoji"))
+        elif kind == "page":
+            # The internal key is generated and is never requested from the owner.
+            slug = "page-" + re.sub(r"[^a-z0-9]+", "-", data["title"].lower()).strip("-")
+            if slug == "page-":
+                slug += uuid4().hex[:10]
+            await repo.create_page(
+                actor, slug[:100], data["title"], data["content"], bool(data["active"])
+            )
+        elif kind == "button":
+            values = {
+                "text": data["text"],
+                "action": data.get("action", "catalog"),
+                "row": int(data.get("row", 0)),
+                "position": int(data.get("position", 0)),
+                "style": data.get("style", "default"),
+                "custom_emoji_id": data.get("emoji"),
+            }
+            if data.get("button_id"):
+                await repo.update_page_button(actor, UUID(data["button_id"]), values)
+            else:
+                await repo.create_page_button(
+                    actor,
+                    UUID(data["page_id"]),
+                    values["text"],
+                    values["action"],
+                    values["row"],
+                    values["position"],
+                    values["style"],
+                    values["custom_emoji_id"],
+                )
+        elif kind == "delivery":
+            await repo.deliver(
+                actor, UUID(data["order_id"]), data["content"], data.get("activation_link")
+            )
+        elif kind == "appearance":
+            await repo.set_admin_button_preference(actor, data["action"], data)
+        await clear_actor_state(actor)
+        await admin_home(message, actor)
+
+    async def handle_wizard_choice(message: Message, actor: int, value: str) -> None:
+        repo.owner(actor)
+        draft = await load_draft(actor)
+        if not draft:
+            raise AccessDenied("FORM_EXPIRED")
+        kind, step, data = draft["kind"], draft["step"], draft["data"]
+        if value == "confirm":
+            await finish_wizard(message, actor, draft)
+            return
+        if kind == "pricing" and step == 0:
+            data["mode"], step = value, 1
+        elif kind == "merchant" and step == 3:
+            data["priority"], step = int(value), 4
+        elif kind == "merchant" and step == 4:
+            if value == "limit":
+                step = 40
+            else:
+                data["daily_limit"], step = 0, 5
+        elif kind == "merchant" and step == 5:
+            data["active"], step = bool(int(value)), 6
+        elif kind == "merchant_edit" and step == 2:
+            data["priority"], step = int(value), 3
+        elif kind == "merchant_edit" and step == 3:
+            if value == "limit":
+                step = 40
+            else:
+                data["daily_limit"], step = 0, 4
+        elif kind == "merchant_edit" and step == 4:
+            data["active"], step = bool(int(value)), 5
+        elif kind == "category" and step == 2:
+            data["active"], step = bool(int(value)), 3
+        elif kind == "category" and step == 3:
+            data["position"], step = int(value), 4
+        elif kind == "category" and step == 4:
+            data["emoji"], step = value or None, 5
+        elif kind == "product" and step == 10:
+            data["unlimited_stock"] = value == "unlimited"
+            step = 12 if value == "unlimited" else 11
+        elif kind == "product" and step == 12:
+            data["requires_kyc"], step = bool(int(value)), 13
+        elif kind == "product" and step == 13:
+            data["active"], step = bool(int(value)), 14
+        elif kind == "product" and step == 14:
+            data["position"], step = int(value), 15
+        elif kind == "product" and step == 15:
+            data["emoji"], step = value or None, 16
+        elif kind == "product" and step == 16:
+            data["pricing_mode"] = value
+            step = 17 if value == "inherit" else 160
+        elif kind == "page" and step == 2:
+            data["active"], step = bool(int(value)), 3
+        elif kind == "appearance" and step == 1:
+            data["style"], step = value, 2
+        elif kind == "appearance" and step == 2:
+            data["emoji"], step = value or None, 3
+        elif kind == "appearance" and step == 3:
+            data["row"], step = int(value), 4
+        elif kind == "appearance" and step == 4:
+            data["order"], step = int(value), 5
+        elif kind == "button" and step == 1:
+            step = 20 if value == "url" else 2
+            if value != "url":
+                data["action"] = value
+        elif kind == "button" and step == 2:
+            data["style"], step = value, 3
+        elif kind == "button" and step == 3:
+            data["emoji"], step = value or None, 4
+        elif kind == "button" and step == 4:
+            data["row"], data["position"], step = int(value), 0, 5
+        else:
+            data["choice"], step = value, step + 1
+        await set_wizard(message, actor, kind, step, data)
+
     async def admin_home(message: Message, actor_id: int) -> None:
         repo.owner(actor_id)
         status = await repo.setup_status(actor_id)
+        preferences = (
+            await repo.admin_button_preferences(actor_id)
+            if hasattr(repo, "admin_button_preferences")
+            else {}
+        )
 
         def mark(ready: bool) -> str:
             return "کامل" if ready else "نیازمند تنظیم"
@@ -88,6 +692,7 @@ def persistent_router(repo: ShopRepository) -> Router:
             "orders",
             "page",
             "emoji",
+            "appearance",
             "audit",
             "close",
         )
@@ -95,24 +700,39 @@ def persistent_router(repo: ShopRepository) -> Router:
             await repo.coordinator.issue_callback(f"admin.{name}", actor_id, one_time=False)
             for name in names
         ]
+        defaults = {
+            "terms": (f"قوانین فروشگاه — {mark(status['terms'])}", "primary", 0),
+            "rate": (f"نرخ دلار — {mark(status['rate'])}", "default", 1),
+            "pricing": (f"فرمول قیمت‌گذاری — {mark(status['pricing'])}", "default", 2),
+            "merchant": (f"کارت مقصد — {mark(status['merchant'])}", "default", 3),
+            "category": (f"دسته‌بندی — {mark(status['category'])}", "default", 4),
+            "product": (f"محصول — {mark(status['product'])}", "default", 5),
+            "kyc": ("احراز هویت", "default", 6),
+            "cards": ("کارت‌ها", "default", 6),
+            "orders": ("سفارش‌ها", "success", 7),
+            "page": ("صفحات سفارشی", "default", 8),
+            "emoji": ("Premium Emoji", "default", 9),
+            "appearance": ("ظاهر پنل", "primary", 10),
+            "audit": ("Audit", "default", 11),
+            "close": ("بازگشت", "danger", 12),
+        }
+        grouped: dict[int, list[tuple[int, Button]]] = {}
+        for index, name in enumerate(names):
+            label, style, row = defaults[name]
+            pref = preferences.get(name, {})
+            icon = await repo.resolve_emoji_key(pref.get("emoji")) if pref.get("emoji") else None
+            button = Button(
+                pref.get("label", label), actions[index], pref.get("style", style), icon
+            )
+            grouped.setdefault(int(pref.get("row", row)), []).append(
+                (int(pref.get("order", index)), button)
+            )
+        rows = [[item[1] for item in sorted(grouped[row])] for row in sorted(grouped)]
         await answer_keyboard(
             message,
             "پنل مدیریت\n\n"
             f"وضعیت آمادگی فروشگاه: {'آماده فروش' if all(status.values()) else 'نیازمند تکمیل'}",
-            [
-                [Button(f"قوانین فروشگاه — {mark(status['terms'])}", actions[0], "primary")],
-                [Button(f"نرخ دلار — {mark(status['rate'])}", actions[1])],
-                [Button(f"فرمول قیمت‌گذاری — {mark(status['pricing'])}", actions[2])],
-                [Button(f"کارت مقصد — {mark(status['merchant'])}", actions[5])],
-                [Button(f"دسته‌بندی — {mark(status['category'])}", actions[3])],
-                [Button(f"محصول — {mark(status['product'])}", actions[4])],
-                [Button("احراز هویت", actions[6]), Button("کارت‌ها", actions[7])],
-                [Button("سفارش‌ها", actions[8], "success")],
-                [Button("صفحات سفارشی", actions[9])],
-                [Button("Premium Emoji", actions[10])],
-                [Button("Audit", actions[11])],
-                [Button("بازگشت", actions[12], "danger")],
-            ],
+            rows,
         )
 
     async def home(message: Message, actor_id: int) -> None:
@@ -174,6 +794,61 @@ def persistent_router(repo: ShopRepository) -> Router:
             if state["a"] == "consent":
                 await repo.accept_terms(query.from_user.id, UUID(state["o"]))
                 await home(query.message, query.from_user.id)
+            elif state["a"] == "admin.wizard.choice":
+                await handle_wizard_choice(query.message, query.from_user.id, state["o"])
+            elif state["a"] == "admin.wizard.skip":
+                draft = await load_draft(query.from_user.id)
+                if not draft:
+                    raise AccessDenied("FORM_EXPIRED")
+                kind, step, data = draft["kind"], draft["step"], draft["data"]
+                fields = {
+                    "terms": ["title", "body", "extra"],
+                    "pricing": [
+                        None,
+                        "percent",
+                        "platform_fee",
+                        "payment_fee",
+                        "warranty_reserve",
+                        "fixed_cost_toman",
+                    ],
+                    "category": ["title", "description"],
+                    "product": [
+                        "title",
+                        "description",
+                        "base_price_usd",
+                        "fixed_price_toman",
+                        "duration",
+                        "plan_type",
+                        "activation_method",
+                        "warranty_text",
+                        "warranty_days",
+                        "delivery_minutes",
+                    ],
+                    "delivery": ["content", "activation_link"],
+                    "button": ["text"],
+                }
+                index = step - 1 if kind == "pricing" else step
+                field = fields.get(kind, [])[index]
+                if field:
+                    data[field] = "0" if kind == "pricing" else None
+                await set_wizard(query.message, query.from_user.id, kind, step + 1, data)
+            elif state["a"] == "admin.wizard.back":
+                draft = await load_draft(query.from_user.id)
+                if not draft:
+                    raise AccessDenied("FORM_EXPIRED")
+                if draft["step"] == 40:
+                    draft["step"] = 4 if draft["kind"] == "merchant" else 3
+                elif draft["step"] == 160:
+                    draft["step"] = 16
+                else:
+                    draft["step"] = max(0, draft["step"] - 1)
+                await set_wizard(
+                    query.message, query.from_user.id, draft["kind"], draft["step"], draft["data"]
+                )
+            elif state["a"] == "admin.wizard.cancel":
+                repo.owner(query.from_user.id)
+                await clear_actor_state(query.from_user.id)
+                await admin_home(query.message, query.from_user.id)
             elif state["a"] == "catalog":
                 rows = []
                 for category in await repo.categories():
@@ -405,6 +1080,35 @@ def persistent_router(repo: ShopRepository) -> Router:
                     await answer_keyboard(query.message, "صف بررسی", rows)
                 elif state["a"] != "admin.audit":
                     await query.message.answer("صف بررسی خالی است.")
+            elif state["a"] == "admin.appearance":
+                repo.owner(query.from_user.id)
+                labels = {
+                    "terms": "قوانین",
+                    "rate": "نرخ دلار",
+                    "pricing": "قیمت‌گذاری",
+                    "merchant": "کارت مقصد",
+                    "category": "دسته‌بندی",
+                    "product": "محصول",
+                    "kyc": "احراز هویت",
+                    "cards": "کارت‌ها",
+                    "orders": "سفارش‌ها",
+                    "page": "صفحات سفارشی",
+                    "emoji": "Premium Emoji",
+                    "audit": "Audit",
+                }
+                rows = []
+                for action, label in labels.items():
+                    token = await repo.coordinator.issue_callback(
+                        "admin.appearance.action", query.from_user.id, action, one_time=True
+                    )
+                    rows.append([Button(label, token)])
+                await answer_keyboard(
+                    query.message, "ظاهر پنل\nدکمه مورد نظر را انتخاب کنید.", rows
+                )
+            elif state["a"] == "admin.appearance.action":
+                await set_wizard(
+                    query.message, query.from_user.id, "appearance", 0, {"action": state["o"]}
+                )
             elif state["a"] in {"admin.category", "admin.product", "admin.merchant"}:
                 repo.owner(query.from_user.id)
                 rows = []
@@ -463,7 +1167,7 @@ def persistent_router(repo: ShopRepository) -> Router:
                     buttons = await repo.coordinator.issue_callback(
                         "admin.page.buttons", query.from_user.id, str(page.id), one_time=False
                     )
-                    rows.append([Button(f"{page.slug} — مدیریت دکمه‌ها", buttons)])
+                    rows.append([Button(f"{page.title} — مدیریت دکمه‌ها", buttons)])
                 create = await repo.coordinator.issue_callback(
                     "admin.page.create", query.from_user.id, one_time=True
                 )
@@ -497,9 +1201,7 @@ def persistent_router(repo: ShopRepository) -> Router:
                 )
                 await query.message.answer("Premium Emoji انتخاب شد.")
             elif state["a"] == "admin.page.create":
-                repo.owner(query.from_user.id)
-                await repo.coordinator.redis.set(f"fsm:{query.from_user.id}", "admin.page", ex=900)
-                await query.message.answer("slug|متن صفحه را ارسال کنید.")
+                await set_wizard(query.message, query.from_user.id, "page", 0, {})
             elif state["a"] == "admin.page.buttons":
                 repo.owner(query.from_user.id)
                 page_id = UUID(state["o"])
@@ -536,20 +1238,16 @@ def persistent_router(repo: ShopRepository) -> Router:
                 rows.append([Button("ساخت دکمه", create, "primary")])
                 await answer_keyboard(query.message, "دکمه‌های صفحه", rows)
             elif state["a"] == "admin.button.create":
-                repo.owner(query.from_user.id)
-                await repo.coordinator.redis.set(
-                    f"fsm:{query.from_user.id}", f"admin.button:{state['o']}", ex=900
-                )
-                await query.message.answer(
-                    "متن|target|row|position|style را ارسال کنید؛ ایموجی جدا انتخاب می‌شود."
+                await set_wizard(
+                    query.message, query.from_user.id, "button", 0, {"page_id": state["o"]}
                 )
             elif state["a"] == "admin.button.edit":
-                repo.owner(query.from_user.id)
-                await repo.coordinator.redis.set(
-                    f"fsm:{query.from_user.id}", f"admin.button.edit:{state['o']}", ex=900
-                )
-                await query.message.answer(
-                    "متن|target|row|position|style|active را ارسال کنید؛ ایموجی جدا انتخاب می‌شود."
+                await set_wizard(
+                    query.message,
+                    query.from_user.id,
+                    "button",
+                    0,
+                    {"button_id": state["o"], "editing": True},
                 )
             elif state["a"] == "admin.button.emoji":
                 repo.owner(query.from_user.id)
@@ -588,14 +1286,8 @@ def persistent_router(repo: ShopRepository) -> Router:
                 "admin.category.create",
                 "admin.merchant.create",
             }:
-                repo.owner(query.from_user.id)
-                target = state["a"].removesuffix(".create")
-                await repo.coordinator.redis.set(f"fsm:{query.from_user.id}", target, ex=900)
-                prompts = {
-                    "admin.category": "عنوان|توضیح|ترتیب را ارسال کنید؛ ایموجی جدا انتخاب می‌شود.",
-                    "admin.merchant": "بانک|صاحب کارت|PAN|اولویت|سقف روزانه را ارسال کنید.",
-                }
-                await query.message.answer(prompts[target])
+                kind = state["a"].split(".")[1]
+                await set_wizard(query.message, query.from_user.id, kind, 0, {})
             elif state["a"] == "admin.product.create":
                 repo.owner(query.from_user.id)
                 rows = []
@@ -614,25 +1306,20 @@ def persistent_router(repo: ShopRepository) -> Router:
                 else:
                     await query.message.answer("ابتدا یک دسته فعال بسازید.")
             elif state["a"] == "admin.product.create.category":
-                repo.owner(query.from_user.id)
-                await repo.coordinator.redis.set(
-                    f"fsm:{query.from_user.id}", f"admin.product:{state['o']}", ex=900
-                )
-                await query.message.answer(
-                    "عنوان|توضیح|USD|مدت|پلن|فعال‌سازی|گارانتی|روز گارانتی|"
-                    "دقیقه تحویل|موجودی|unlimited|KYC|ترتیب|fixed_toman یا - "
-                    "را ارسال کنید؛ ایموجی جدا از Registry انتخاب می‌شود."
+                await set_wizard(
+                    query.message,
+                    query.from_user.id,
+                    "product",
+                    0,
+                    {"category_id": state["o"]},
                 )
             elif state["a"] == "admin.product.pricing":
-                repo.owner(query.from_user.id)
-                await repo.coordinator.redis.set(
-                    f"fsm:{query.from_user.id}",
-                    f"admin.product.pricing:{state['o']}",
-                    ex=900,
-                )
-                await query.message.answer(
-                    "mode|markup|target_margin|platform_fee|payment_fee|warranty_reserve|"
-                    "fixed_cost|fixed_toman یا - را ارسال کنید. برای حذف override، mode=inherit."
+                await set_wizard(
+                    query.message,
+                    query.from_user.id,
+                    "pricing",
+                    0,
+                    {"product_id": state["o"]},
                 )
             elif state["a"].startswith(
                 ("admin.category.toggle", "admin.product.toggle", "admin.merchant.toggle")
@@ -661,40 +1348,72 @@ def persistent_router(repo: ShopRepository) -> Router:
                 ("admin.category.edit", "admin.product.edit", "admin.merchant.edit")
             ):
                 repo.owner(query.from_user.id)
-                target = state["a"].removesuffix(".edit")
-                await repo.coordinator.redis.set(
-                    f"fsm:{query.from_user.id}", f"{target}.edit:{state['o']}", ex=900
-                )
-                prompts = {
-                    "admin.category": "عنوان|توضیح|ترتیب را ارسال کنید؛ ایموجی جدا انتخاب می‌شود.",
-                    "admin.product": (
-                        "category_id|عنوان|توضیح|USD|مدت|پلن|فعال‌سازی|گارانتی|روز گارانتی|"
-                        "دقیقه تحویل|موجودی|unlimited|KYC|ترتیب|fixed_toman یا - را ارسال کنید؛"
-                        " ایموجی جدا از Registry انتخاب می‌شود."
-                    ),
-                    "admin.merchant": "بانک|صاحب کارت|اولویت|سقف روزانه|active را ارسال کنید.",
-                }
-                await query.message.answer(prompts[target])
+                kind = state["a"].split(".")[1]
+                object_id = UUID(state["o"])
+                if kind == "category":
+                    item = next(
+                        x
+                        for x in await repo.owner_categories(query.from_user.id)
+                        if x.id == object_id
+                    )
+                    data = {
+                        "editing_id": state["o"],
+                        "title": item.title,
+                        "description": item.description or "",
+                        "active": item.active,
+                        "position": item.position,
+                        "emoji": item.custom_emoji_id,
+                    }
+                elif kind == "merchant":
+                    item = next(
+                        x
+                        for x in await repo.owner_merchant_cards(query.from_user.id)
+                        if x.id == object_id
+                    )
+                    data = {
+                        "editing_id": state["o"],
+                        "bank": item.bank_name,
+                        "holder": item.holder_name,
+                        "masked_pan": item.masked_pan,
+                        "active": item.active,
+                        "priority": item.priority,
+                        "daily_limit": item.daily_limit,
+                    }
+                    kind = "merchant_edit"
+                else:
+                    item = next(
+                        x
+                        for x in await repo.owner_products(query.from_user.id)
+                        if x.id == object_id
+                    )
+                    data = {
+                        "editing_id": state["o"],
+                        "category_id": str(item.category_id),
+                        "title": item.title,
+                        "description": item.description,
+                        "base_price_usd": str(item.base_price_usd),
+                        "fixed_price_toman": item.fixed_price_toman,
+                        "duration": item.duration,
+                        "plan_type": item.plan_type,
+                        "activation_method": item.activation_method,
+                        "warranty_text": item.warranty_text,
+                        "warranty_days": item.warranty_days,
+                        "delivery_minutes": item.delivery_minutes,
+                        "stock": item.stock,
+                        "unlimited_stock": item.unlimited_stock,
+                        "requires_kyc": item.requires_kyc,
+                        "active": item.active,
+                        "position": item.position,
+                        "emoji": item.custom_emoji_id,
+                    }
+                await set_wizard(query.message, query.from_user.id, kind, 0, data)
             elif state["a"] == "admin.terms":
-                repo.owner(query.from_user.id)
-                await repo.coordinator.redis.set(
-                    f"fsm:{query.from_user.id}", "admin.terms.title", ex=900
-                )
-                await query.message.answer("عنوان نسخه جدید قوانین را ارسال کنید.")
+                await set_wizard(query.message, query.from_user.id, "terms", 0, {})
             elif state["a"] in {
                 "admin.rate",
                 "admin.pricing",
             }:
-                repo.owner(query.from_user.id)
-                await repo.coordinator.redis.set(f"fsm:{query.from_user.id}", state["a"], ex=900)
-                prompts = {
-                    "admin.rate": "نرخ صحیح USD/Toman را ارسال کنید.",
-                    "admin.pricing": (
-                        "تنظیم قیمت را به‌ترتیب mode|markup|target_margin|platform_fee|"
-                        "payment_fee|warranty_reserve|fixed_cost ارسال کنید."
-                    ),
-                }
-                await query.message.answer(prompts[state["a"]])
+                await set_wizard(query.message, query.from_user.id, state["a"].split(".")[1], 0, {})
             elif state["a"].startswith(("admin.kyc.", "admin.card.", "admin.payment.")):
                 repo.owner(query.from_user.id)
                 await repo.coordinator.redis.set(
@@ -708,11 +1427,13 @@ def persistent_router(repo: ShopRepository) -> Router:
                 await repo.claim(query.from_user.id, UUID(state["o"]))
                 await query.message.answer("سفارش به شما Assign و وارد PROCESSING شد.")
             elif state["a"] == "admin.order.deliver":
-                repo.owner(query.from_user.id)
-                await repo.coordinator.redis.set(
-                    f"fsm:{query.from_user.id}", f"admin.delivery:{state['o']}", ex=900
+                await set_wizard(
+                    query.message,
+                    query.from_user.id,
+                    "delivery",
+                    0,
+                    {"order_id": state["o"]},
                 )
-                await query.message.answer("متن تحویل|لینک اختیاری را ارسال کنید.")
             elif state["a"] == "admin.delivery.confirm":
                 repo.owner(query.from_user.id)
                 draft_key = f"delivery-draft:{query.from_user.id}:{state['o']}"
@@ -824,318 +1545,127 @@ def persistent_router(repo: ShopRepository) -> Router:
     @router.message(F.text)
     async def form_text(message: Message) -> None:
         state = await repo.coordinator.redis.get(f"fsm:{message.from_user.id}")
-        if state and state.startswith("admin.delivery:"):
+        if state == "admin.wizard":
             try:
                 repo.owner(message.from_user.id)
-                order_id = UUID(state.split(":", 1)[1])
-                content, *link = [item.strip() for item in message.text.split("|", 1)]
-                if not content:
-                    raise ValueError("DELIVERY_CONTENT_REQUIRED")
-                activation_link = link[0] if link and link[0] else ""
-                await repo.coordinator.redis.set(
-                    f"delivery-draft:{message.from_user.id}:{order_id}",
-                    f"{content}\0{activation_link}",
-                    ex=900,
+                draft = await load_draft(message.from_user.id)
+                if not draft:
+                    raise ValueError("FORM_EXPIRED")
+                kind, step, data = draft["kind"], draft["step"], draft["data"]
+                value = normalize_digits(message.text).strip()
+                fields = {
+                    "terms": ["title", "body", "extra"],
+                    "rate": ["rate"],
+                    "merchant": ["pan", "bank", "holder"],
+                    "merchant_edit": ["bank", "holder"],
+                    "category": ["title", "description"],
+                    "pricing": [
+                        None,
+                        "percent",
+                        "platform_fee",
+                        "payment_fee",
+                        "warranty_reserve",
+                        "fixed_cost_toman",
+                    ],
+                    "product": [
+                        "title",
+                        "description",
+                        "base_price_usd",
+                        "fixed_price_toman",
+                        "duration",
+                        "plan_type",
+                        "activation_method",
+                        "warranty_text",
+                        "warranty_days",
+                        "delivery_minutes",
+                    ],
+                    "page": ["title", "content"],
+                    "button": ["text", "url"],
+                    "delivery": ["content", "activation_link"],
+                    "appearance": ["label"],
+                }
+                if kind in {"merchant", "merchant_edit"} and step == 40:
+                    if not value.isdigit() or int(value) <= 0:
+                        raise ValueError("POSITIVE_AMOUNT_REQUIRED")
+                    data["daily_limit"] = int(value)
+                    next_step = 5 if kind == "merchant" else 4
+                elif kind == "product" and step == 160:
+                    number = Decimal(value)
+                    if number < 0 or (data.get("pricing_mode") != "fixed" and number >= 100):
+                        raise ValueError("INVALID_PRODUCT_PRICING")
+                    data["pricing_value"], next_step = str(number), 17
+                elif kind == "button" and step == 20:
+                    if not value.startswith("https://"):
+                        raise ValueError("HTTPS_URL_REQUIRED")
+                    data["action"], next_step = value, 2
+                elif kind == "product" and step == 11:
+                    if not value.isdigit() or int(value) < 0:
+                        raise ValueError("NON_NEGATIVE_NUMBER_REQUIRED")
+                    data["stock"], next_step = int(value), 12
+                else:
+                    index = step - 1 if kind == "pricing" else step
+                    field = fields.get(kind, [])[index]
+                    if not value:
+                        raise ValueError("VALUE_REQUIRED")
+                    if kind == "merchant" and field == "pan":
+                        digits = "".join(char for char in value if char.isdigit())
+                        if not valid_card_number(digits):
+                            raise ValueError("CARD_NUMBER_REQUIRED")
+                        data["encrypted_pan"] = repo.vault.encrypt(digits)
+                        data["masked_pan"] = mask_pan(digits)
+                        with contextlib.suppress(Exception):
+                            await message.delete()
+                    elif kind == "rate":
+                        amount = int(value.replace(",", ""))
+                        if amount <= 0:
+                            raise ValueError("POSITIVE_RATE_REQUIRED")
+                        data[field] = amount
+                    elif kind == "pricing":
+                        number = Decimal(value)
+                        if number < 0 or (field != "fixed_cost_toman" and number >= 100):
+                            raise ValueError("INVALID_PERCENT")
+                        data[field] = str(number)
+                    elif kind == "product" and field in {
+                        "base_price_usd",
+                        "fixed_price_toman",
+                        "warranty_days",
+                        "delivery_minutes",
+                    }:
+                        number = Decimal(value)
+                        if number < 0:
+                            raise ValueError("NON_NEGATIVE_NUMBER_REQUIRED")
+                        data[field] = int(number) if field != "base_price_usd" else str(number)
+                    else:
+                        data[field] = value
+                    next_step = step + 1
+                await save_draft(
+                    message.from_user.id, {"kind": kind, "step": next_step, "data": data}
                 )
-                confirm = await repo.coordinator.issue_callback(
-                    "admin.delivery.confirm",
-                    message.from_user.id,
-                    str(order_id),
-                    one_time=True,
+                with contextlib.suppress(Exception):
+                    await message.delete()
+                await set_wizard(message, message.from_user.id, kind, next_step, data)
+            except (ValueError, InvalidOperation, IndexError):
+                await message.answer(
+                    "این مقدار معتبر نیست. لطفاً فقط مقدار خواسته‌شده در همین مرحله "
+                    "را با قالب درست ارسال کنید."
                 )
-                preview = f"پیش‌نمایش تحویل\n\n{content}"
-                if activation_link:
-                    preview += f"\n{activation_link}"
-                await answer_keyboard(
-                    message, preview, [[Button("تأیید نهایی تحویل", confirm, "success")]]
-                )
-            except Exception:
-                log.exception("delivery failed", extra={"telegram_id": message.from_user.id})
-                await message.answer("ثبت تحویل انجام نشد.")
+            except AccessDenied:
+                await message.answer("دسترسی مجاز نیست.")
         elif state == "admin.emoji":
             try:
                 repo.owner(message.from_user.id)
-                source = message.reply_to_message
-                identifiers = extract_message_custom_emoji(source)
+                identifiers = extract_message_custom_emoji(message.reply_to_message)
                 if not message.text.strip() or not identifiers:
                     raise ValueError("NAME_AND_CUSTOM_EMOJI_REQUIRED")
                 emoji = await repo.register_emoji(
                     message.from_user.id, message.text.strip(), identifiers[0]
                 )
-                await repo.coordinator.redis.delete(f"fsm:{message.from_user.id}")
+                await clear_actor_state(message.from_user.id)
                 await message.answer(f"Premium Emoji ثبت شد: {emoji.name}")
             except Exception:
                 log.exception("emoji registration failed")
                 await message.answer("پیام باید پاسخ به یک Premium Custom Emoji معتبر باشد.")
-        elif state and state.startswith("admin.product.pricing:"):
-            try:
-                repo.owner(message.from_user.id)
-                product_id = UUID(state.rsplit(":", 1)[1])
-                values = [item.strip() for item in message.text.split("|")]
-                if len(values) != 8:
-                    raise ValueError("FIELDS_REQUIRED")
-                await repo.set_product_pricing_override(
-                    message.from_user.id,
-                    product_id,
-                    {
-                        "mode": values[0],
-                        "markup": values[1],
-                        "target_margin": values[2],
-                        "platform_fee": values[3],
-                        "payment_fee": values[4],
-                        "warranty_reserve": values[5],
-                        "fixed_cost_toman": int(values[6]),
-                        "fixed_price_toman": int(values[7]) if values[7] != "-" else None,
-                    },
-                )
-                await repo.coordinator.redis.delete(f"fsm:{message.from_user.id}")
-                await message.answer("قانون قیمت اختصاصی محصول ثبت شد.")
-            except Exception:
-                log.exception("product pricing override failed")
-                await message.answer("قانون قیمت اختصاصی معتبر نیست.")
-        elif state and state.startswith("admin.product:"):
-            try:
-                repo.owner(message.from_user.id)
-                category_id = UUID(state.split(":", 1)[1])
-                values = [item.strip() for item in message.text.split("|")]
-                if len(values) != 14:
-                    raise ValueError("FIELDS_REQUIRED")
-                await repo.create_product(
-                    message.from_user.id,
-                    category_id,
-                    {
-                        "title": values[0],
-                        "description": values[1],
-                        "base_price_usd": values[2],
-                        "duration": values[3],
-                        "plan_type": values[4],
-                        "activation_method": values[5],
-                        "warranty_text": values[6],
-                        "warranty_days": int(values[7]),
-                        "delivery_minutes": int(values[8]),
-                        "stock": int(values[9]),
-                        "unlimited_stock": values[10].lower() == "true",
-                        "requires_kyc": values[11].lower() == "true",
-                        "position": int(values[12]),
-                        "fixed_price_toman": int(values[13]) if values[13] != "-" else None,
-                    },
-                )
-                await repo.coordinator.redis.delete(f"fsm:{message.from_user.id}")
-                await message.answer("محصول با موفقیت ثبت شد.")
-            except Exception:
-                log.exception("product creation failed")
-                await message.answer("مشخصات محصول معتبر نیست.")
-        elif state and state.startswith("admin.button.edit:"):
-            try:
-                repo.owner(message.from_user.id)
-                button_id = UUID(state.rsplit(":", 1)[1])
-                values = [item.strip() for item in message.text.split("|")]
-                if len(values) != 6:
-                    raise ValueError("FIELDS_REQUIRED")
-                await repo.update_page_button(
-                    message.from_user.id,
-                    button_id,
-                    {
-                        "text": values[0],
-                        "action": values[1],
-                        "row": int(values[2]),
-                        "position": int(values[3]),
-                        "style": values[4],
-                        "active": values[5].lower() == "true",
-                    },
-                )
-                await repo.coordinator.redis.delete(f"fsm:{message.from_user.id}")
-                await message.answer("ویرایش دکمه ثبت شد.")
-            except Exception:
-                log.exception("button edit failed", extra={"telegram_id": message.from_user.id})
-                await message.answer("تنظیمات ویرایش دکمه معتبر نیست.")
-        elif state and state.startswith("admin.button:"):
-            try:
-                repo.owner(message.from_user.id)
-                page_id = UUID(state.split(":", 1)[1])
-                values = [item.strip() for item in message.text.split("|")]
-                if len(values) != 5:
-                    raise ValueError("FIELDS_REQUIRED")
-                button = await repo.create_page_button(
-                    message.from_user.id,
-                    page_id,
-                    values[0],
-                    values[1],
-                    int(values[2]),
-                    int(values[3]),
-                    values[4],
-                )
-                await repo.coordinator.redis.delete(f"fsm:{message.from_user.id}")
-                await message.answer(f"دکمه ثبت شد: {button.text}")
-            except Exception:
-                log.exception("button creation failed", extra={"telegram_id": message.from_user.id})
-                await message.answer("تنظیمات دکمه معتبر نیست.")
-        elif state == "admin.terms.title":
-            try:
-                repo.owner(message.from_user.id)
-                await repo.coordinator.redis.set(
-                    f"terms-title:{message.from_user.id}", message.text, ex=900
-                )
-                await repo.coordinator.redis.set(
-                    f"fsm:{message.from_user.id}", "admin.terms.body", ex=900
-                )
-                await message.answer("متن قوانین را ارسال کنید.")
-            except AccessDenied:
-                await message.answer("دسترسی مجاز نیست.")
-        elif state == "admin.terms.body":
-            try:
-                repo.owner(message.from_user.id)
-                title = await repo.coordinator.redis.get(f"terms-title:{message.from_user.id}")
-                if not title:
-                    raise ValueError("FORM_EXPIRED")
-                terms = await repo.publish_terms(message.from_user.id, title, message.text)
-                await repo.coordinator.redis.delete(
-                    f"fsm:{message.from_user.id}", f"terms-title:{message.from_user.id}"
-                )
-                await message.answer(f"نسخه {terms.version} قوانین منتشر شد.")
-            except Exception:
-                log.exception("terms publication failed")
-                await message.answer("انتشار قوانین انجام نشد.")
-        elif state in {
-            "admin.rate",
-            "admin.pricing",
-            "admin.category",
-            "admin.product",
-            "admin.merchant",
-            "admin.page",
-        }:
-            try:
-                repo.owner(message.from_user.id)
-                values = [item.strip() for item in message.text.split("|")]
-                if state == "admin.rate":
-                    await repo.set_rate(message.from_user.id, int(values[0]))
-                elif state == "admin.pricing":
-                    if len(values) != 7:
-                        raise ValueError("FIELDS_REQUIRED")
-                    await repo.set_pricing(
-                        message.from_user.id,
-                        {
-                            "mode": values[0],
-                            "markup": values[1],
-                            "target_margin": values[2],
-                            "platform_fee": values[3],
-                            "payment_fee": values[4],
-                            "warranty_reserve": values[5],
-                            "fixed_cost_toman": int(values[6]),
-                        },
-                    )
-                elif state == "admin.category":
-                    if len(values) != 3:
-                        raise ValueError("FIELDS_REQUIRED")
-                    title, description, position = values[:3]
-                    await repo.create_category(
-                        message.from_user.id, title, description, int(position)
-                    )
-                elif state == "admin.product":
-                    if len(values) not in {12, 16}:
-                        raise ValueError("FIELDS_REQUIRED")
-                    expanded = len(values) == 16
-                    await repo.create_product(
-                        message.from_user.id,
-                        UUID(values[0]),
-                        {
-                            "title": values[1],
-                            "description": values[2],
-                            "base_price_usd": values[3],
-                            "duration": values[4],
-                            "plan_type": values[5],
-                            "activation_method": values[6],
-                            "warranty_text": values[7],
-                            "warranty_days": int(values[8]),
-                            "delivery_minutes": int(values[9]),
-                            "stock": int(values[10]),
-                            "unlimited_stock": values[11].lower() == "true",
-                            "requires_kyc": values[12].lower() == "true" if expanded else True,
-                            "position": int(values[13]) if expanded else 0,
-                            "fixed_price_toman": (
-                                int(values[14]) if expanded and values[14] != "-" else None
-                            ),
-                            "custom_emoji_id": (
-                                values[15] if expanded and values[15] != "-" else None
-                            ),
-                        },
-                    )
-                elif state == "admin.merchant":
-                    bank, holder, pan, priority, limit = values
-                    await repo.create_merchant_card(
-                        message.from_user.id, bank, holder, pan, int(priority), int(limit)
-                    )
-                    with contextlib.suppress(Exception):
-                        await message.delete()
-                elif state == "admin.page":
-                    slug, content = values
-                    await repo.upsert_page(message.from_user.id, slug, content)
-                await repo.coordinator.redis.delete(f"fsm:{message.from_user.id}")
-                await message.answer("تنظیم با موفقیت ثبت شد.")
-            except Exception:
-                log.exception(
-                    "admin configuration failed", extra={"telegram_id": message.from_user.id}
-                )
-                await message.answer("ورودی معتبر نیست؛ فرم را دوباره آغاز کنید.")
-        elif state and state.startswith(
-            ("admin.category.edit:", "admin.product.edit:", "admin.merchant.edit:")
-        ):
-            try:
-                repo.owner(message.from_user.id)
-                action, object_id = state.rsplit(":", 1)
-                values = [item.strip() for item in message.text.split("|")]
-                if action == "admin.category.edit":
-                    if len(values) != 3:
-                        raise ValueError("FIELDS_REQUIRED")
-                    await repo.update_category(
-                        message.from_user.id,
-                        UUID(object_id),
-                        title=values[0],
-                        description=values[1] or None,
-                        position=int(values[2]),
-                    )
-                elif action == "admin.product.edit":
-                    if len(values) != 15:
-                        raise ValueError("FIELDS_REQUIRED")
-                    await repo.update_product(
-                        message.from_user.id,
-                        UUID(object_id),
-                        {
-                            "category_id": UUID(values[0]),
-                            "title": values[1],
-                            "description": values[2],
-                            "base_price_usd": values[3],
-                            "duration": values[4],
-                            "plan_type": values[5],
-                            "activation_method": values[6],
-                            "warranty_text": values[7],
-                            "warranty_days": int(values[8]),
-                            "delivery_minutes": int(values[9]),
-                            "stock": int(values[10]),
-                            "unlimited_stock": values[11].lower() == "true",
-                            "requires_kyc": values[12].lower() == "true",
-                            "position": int(values[13]),
-                            "fixed_price_toman": int(values[14]) if values[14] != "-" else None,
-                        },
-                    )
-                else:
-                    if len(values) != 5:
-                        raise ValueError("FIELDS_REQUIRED")
-                    await repo.update_merchant_card(
-                        message.from_user.id,
-                        UUID(object_id),
-                        bank_name=values[0],
-                        holder_name=values[1],
-                        priority=int(values[2]),
-                        daily_limit=int(values[3]),
-                        active=values[4].lower() == "true",
-                    )
-                await repo.coordinator.redis.delete(f"fsm:{message.from_user.id}")
-                await message.answer("ویرایش با موفقیت ثبت شد.")
-            except Exception:
-                log.exception("admin edit failed", extra={"telegram_id": message.from_user.id})
-                await message.answer("ورودی ویرایش معتبر نیست.")
-        elif state and state.startswith("admin."):
+        elif state and state.startswith(("admin.kyc.", "admin.card.", "admin.payment.")):
             try:
                 repo.owner(message.from_user.id)
                 action, object_id = state.rsplit(":", 1)
@@ -1148,7 +1678,7 @@ def persistent_router(repo: ShopRepository) -> Router:
                     await repo.review_card(
                         message.from_user.id, UUID(object_id), approved, message.text
                     )
-                elif action.startswith("admin.payment."):
+                else:
                     await repo.manual_reconcile(
                         message.from_user.id, UUID(object_id), approved, message.text
                     )

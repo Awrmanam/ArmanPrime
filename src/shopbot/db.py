@@ -155,7 +155,9 @@ class PageRow(Base):
     __tablename__ = "pages"
     id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
     slug: Mapped[str] = mapped_column(String(100), unique=True)
+    title: Mapped[str] = mapped_column(Text, default="")
     text: Mapped[str] = mapped_column(Text)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
 
 
 class ButtonRow(Base):
