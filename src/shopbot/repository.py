@@ -5,6 +5,7 @@ import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from hashlib import sha256
 from uuid import UUID
 
@@ -35,6 +36,7 @@ from .db import (
     UserRow,
 )
 from .domain import PricingRule, calculate_price, decimal_value
+from .fx import ProviderRate, RateProvider, validate_currency
 from .security import Vault, mask_pan, pan_fingerprint
 
 
@@ -440,14 +442,122 @@ class ShopRepository:
             )
 
     async def set_rate(self, actor: int, rate: int) -> RateRow:
+        return await self.set_currency_rate(actor, "USD", rate)
+
+    async def set_currency_rate(
+        self,
+        actor: int,
+        currency_code: str,
+        rate: Decimal | int | str,
+        *,
+        buffer_percent: Decimal | int | str = "0",
+        source: str = "manual_override",
+        active: bool = True,
+    ) -> RateRow:
         self.owner(actor)
-        if rate <= 0:
+        code = validate_currency(currency_code)
+        amount, buffer = decimal_value(rate), decimal_value(buffer_percent)
+        if amount <= 0 or not Decimal("0") <= buffer < Decimal("100"):
             raise InvalidState("INVALID_RATE")
+        now = self.now()
         async with self.sessions.begin() as session:
-            row = RateRow(usd_to_toman=rate, source="manual", created_at=self.now())
+            previous = await session.scalar(
+                select(func.max(RateRow.version)).where(RateRow.currency_code == code)
+            )
+            row = RateRow(
+                usd_to_toman=int(amount),
+                source=source,
+                created_at=now,
+                currency_code=code,
+                toman_per_unit=amount,
+                provider_name="manual",
+                provider_symbol=code.lower(),
+                provider_timestamp=now,
+                fetched_at=now,
+                valid_until=now + timedelta(days=36500),
+                active=active,
+                last_fetch_status="ok",
+                version=(previous or 0) + 1,
+                buffer_percent=buffer,
+            )
             session.add(row)
-            await self.audit(session, actor, "currency.rate", "USD_TOMAN", str(rate))
+            await self.audit(session, actor, "currency.rate", code, f"source={source}")
             return row
+
+    async def active_currency_rates(self, actor: int | None = None) -> list[RateRow]:
+        if actor is not None:
+            self.owner(actor)
+        async with self.sessions() as session:
+            ranked = (
+                select(
+                    RateRow.id,
+                    func.row_number()
+                    .over(
+                        partition_by=RateRow.currency_code,
+                        order_by=RateRow.version.desc(),
+                    )
+                    .label("rank"),
+                )
+                .where(RateRow.active.is_(True))
+                .subquery()
+            )
+            return list(
+                (
+                    await session.scalars(
+                        select(RateRow)
+                        .join(ranked, ranked.c.id == RateRow.id)
+                        .where(ranked.c.rank == 1)
+                    )
+                ).all()
+            )
+
+    async def persist_provider_rates(
+        self, provider_rates: list[ProviderRate], max_age_minutes: int
+    ) -> int:
+        now = self.now()
+        async with self.sessions.begin() as session:
+            for item in provider_rates:
+                override = await session.scalar(
+                    select(RateRow)
+                    .where(
+                        RateRow.currency_code == item.currency_code,
+                        RateRow.source == "manual_override",
+                        RateRow.active.is_(True),
+                    )
+                    .order_by(RateRow.version.desc())
+                    .limit(1)
+                )
+                previous = await session.scalar(
+                    select(func.max(RateRow.version)).where(
+                        RateRow.currency_code == item.currency_code
+                    )
+                )
+                session.add(
+                    RateRow(
+                        usd_to_toman=int(item.toman_per_unit),
+                        source="api",
+                        created_at=now,
+                        currency_code=item.currency_code,
+                        toman_per_unit=item.toman_per_unit,
+                        provider_name=item.provider_name,
+                        provider_symbol=item.provider_symbol,
+                        provider_timestamp=item.provider_timestamp,
+                        fetched_at=now,
+                        valid_until=now + timedelta(minutes=max_age_minutes),
+                        active=not bool(override),
+                        last_fetch_status="ok",
+                        version=(previous or 0) + 1,
+                        buffer_percent=Decimal("0"),
+                    )
+                )
+        return len(provider_rates)
+
+    async def refresh_currency_rates(
+        self, provider: RateProvider, currencies: set[str], max_age_minutes: int
+    ) -> int:
+        async with self.coordinator.lock("fx-refresh", timeout=60):
+            rates = await provider.fetch({validate_currency(code) for code in currencies})
+            return await self.persist_provider_rates(rates, max_age_minutes)
 
     async def set_pricing(self, actor: int, config: dict) -> None:
         self.owner(actor)
@@ -535,9 +645,11 @@ class ShopRepository:
     async def create_product(self, actor: int, category_id: UUID, values: dict) -> ProductRow:
         self.owner(actor)
         title = str(values.get("title", "")).strip()
-        base_usd = decimal_value(values.get("base_price_usd", "0"))
+        base_cost = decimal_value(values.get("base_cost_amount", values.get("base_price_usd", "0")))
+        currency = validate_currency(values.get("base_cost_currency", "USD"))
+        currency_buffer = decimal_value(values.get("currency_buffer_percent", "0"))
         stock = int(values.get("stock", 0))
-        if not title or base_usd < 0 or stock < 0:
+        if not title or base_cost < 0 or stock < 0 or not Decimal("0") <= currency_buffer < 100:
             raise InvalidState("INVALID_PRODUCT")
         async with self.sessions.begin() as session:
             if not await session.get(CategoryRow, category_id):
@@ -546,7 +658,10 @@ class ShopRepository:
                 category_id=category_id,
                 title=title,
                 description=str(values.get("description", "")),
-                base_price_usd=base_usd,
+                base_price_usd=base_cost if currency == "USD" else Decimal("0"),
+                base_cost_amount=base_cost,
+                base_cost_currency=currency,
+                currency_buffer_percent=currency_buffer,
                 fixed_price_toman=(
                     int(values["fixed_price_toman"]) if values.get("fixed_price_toman") else None
                 ),
@@ -576,6 +691,9 @@ class ShopRepository:
             "title",
             "description",
             "base_price_usd",
+            "base_cost_amount",
+            "base_cost_currency",
+            "currency_buffer_percent",
             "fixed_price_toman",
             "duration",
             "plan_type",
@@ -600,6 +718,14 @@ class ShopRepository:
                 raise InvalidState("INVALID_PRODUCT")
         if "base_price_usd" in changes and decimal_value(changes["base_price_usd"]) < 0:
             raise InvalidState("INVALID_PRODUCT")
+        if "base_cost_amount" in changes and decimal_value(changes["base_cost_amount"]) < 0:
+            raise InvalidState("INVALID_PRODUCT")
+        if "base_cost_currency" in changes:
+            changes["base_cost_currency"] = validate_currency(changes["base_cost_currency"])
+        if "currency_buffer_percent" in changes and not Decimal("0") <= decimal_value(
+            changes["currency_buffer_percent"]
+        ) < Decimal("100"):
+            raise InvalidState("INVALID_PRODUCT")
         if changes.get("custom_emoji_id") and not str(changes["custom_emoji_id"]).isdigit():
             raise InvalidState("INVALID_PRODUCT")
         async with self.sessions.begin() as session:
@@ -612,7 +738,13 @@ class ShopRepository:
                     raise InvalidState("CATEGORY_NOT_FOUND")
                 changes["category_id"] = category_id
             for key, value in changes.items():
-                setattr(row, key, decimal_value(value) if key == "base_price_usd" else value)
+                setattr(
+                    row,
+                    key,
+                    decimal_value(value)
+                    if key in {"base_price_usd", "base_cost_amount", "currency_buffer_percent"}
+                    else value,
+                )
             await self.audit(session, actor, "product.update", str(row.id))
             return row
 
@@ -1086,11 +1218,33 @@ class ShopRepository:
                     raise InvalidState("PRODUCT_UNAVAILABLE")
                 if not product.unlimited_stock and product.stock - product.reserved < 1:
                     raise InvalidState("OUT_OF_STOCK")
-                rate = await session.scalar(
-                    select(RateRow).order_by(RateRow.created_at.desc()).limit(1)
-                )
-                if not rate:
-                    raise InvalidState("RATE_NOT_CONFIGURED")
+                rate = None
+                if product.fixed_price_toman is None:
+                    rate = await session.scalar(
+                        select(RateRow)
+                        .where(
+                            RateRow.currency_code == product.base_cost_currency,
+                            RateRow.active.is_(True),
+                        )
+                        .order_by(
+                            (RateRow.source == "manual_override").desc(),
+                            RateRow.version.desc(),
+                        )
+                        .limit(1)
+                    )
+                    if not rate:
+                        raise InvalidState("CURRENCY_RATE_NOT_CONFIGURED")
+                    if rate.source == "api" and rate.valid_until <= self.now():
+                        async with self.sessions.begin() as notification_session:
+                            notification_session.add(
+                                OutboxRow(
+                                    kind="FX_RATE_STALE",
+                                    chat_id=self.notification_chat_id,
+                                    payload={"currency": product.base_cost_currency},
+                                    available_at=self.now(),
+                                )
+                            )
+                        raise InvalidState("CURRENCY_RATE_STALE")
                 pricing = await session.get(ConfigRow, "pricing.global")
                 if not pricing:
                     raise InvalidState("PRICING_NOT_CONFIGURED")
@@ -1110,7 +1264,13 @@ class ShopRepository:
                     ),
                     fixed_price_toman=product.fixed_price_toman,
                 )
-                final = calculate_price(product.base_price_usd, rate.usd_to_toman, rule)
+                effective_rate = rate.toman_per_unit if rate else Decimal("1")
+                currency_buffer = product.currency_buffer_percent + (
+                    rate.buffer_percent if rate else Decimal("0")
+                )
+                final = calculate_price(
+                    product.base_cost_amount, effective_rate, rule, currency_buffer
+                )
                 now = self.now()
                 quote = QuoteRow(
                     user_id=user.id,
@@ -1123,11 +1283,19 @@ class ShopRepository:
                         "plan": product.plan_type,
                         "activation": product.activation_method,
                         "warranty": product.warranty_text,
-                        "base_usd": str(product.base_price_usd),
-                        "rate_at": rate.created_at.isoformat(),
+                        "base_cost_amount": str(product.base_cost_amount),
+                        "base_cost_currency": product.base_cost_currency,
+                        "toman_per_currency_unit": str(effective_rate),
+                        "rate_source": rate.source if rate else "fixed_toman",
+                        "rate_provider": rate.provider_name if rate else None,
+                        "provider_timestamp": (
+                            rate.provider_timestamp.isoformat() if rate else None
+                        ),
+                        "rate_version": rate.version if rate else None,
+                        "currency_buffer_percent": str(currency_buffer),
                         "pricing": config,
                     },
-                    rate=rate.usd_to_toman,
+                    rate=int(effective_rate),
                     final_toman=final,
                     created_at=now,
                     expires_at=now + self.QUOTE_TTL,

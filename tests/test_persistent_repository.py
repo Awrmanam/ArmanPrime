@@ -80,6 +80,9 @@ async def configure_checkout(repo: ShopRepository):
             title="Product",
             description="Full",
             base_price_usd=Decimal("10.50"),
+            base_cost_amount=Decimal("10.50"),
+            base_cost_currency="USD",
+            currency_buffer_percent=Decimal("0"),
             duration="1 month",
             plan_type="standard",
             activation_method="link",
@@ -459,3 +462,32 @@ async def test_rejection_missing_gates_expiration_and_delivery_guards(repository
         expired = await session.get(QuoteRow, quote.id)
         persisted_product = await session.get(ProductRow, product.id)
         assert expired.status == "EXPIRED" and persisted_product.reserved == 0
+
+
+@pytest.mark.asyncio
+async def test_rub_manual_rate_quote_snapshot_and_fixed_toman_independence(repository):
+    product, card = await configure_checkout(repository)
+    await repository.update_product(
+        100,
+        product.id,
+        {
+            "base_cost_amount": "100",
+            "base_cost_currency": "RUB",
+            "currency_buffer_percent": "2",
+        },
+    )
+    rate = await repository.set_currency_rate(100, "RUB", "1250", buffer_percent="1")
+    quote = await repository.create_quote(200, product.id, card.id)
+    assert quote.snapshot["base_cost_currency"] == "RUB"
+    assert quote.snapshot["toman_per_currency_unit"] == "1250.00000000"
+    assert quote.snapshot["rate_version"] == rate.version
+    assert quote.snapshot["currency_buffer_percent"] == "3.0000"
+
+    await repository.update_product(100, product.id, {"fixed_price_toman": 777_777})
+    async with repository.sessions.begin() as session:
+        current = await session.get(ProductRow, product.id)
+        current.reserved = 0
+        current.stock = 2
+    fixed = await repository.create_quote(200, product.id, card.id)
+    assert fixed.final_toman == 777_777
+    assert fixed.snapshot["rate_source"] == "fixed_toman"

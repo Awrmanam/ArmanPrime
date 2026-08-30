@@ -119,6 +119,9 @@ class ProductRow(Base):
     title: Mapped[str] = mapped_column(Text)
     description: Mapped[str] = mapped_column(Text, default="")
     base_price_usd: Mapped[Decimal] = mapped_column(Numeric(18, 4))
+    base_cost_amount: Mapped[Decimal] = mapped_column(Numeric(24, 8))
+    base_cost_currency: Mapped[str] = mapped_column(String(3), default="USD", index=True)
+    currency_buffer_percent: Mapped[Decimal] = mapped_column(Numeric(8, 4), default=0)
     fixed_price_toman: Mapped[int | None] = mapped_column(BigInteger)
     duration: Mapped[str | None] = mapped_column(Text)
     plan_type: Mapped[str | None] = mapped_column(Text)
@@ -179,6 +182,18 @@ class RateRow(Base):
     usd_to_toman: Mapped[int] = mapped_column(BigInteger)
     source: Mapped[str] = mapped_column(String(32), default="manual")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    currency_code: Mapped[str] = mapped_column(String(3), default="USD", index=True)
+    toman_per_unit: Mapped[Decimal] = mapped_column(Numeric(24, 8))
+    provider_name: Mapped[str] = mapped_column(String(64), default="manual")
+    provider_symbol: Mapped[str] = mapped_column(String(64), default="usd")
+    provider_timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    valid_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    last_fetch_status: Mapped[str] = mapped_column(String(32), default="ok")
+    last_error_code: Mapped[str | None] = mapped_column(String(64))
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    buffer_percent: Mapped[Decimal] = mapped_column(Numeric(8, 4), default=0)
 
 
 class QuoteRow(Base):

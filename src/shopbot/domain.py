@@ -69,8 +69,10 @@ class CustomerCard:
 class Product:
     id: UUID
     title: str
-    base_price_usd: Decimal
+    base_cost_amount: Decimal
     stock: int
+    base_cost_currency: str = "USD"
+    currency_buffer_percent: Decimal = Decimal("0")
     reserved: int = 0
     active: bool = True
     requires_kyc: bool = True
@@ -102,14 +104,26 @@ def decimal_value(value: Decimal | int | str) -> Decimal:
     return value if isinstance(value, Decimal) else Decimal(str(value))
 
 
-def calculate_price(base_usd: Decimal | int | str, rate: int, rule: PricingRule) -> int:
+def calculate_price(
+    base_cost: Decimal | int | str,
+    rate: Decimal | int | str,
+    rule: PricingRule,
+    currency_buffer_percent: Decimal | int | str = Decimal("0"),
+) -> int:
     one, hundred = Decimal("1"), Decimal("100")
     if rule.fixed_price_toman is not None:
         if rule.fixed_price_toman < 0:
             raise ValueError("fixed price cannot be negative")
         return int(rule.fixed_price_toman)
-    base = decimal_value(base_usd)
-    if base < 0 or rate <= 0 or rule.fixed_cost_toman < 0:
+    base = decimal_value(base_cost)
+    numeric_rate = decimal_value(rate)
+    buffer = decimal_value(currency_buffer_percent)
+    if (
+        base < 0
+        or numeric_rate <= 0
+        or rule.fixed_cost_toman < 0
+        or not Decimal("0") <= buffer < hundred
+    ):
         raise ValueError("base price, rate, and fixed costs must be valid")
     fees = tuple(
         decimal_value(item)
@@ -129,8 +143,9 @@ def calculate_price(base_usd: Decimal | int | str, rate: int, rule: PricingRule)
         raise ValueError("fees, reserve, and markup percentages must be non-negative")
     if margin is not None and not Decimal("0") <= margin < hundred:
         raise ValueError("target margin must satisfy 0 <= margin < 100")
-    converted = base * decimal_value(rate)
-    landed = converted + converted * sum(fees, Decimal("0")) / hundred
+    converted = base * numeric_rate
+    landed = converted * (one + buffer / hundred)
+    landed += landed * sum(fees, Decimal("0")) / hundred
     landed += decimal_value(rule.fixed_cost_toman)
     result = (
         landed / (one - margin / hundred)
@@ -221,11 +236,11 @@ class CheckoutService:
             product.id,
             card.id,
             {"title": product.title},
-            product.base_price_usd,
+            product.base_cost_amount,
             rate,
             "manual",
             now,
-            calculate_price(product.base_price_usd, rate, rule),
+            calculate_price(product.base_cost_amount, rate, rule, product.currency_buffer_percent),
             now,
             now + self.ttl,
             version,

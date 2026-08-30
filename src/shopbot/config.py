@@ -22,6 +22,14 @@ class Settings(BaseSettings):
     feature_cooperation: bool = False
     feature_membership_check: bool = False
     secure_file_path: str = "/var/lib/shopbot/secure"
+    fx_provider: str = "manual"
+    navasan_api_key: SecretStr = SecretStr("")
+    navasan_base_url: str = "https://api.navasan.tech/latest/"
+    fx_refresh_minutes: int = Field(default=360, ge=5)
+    fx_max_age_minutes: int = Field(default=720, ge=5)
+    fx_http_connect_timeout: float = Field(default=5.0, gt=0)
+    fx_http_read_timeout: float = Field(default=10.0, gt=0)
+    fx_retry_limit: int = Field(default=3, ge=1, le=5)
 
     @field_validator("price_quote_ttl_minutes")
     @classmethod

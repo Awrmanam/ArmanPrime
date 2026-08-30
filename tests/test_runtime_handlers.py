@@ -148,6 +148,9 @@ class RepoFake:
     async def resolve_emoji_key(self, key):
         return "123456" if key == "premium" else None
 
+    async def active_currency_rates(self, _=None):
+        return [SimpleNamespace(currency_code="USD")]
+
     async def emojis(self, _, active_only=False):
         return [SimpleNamespace(id=uuid4(), name="premium", custom_emoji_id="123456", active=True)]
 
@@ -218,6 +221,7 @@ class RepoFake:
 
     publish_terms = AsyncMock(return_value=SimpleNamespace(version=2))
     set_rate = AsyncMock()
+    set_currency_rate = AsyncMock()
     set_pricing = AsyncMock()
     create_category = AsyncMock()
     create_product = AsyncMock()
@@ -583,16 +587,20 @@ async def test_admin_text_forms_claim_delivery_and_emoji():
     callback = handler(router, "callback_query", "callback")
     token = await repo.coordinator.issue_callback("admin.rate", 1)
     await callback(QueryFake(token, owner, actor=1))
+    currency = owner.answers[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data
+    await callback(QueryFake(currency, owner, actor=1))
     owner.text = "not-a-number"
     await form(owner)
     assert "معتبر نیست" in owner.answers[-1][0]
     assert await repo.coordinator.redis.get("fsm:1") == "admin.wizard"
     owner.text = "۵۰٬۰۰۰".replace("٬", "")
     await form(owner)
+    skip = owner.answers[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data
+    await callback(QueryFake(skip, owner, actor=1))
     assert "پیش‌نمایش نرخ" in owner.answers[-1][0]
     confirm = owner.answers[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data
     await callback(QueryFake(confirm, owner, actor=1))
-    assert repo.set_rate.await_count == 1
+    assert repo.set_currency_rate.await_count == 1
 
     await repo.coordinator.redis.set("fsm:1", "admin.emoji")
     owner.text = "inline-premium"

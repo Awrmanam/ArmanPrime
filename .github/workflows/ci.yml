@@ -80,6 +80,11 @@ jobs:
         run: |
           test ! -e .env
           ! git ls-files | grep -Fx .env
-          ! git grep -nE '([0-9]{16}|BOT_TOKEN=[[:space:]]*[0-9]{5,15}:[A-Za-z0-9_-]{30,}|gh[pousr]_[A-Za-z0-9_]{20,})' -- ':!tests/**' ':!README.md'
+          pattern='(^|[^0-9])[0-9]{16}([^0-9]|$)|BOT_TOKEN=[[:space:]]*[0-9]{5,15}:[A-Za-z0-9_-]{30,}|gh[pousr]_[A-Za-z0-9_]{20,}'
+          printf '%s\n' 'card=41111111''11111111' | grep -Eq "$pattern"
+          ! printf '%s\n' '01234567890123456789' | grep -Eq "$pattern"
+          printf '%s\n' 'BOT_TOKEN=123456:ABCDEFGHIJKLMNOP''QRSTUVWXYZabcdefgh' | grep -Eq "$pattern"
+          printf '%s\n' 'ghp_abcdefghijklmnop''qrstuvwxyz123456' | grep -Eq "$pattern"
+          ! git grep -nE "$pattern" -- ':!tests/**' ':!README.md'
       - uses: gitleaks/gitleaks-action@v2
         env: {GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'}

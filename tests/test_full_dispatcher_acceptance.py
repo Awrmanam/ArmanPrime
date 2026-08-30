@@ -175,8 +175,10 @@ async def test_full_dispatcher_acceptance_persists_after_reconstruction():
     await telegram.send(100, "متن لازم‌الاجرای قوانین")
     await telegram.click(100, "رد کردن")
     await telegram.click(100, "انتشار قوانین")
-    await telegram.click(100, "نرخ دلار")
+    await telegram.click(100, "نرخ ارزها")
+    await telegram.click(100, "USD")
     await telegram.send(100, "50000")
+    await telegram.click(100, "رد کردن")
     await telegram.click(100, "تأیید نرخ")
     await telegram.click(100, "قیمت‌گذاری")
     await telegram.click(100, "درصد افزایش")
@@ -213,6 +215,8 @@ async def test_full_dispatcher_acceptance_persists_after_reconstruction():
     await telegram.click(100, "Category")
     for value in ("Product", "Full description", "10"):
         await telegram.send(100, value)
+    await telegram.click(100, "USD")
+    await telegram.click(100, "رد کردن")
     await telegram.click(100, "رد کردن")
     for value in ("30 days", "standard", "link", "manual warranty", "7", "60"):
         await telegram.send(100, value)
