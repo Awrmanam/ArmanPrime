@@ -839,6 +839,56 @@ class ShopRepository:
             await self.audit(session, actor, "emoji.register", str(row.id))
             return row
 
+    async def emojis(self, actor: int, *, active_only: bool = False) -> list[EmojiRow]:
+        self.owner(actor)
+        async with self.sessions() as session:
+            statement = select(EmojiRow)
+            if active_only:
+                statement = statement.where(EmojiRow.active.is_(True))
+            return list((await session.scalars(statement.order_by(EmojiRow.name))).all())
+
+    async def set_emoji_active(self, actor: int, emoji_id: UUID, active: bool) -> EmojiRow:
+        self.owner(actor)
+        async with self.sessions.begin() as session:
+            emoji = await session.get(EmojiRow, emoji_id, with_for_update=True)
+            if not emoji:
+                raise InvalidState("EMOJI_NOT_FOUND")
+            emoji.active = active
+            await self.audit(session, actor, "emoji.status", str(emoji.id), f"active={active}")
+            return emoji
+
+    async def resolve_emoji_key(self, key: str | None) -> str | None:
+        if not key:
+            return None
+        async with self.sessions() as session:
+            emoji = await session.scalar(
+                select(EmojiRow).where(EmojiRow.name == key, EmojiRow.active.is_(True))
+            )
+            return emoji.custom_emoji_id if emoji else None
+
+    async def set_entity_emoji(
+        self, actor: int, entity: str, object_id: UUID, emoji_name: str | None
+    ) -> None:
+        self.owner(actor)
+        if entity not in {"category", "product"}:
+            raise InvalidState("INVALID_EMOJI_TARGET")
+        async with self.sessions.begin() as session:
+            if emoji_name:
+                emoji = await session.scalar(
+                    select(EmojiRow).where(EmojiRow.name == emoji_name, EmojiRow.active.is_(True))
+                )
+                if not emoji:
+                    raise InvalidState("ACTIVE_EMOJI_REQUIRED")
+            model = CategoryRow if entity == "category" else ProductRow
+            target = await session.get(model, object_id, with_for_update=True)
+            if not target:
+                raise InvalidState("EMOJI_TARGET_NOT_FOUND")
+            # The legacy column now stores the stable registry name, never a raw Telegram ID.
+            target.custom_emoji_id = emoji_name
+            await self.audit(
+                session, actor, f"{entity}.emoji", str(object_id), emoji_name or "none"
+            )
+
     async def submit_customer_card(
         self, telegram_id: int, bank: str, pan: str, evidence_file_id: str
     ) -> CustomerCardRow:

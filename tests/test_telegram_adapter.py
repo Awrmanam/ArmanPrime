@@ -1,7 +1,15 @@
+from types import SimpleNamespace
+
 import httpx
 import pytest
 
-from shopbot.telegram_adapter import Button, TelegramAPI, extract_custom_emoji, utf16_offset
+from shopbot.telegram_adapter import (
+    Button,
+    TelegramAPI,
+    extract_custom_emoji,
+    extract_message_custom_emoji,
+    utf16_offset,
+)
 
 
 def test_styles_custom_emoji_and_utf16():
@@ -16,6 +24,15 @@ def test_styles_custom_emoji_and_utf16():
     assert extract_custom_emoji(
         [{"type": "custom_emoji", "custom_emoji_id": "1"}, {"type": "bold"}]
     ) == ["1"]
+
+
+def test_message_custom_emoji_extraction_from_text_and_caption():
+    entity = SimpleNamespace(type="custom_emoji", custom_emoji_id="123456")
+    caption = SimpleNamespace(type="custom_emoji", custom_emoji_id="789012")
+    invalid = SimpleNamespace(type="custom_emoji", custom_emoji_id="not-numeric")
+    other = SimpleNamespace(type="bold", custom_emoji_id="345678")
+    message = SimpleNamespace(entities=[entity, invalid], caption_entities=[caption, other])
+    assert extract_message_custom_emoji(message) == ["123456", "789012"]
 
 
 @pytest.mark.asyncio

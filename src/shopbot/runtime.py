@@ -7,6 +7,7 @@ from datetime import timedelta
 from uuid import UUID
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message, Update
 from fastapi import FastAPI, Header, HTTPException, Request, status
@@ -17,7 +18,7 @@ from .config import Settings
 from .db import create_engine_and_session
 from .repository import AccessDenied, RedisCoordinator, ShopRepository
 from .security import Vault
-from .telegram_adapter import Button
+from .telegram_adapter import Button, extract_message_custom_emoji
 
 log = logging.getLogger(__name__)
 
@@ -29,28 +30,96 @@ def markup(rows: list[list[Button]]) -> InlineKeyboardMarkup:
     )
 
 
+def _button_feature_rejected(exc: TelegramBadRequest) -> bool:
+    detail = str(exc).lower()
+    return "style" in detail or "icon_custom_emoji_id" in detail or "custom emoji" in detail
+
+
+async def answer_keyboard(message: Message, text_value: str, rows: list[list[Button]]) -> Message:
+    """Send a rich keyboard, retrying once only for unsupported Bot API button fields."""
+    try:
+        return await message.answer(text_value, reply_markup=markup(rows))
+    except TelegramBadRequest as exc:
+        if not _button_feature_rejected(exc):
+            raise
+        plain_rows = [[Button(button.text, button.callback_data) for button in row] for row in rows]
+        return await message.answer(text_value, reply_markup=markup(plain_rows))
+
+
 def persistent_router(repo: ShopRepository) -> Router:
     router = Router(name="persistent-commerce")
+
+    async def clear_actor_state(actor_id: int) -> None:
+        keys = [
+            f"fsm:{actor_id}",
+            f"terms-title:{actor_id}",
+            f"card-bank:{actor_id}",
+            f"card-pan:{actor_id}",
+            f"receipt-order:{actor_id}",
+        ]
+        scan_iter = getattr(repo.coordinator.redis, "scan_iter", None)
+        if scan_iter:
+            async for key in scan_iter(match=f"delivery-draft:{actor_id}:*"):
+                keys.append(key)
+        await repo.coordinator.redis.delete(*keys)
+
+    async def admin_home(message: Message, actor_id: int) -> None:
+        repo.owner(actor_id)
+        names = (
+            "terms",
+            "rate",
+            "pricing",
+            "category",
+            "product",
+            "merchant",
+            "kyc",
+            "cards",
+            "orders",
+            "page",
+            "emoji",
+            "audit",
+            "close",
+        )
+        actions = [
+            await repo.coordinator.issue_callback(f"admin.{name}", actor_id, one_time=False)
+            for name in names
+        ]
+        await answer_keyboard(
+            message,
+            "پنل مدیریت",
+            [
+                [Button("قوانین", actions[0], "primary")],
+                [Button("نرخ دلار", actions[1]), Button("قیمت‌گذاری", actions[2])],
+                [Button("دسته", actions[3]), Button("محصول", actions[4])],
+                [Button("کارت مقصد", actions[5])],
+                [Button("احراز هویت", actions[6]), Button("کارت‌ها", actions[7])],
+                [Button("سفارش‌ها", actions[8], "success")],
+                [Button("صفحه‌ها", actions[9])],
+                [Button("Premium Emoji", actions[10])],
+                [Button("Audit", actions[11])],
+                [Button("بازگشت", actions[12], "danger")],
+            ],
+        )
 
     async def home(message: Message, actor_id: int) -> None:
         actions = {}
         for action in ("catalog", "account", "begin_kyc", "begin_card", "my_orders"):
             actions[action] = await repo.coordinator.issue_callback(action, actor_id)
-        await message.answer(
+        await answer_keyboard(
+            message,
             "صفحه اصلی",
-            reply_markup=markup(
-                [
-                    [Button("فروشگاه", actions["catalog"], "primary")],
-                    [Button("حساب کاربری", actions["account"])],
-                    [Button("احراز هویت", actions["begin_kyc"])],
-                    [Button("کارت‌های بانکی", actions["begin_card"])],
-                    [Button("سفارش‌های من", actions["my_orders"])],
-                ]
-            ),
+            [
+                [Button("فروشگاه", actions["catalog"], "primary")],
+                [Button("حساب کاربری", actions["account"])],
+                [Button("احراز هویت", actions["begin_kyc"])],
+                [Button("کارت‌های بانکی", actions["begin_card"])],
+                [Button("سفارش‌های من", actions["my_orders"])],
+            ],
         )
 
     @router.message(Command("start"))
     async def start(message: Message) -> None:
+        await clear_actor_state(message.from_user.id)
         if not await repo.coordinator.rate_limit("start", message.from_user.id, 10, 60):
             await message.answer("درخواست‌های شما بیش از حد مجاز است.")
             return
@@ -71,9 +140,10 @@ def persistent_router(repo: ShopRepository) -> Router:
             terms.version,
             one_time=True,
         )
-        await message.answer(
+        await answer_keyboard(
+            message,
             f"{terms.title}\n\n{terms.pages[0]}",
-            reply_markup=markup([[Button("تأیید قوانین", token, "success")]]),
+            [[Button("تأیید قوانین", token, "success")]],
         )
 
     @router.callback_query(F.data.startswith("c1."))
@@ -89,13 +159,12 @@ def persistent_router(repo: ShopRepository) -> Router:
                     token = await repo.coordinator.issue_callback(
                         "category", query.from_user.id, str(category.id)
                     )
-                    rows.append(
-                        [Button(category.title, token, "default", category.custom_emoji_id)]
-                    )
-                await query.message.answer(
-                    "دسته‌بندی‌ها" if rows else "دسته فعالی وجود ندارد.",
-                    reply_markup=markup(rows) if rows else None,
-                )
+                    icon = await repo.resolve_emoji_key(category.custom_emoji_id)
+                    rows.append([Button(category.title, token, "default", icon)])
+                if rows:
+                    await answer_keyboard(query.message, "دسته‌بندی‌ها", rows)
+                else:
+                    await query.message.answer("دسته فعالی وجود ندارد.")
             elif state["a"] == "account":
                 async with repo.sessions.begin() as session:
                     user = await repo.user(query.from_user.id, session)
@@ -126,11 +195,12 @@ def persistent_router(repo: ShopRepository) -> Router:
                     token = await repo.coordinator.issue_callback(
                         "product", query.from_user.id, str(product.id)
                     )
-                    rows.append([Button(product.title, token, "default", product.custom_emoji_id)])
-                await query.message.answer(
-                    "محصولات" if rows else "محصول فعالی وجود ندارد.",
-                    reply_markup=markup(rows) if rows else None,
-                )
+                    icon = await repo.resolve_emoji_key(product.custom_emoji_id)
+                    rows.append([Button(product.title, token, "default", icon)])
+                if rows:
+                    await answer_keyboard(query.message, "محصولات", rows)
+                else:
+                    await query.message.answer("محصول فعالی وجود ندارد.")
             elif state["a"] == "product":
                 product = await repo.product(UUID(state["o"]))
                 if not product:
@@ -138,13 +208,14 @@ def persistent_router(repo: ShopRepository) -> Router:
                 buy = await repo.coordinator.issue_callback(
                     "buy", query.from_user.id, str(product.id)
                 )
-                await query.message.answer(
+                await answer_keyboard(
+                    query.message,
                     f"{product.title}\n\n{product.description}\nمدت: {product.duration or '-'}\n"
                     f"پلن: {product.plan_type or '-'}\n"
                     f"فعال‌سازی: {product.activation_method or '-'}\n"
                     f"گارانتی: {product.warranty_text or '-'}\n"
                     f"زمان تحویل: {product.delivery_minutes} دقیقه",
-                    reply_markup=markup([[Button("خرید", buy, "success")]]),
+                    [[Button("خرید", buy, "success")]],
                 )
             elif state["a"] == "buy":
                 rows = []
@@ -165,11 +236,12 @@ def persistent_router(repo: ShopRepository) -> Router:
                         [Button("ارسال مدارک احراز هویت", kyc, "primary")],
                         [Button("ثبت کارت بانکی", card)],
                     ]
-                await query.message.answer(
+                await answer_keyboard(
+                    query.message,
                     "کارت مبدأ تأییدشده را انتخاب کنید."
                     if has_verified_cards
                     else "برای خرید، KYC و کارت بانکی تأییدشده لازم است.",
-                    reply_markup=markup(rows),
+                    rows,
                 )
             elif state["a"] == "quote":
                 product_id, card_id = map(UUID, state["o"].split(":"))
@@ -177,10 +249,11 @@ def persistent_router(repo: ShopRepository) -> Router:
                 final = await repo.coordinator.issue_callback(
                     "final", query.from_user.id, str(quote.id), quote.version, one_time=True
                 )
-                await query.message.answer(
+                await answer_keyboard(
+                    query.message,
                     f"چک نهایی\n{quote.snapshot['title']}\nمبلغ: {quote.final_toman} تومان\n"
                     "اعتبار قیمت: ۳۰ دقیقه",
-                    reply_markup=markup([[Button("تأیید و ادامه", final, "success")]]),
+                    [[Button("تأیید و ادامه", final, "success")]],
                 )
             elif state["a"] == "final":
                 quote_id = UUID(state["o"])
@@ -190,9 +263,10 @@ def persistent_router(repo: ShopRepository) -> Router:
                     requote = await repo.coordinator.issue_callback(
                         "requote", query.from_user.id, str(quote_id), one_time=True
                     )
-                    await query.message.answer(
+                    await answer_keyboard(
+                        query.message,
                         "اعتبار قیمت تمام شده است.",
-                        reply_markup=markup([[Button("محاسبه قیمت جدید", requote, "primary")]]),
+                        [[Button("محاسبه قیمت جدید", requote, "primary")]],
                     )
                     await query.answer()
                     return
@@ -200,9 +274,10 @@ def persistent_router(repo: ShopRepository) -> Router:
                 await repo.coordinator.redis.set(
                     f"receipt-order:{query.from_user.id}", str(order.id), ex=1800
                 )
-                await query.message.answer(
+                await answer_keyboard(
+                    query.message,
                     f"کارت مقصد: {pan}\nصاحب کارت: {holder}\nمبلغ: {order.amount_toman} تومان\n"
-                    "اکنون تصویر یا فایل رسید را ارسال کنید. رسید به‌تنهایی اثبات پرداخت نیست."
+                    "اکنون تصویر یا فایل رسید را ارسال کنید. رسید به‌تنهایی اثبات پرداخت نیست.",
                 )
             elif state["a"] == "requote":
                 quote = await repo.requote(query.from_user.id, UUID(state["o"]))
@@ -212,7 +287,7 @@ def persistent_router(repo: ShopRepository) -> Router:
                 await query.message.answer(
                     f"چک نهایی جدید\n{quote.snapshot['title']}\n"
                     f"مبلغ: {quote.final_toman} تومان\nاعتبار: ۳۰ دقیقه",
-                    reply_markup=markup([[Button("تأیید و ادامه", final, "success")]]),
+                    [[Button("تأیید و ادامه", final, "success")]],
                 )
             elif state["a"] in {"admin.kyc", "admin.cards", "admin.orders", "admin.audit"}:
                 repo.owner(query.from_user.id)
@@ -306,7 +381,7 @@ def persistent_router(repo: ShopRepository) -> Router:
                     )
                     await query.message.answer(text)
                 if rows:
-                    await query.message.answer("صف بررسی", reply_markup=markup(rows))
+                    await answer_keyboard(query.message, "صف بررسی", rows)
                 elif state["a"] != "admin.audit":
                     await query.message.answer("صف بررسی خالی است.")
             elif state["a"] in {"admin.category", "admin.product", "admin.merchant"}:
@@ -338,6 +413,14 @@ def persistent_router(repo: ShopRepository) -> Router:
                         f"admin.{entity}.edit", query.from_user.id, str(item.id), one_time=True
                     )
                     rows.append([Button("ویرایش", edit)])
+                    if entity in {"category", "product"}:
+                        choose_emoji = await repo.coordinator.issue_callback(
+                            "admin.entity.emoji",
+                            query.from_user.id,
+                            f"{entity}:{item.id}",
+                            one_time=True,
+                        )
+                        rows.append([Button("انتخاب Premium Emoji", choose_emoji)])
                     if entity == "product":
                         pricing = await repo.coordinator.issue_callback(
                             "admin.product.pricing",
@@ -351,7 +434,7 @@ def persistent_router(repo: ShopRepository) -> Router:
                     f"admin.{entity}.create", query.from_user.id, one_time=True
                 )
                 rows.append([Button("ایجاد مورد جدید", create, "primary")])
-                await query.message.answer("مدیریت", reply_markup=markup(rows))
+                await answer_keyboard(query.message, "مدیریت", rows)
             elif state["a"] == "admin.page":
                 repo.owner(query.from_user.id)
                 rows = []
@@ -364,7 +447,34 @@ def persistent_router(repo: ShopRepository) -> Router:
                     "admin.page.create", query.from_user.id, one_time=True
                 )
                 rows.append([Button("ایجاد/ویرایش صفحه", create, "primary")])
-                await query.message.answer("صفحه‌ها", reply_markup=markup(rows))
+                await answer_keyboard(query.message, "صفحه‌ها", rows)
+            elif state["a"] == "admin.entity.emoji":
+                repo.owner(query.from_user.id)
+                entity, object_id = state["o"].split(":", 1)
+                rows = []
+                for emoji in await repo.emojis(query.from_user.id, active_only=True):
+                    select_emoji = await repo.coordinator.issue_callback(
+                        "admin.entity.emoji.select",
+                        query.from_user.id,
+                        f"{entity}:{object_id}:{emoji.name}",
+                        one_time=True,
+                    )
+                    rows.append([Button(emoji.name, select_emoji)])
+                remove = await repo.coordinator.issue_callback(
+                    "admin.entity.emoji.select",
+                    query.from_user.id,
+                    f"{entity}:{object_id}:",
+                    one_time=True,
+                )
+                rows.append([Button("بدون آیکون", remove, "danger")])
+                await answer_keyboard(query.message, "انتخاب ایموجی Registry", rows)
+            elif state["a"] == "admin.entity.emoji.select":
+                repo.owner(query.from_user.id)
+                entity, object_id, emoji_name = state["o"].split(":", 2)
+                await repo.set_entity_emoji(
+                    query.from_user.id, entity, UUID(object_id), emoji_name or None
+                )
+                await query.message.answer("Premium Emoji انتخاب شد.")
             elif state["a"] == "admin.page.create":
                 repo.owner(query.from_user.id)
                 await repo.coordinator.redis.set(f"fsm:{query.from_user.id}", "admin.page", ex=900)
@@ -389,7 +499,7 @@ def persistent_router(repo: ShopRepository) -> Router:
                     "admin.button.create", query.from_user.id, str(page_id), one_time=True
                 )
                 rows.append([Button("ساخت دکمه", create, "primary")])
-                await query.message.answer("دکمه‌های صفحه", reply_markup=markup(rows))
+                await answer_keyboard(query.message, "دکمه‌های صفحه", rows)
             elif state["a"] == "admin.button.create":
                 repo.owner(query.from_user.id)
                 await repo.coordinator.redis.set(
@@ -423,7 +533,7 @@ def persistent_router(repo: ShopRepository) -> Router:
                 target = state["a"].removesuffix(".create")
                 await repo.coordinator.redis.set(f"fsm:{query.from_user.id}", target, ex=900)
                 prompts = {
-                    "admin.category": "عنوان|توضیح|ترتیب|custom_emoji_id یا - را ارسال کنید.",
+                    "admin.category": "عنوان|توضیح|ترتیب را ارسال کنید؛ ایموجی جدا انتخاب می‌شود.",
                     "admin.merchant": "بانک|صاحب کارت|PAN|اولویت|سقف روزانه را ارسال کنید.",
                 }
                 await query.message.answer(prompts[target])
@@ -440,10 +550,10 @@ def persistent_router(repo: ShopRepository) -> Router:
                         one_time=True,
                     )
                     rows.append([Button(category.title, choose)])
-                await query.message.answer(
-                    "ابتدا دسته محصول را انتخاب کنید." if rows else "ابتدا یک دسته فعال بسازید.",
-                    reply_markup=markup(rows) if rows else None,
-                )
+                if rows:
+                    await answer_keyboard(query.message, "ابتدا دسته محصول را انتخاب کنید.", rows)
+                else:
+                    await query.message.answer("ابتدا یک دسته فعال بسازید.")
             elif state["a"] == "admin.product.create.category":
                 repo.owner(query.from_user.id)
                 await repo.coordinator.redis.set(
@@ -451,8 +561,8 @@ def persistent_router(repo: ShopRepository) -> Router:
                 )
                 await query.message.answer(
                     "عنوان|توضیح|USD|مدت|پلن|فعال‌سازی|گارانتی|روز گارانتی|"
-                    "دقیقه تحویل|موجودی|unlimited|KYC|ترتیب|fixed_toman یا -|"
-                    "custom_emoji_id یا - را ارسال کنید."
+                    "دقیقه تحویل|موجودی|unlimited|KYC|ترتیب|fixed_toman یا - "
+                    "را ارسال کنید؛ ایموجی جدا از Registry انتخاب می‌شود."
                 )
             elif state["a"] == "admin.product.pricing":
                 repo.owner(query.from_user.id)
@@ -497,11 +607,11 @@ def persistent_router(repo: ShopRepository) -> Router:
                     f"fsm:{query.from_user.id}", f"{target}.edit:{state['o']}", ex=900
                 )
                 prompts = {
-                    "admin.category": "عنوان|توضیح|ترتیب|custom_emoji_id یا - را ارسال کنید.",
+                    "admin.category": "عنوان|توضیح|ترتیب را ارسال کنید؛ ایموجی جدا انتخاب می‌شود.",
                     "admin.product": (
                         "category_id|عنوان|توضیح|USD|مدت|پلن|فعال‌سازی|گارانتی|روز گارانتی|"
-                        "دقیقه تحویل|موجودی|unlimited|KYC|ترتیب|fixed_toman یا -|"
-                        "custom_emoji_id یا - را ارسال کنید."
+                        "دقیقه تحویل|موجودی|unlimited|KYC|ترتیب|fixed_toman یا - را ارسال کنید؛"
+                        " ایموجی جدا از Registry انتخاب می‌شود."
                     ),
                     "admin.merchant": "بانک|صاحب کارت|اولویت|سقف روزانه|active را ارسال کنید.",
                 }
@@ -559,12 +669,39 @@ def persistent_router(repo: ShopRepository) -> Router:
                 )
                 await repo.coordinator.redis.delete(draft_key, f"fsm:{query.from_user.id}")
                 await query.message.answer("تحویل ثبت و اعلان مشتری در Outbox قرار گرفت.")
+            elif state["a"] == "admin.close":
+                repo.owner(query.from_user.id)
+                await clear_actor_state(query.from_user.id)
+                await admin_home(query.message, query.from_user.id)
             elif state["a"] == "admin.emoji":
+                repo.owner(query.from_user.id)
+                rows = []
+                for emoji in await repo.emojis(query.from_user.id):
+                    toggle = await repo.coordinator.issue_callback(
+                        "admin.emoji.toggle",
+                        query.from_user.id,
+                        f"{emoji.id}:{int(not emoji.active)}",
+                        one_time=True,
+                    )
+                    rows.append(
+                        [Button(emoji.name, toggle, "success" if emoji.active else "danger")]
+                    )
+                register = await repo.coordinator.issue_callback(
+                    "admin.emoji.register", query.from_user.id, one_time=True
+                )
+                rows.append([Button("ثبت Premium Emoji", register, "primary")])
+                await answer_keyboard(query.message, "Premium Emoji Registry", rows)
+            elif state["a"] == "admin.emoji.register":
                 repo.owner(query.from_user.id)
                 await repo.coordinator.redis.set(f"fsm:{query.from_user.id}", "admin.emoji", ex=900)
                 await query.message.answer(
                     "نام ایموجی را در پاسخ به پیامی دارای Premium Custom Emoji ارسال کنید."
                 )
+            elif state["a"] == "admin.emoji.toggle":
+                repo.owner(query.from_user.id)
+                emoji_id, active = state["o"].split(":", 1)
+                await repo.set_emoji_active(query.from_user.id, UUID(emoji_id), bool(int(active)))
+                await query.message.answer("وضعیت Premium Emoji تغییر کرد.")
             await query.answer()
         except Exception:
             log.exception("callback rejected", extra={"telegram_id": query.from_user.id})
@@ -577,44 +714,18 @@ def persistent_router(repo: ShopRepository) -> Router:
         except AccessDenied:
             await message.answer("دسترسی مجاز نیست.")
             return
-        actions = []
-        for action in (
-            "terms",
-            "rate",
-            "pricing",
-            "category",
-            "product",
-            "merchant",
-            "kyc",
-            "cards",
-            "orders",
-            "page",
-            "emoji",
-            "audit",
-            "close",
-        ):
-            actions.append(
-                await repo.coordinator.issue_callback(
-                    f"admin.{action}", message.from_user.id, one_time=False
-                )
-            )
-        await message.answer(
-            "پنل مدیریت",
-            reply_markup=markup(
-                [
-                    [Button("قوانین", actions[0], "primary")],
-                    [Button("نرخ دلار", actions[1]), Button("قیمت‌گذاری", actions[2])],
-                    [Button("دسته", actions[3]), Button("محصول", actions[4])],
-                    [Button("کارت مقصد", actions[5])],
-                    [Button("احراز هویت", actions[6]), Button("کارت‌ها", actions[7])],
-                    [Button("سفارش‌ها", actions[8], "success")],
-                    [Button("صفحه‌ها", actions[9])],
-                    [Button("Premium Emoji", actions[10])],
-                    [Button("Audit", actions[11])],
-                    [Button("بازگشت", actions[12], "danger")],
-                ]
-            ),
-        )
+        await clear_actor_state(message.from_user.id)
+        await admin_home(message, message.from_user.id)
+
+    @router.message(Command("cancel"))
+    async def cancel(message: Message) -> None:
+        await clear_actor_state(message.from_user.id)
+        try:
+            repo.owner(message.from_user.id)
+        except AccessDenied:
+            await start(message)
+        else:
+            await admin_home(message, message.from_user.id)
 
     @router.message(Command("kyc"))
     async def begin_kyc(message: Message) -> None:
@@ -630,12 +741,7 @@ def persistent_router(repo: ShopRepository) -> Router:
             repo.owner(message.from_user.id)
             parts = message.text.split(maxsplit=1)
             source = message.reply_to_message
-            entities = list((source.entities if source else None) or [])
-            identifiers = [
-                entity.custom_emoji_id
-                for entity in entities
-                if entity.type == "custom_emoji" and entity.custom_emoji_id
-            ]
+            identifiers = extract_message_custom_emoji(source)
             if len(parts) != 2 or not identifiers:
                 raise ValueError("NAME_AND_CUSTOM_EMOJI_REQUIRED")
             emoji = await repo.register_emoji(message.from_user.id, parts[1], identifiers[0])
@@ -677,9 +783,8 @@ def persistent_router(repo: ShopRepository) -> Router:
                 preview = f"پیش‌نمایش تحویل\n\n{content}"
                 if activation_link:
                     preview += f"\n{activation_link}"
-                await message.answer(
-                    preview,
-                    reply_markup=markup([[Button("تأیید نهایی تحویل", confirm, "success")]]),
+                await answer_keyboard(
+                    message, preview, [[Button("تأیید نهایی تحویل", confirm, "success")]]
                 )
             except Exception:
                 log.exception("delivery failed", extra={"telegram_id": message.from_user.id})
@@ -688,12 +793,7 @@ def persistent_router(repo: ShopRepository) -> Router:
             try:
                 repo.owner(message.from_user.id)
                 source = message.reply_to_message
-                entities = list((source.entities if source else None) or [])
-                identifiers = [
-                    entity.custom_emoji_id
-                    for entity in entities
-                    if entity.type == "custom_emoji" and entity.custom_emoji_id
-                ]
+                identifiers = extract_message_custom_emoji(source)
                 if not message.text.strip() or not identifiers:
                     raise ValueError("NAME_AND_CUSTOM_EMOJI_REQUIRED")
                 emoji = await repo.register_emoji(
@@ -735,7 +835,7 @@ def persistent_router(repo: ShopRepository) -> Router:
                 repo.owner(message.from_user.id)
                 category_id = UUID(state.split(":", 1)[1])
                 values = [item.strip() for item in message.text.split("|")]
-                if len(values) != 15:
+                if len(values) != 14:
                     raise ValueError("FIELDS_REQUIRED")
                 await repo.create_product(
                     message.from_user.id,
@@ -755,7 +855,6 @@ def persistent_router(repo: ShopRepository) -> Router:
                         "requires_kyc": values[11].lower() == "true",
                         "position": int(values[12]),
                         "fixed_price_toman": int(values[13]) if values[13] != "-" else None,
-                        "custom_emoji_id": values[14] if values[14] != "-" else None,
                     },
                 )
                 await repo.coordinator.redis.delete(f"fsm:{message.from_user.id}")
@@ -865,12 +964,11 @@ def persistent_router(repo: ShopRepository) -> Router:
                         },
                     )
                 elif state == "admin.category":
-                    if len(values) not in {3, 4}:
+                    if len(values) != 3:
                         raise ValueError("FIELDS_REQUIRED")
                     title, description, position = values[:3]
-                    emoji_id = values[3] if len(values) == 4 and values[3] != "-" else None
                     await repo.create_category(
-                        message.from_user.id, title, description, int(position), emoji_id
+                        message.from_user.id, title, description, int(position)
                     )
                 elif state == "admin.product":
                     if len(values) not in {12, 16}:
@@ -926,7 +1024,7 @@ def persistent_router(repo: ShopRepository) -> Router:
                 action, object_id = state.rsplit(":", 1)
                 values = [item.strip() for item in message.text.split("|")]
                 if action == "admin.category.edit":
-                    if len(values) != 4:
+                    if len(values) != 3:
                         raise ValueError("FIELDS_REQUIRED")
                     await repo.update_category(
                         message.from_user.id,
@@ -934,10 +1032,9 @@ def persistent_router(repo: ShopRepository) -> Router:
                         title=values[0],
                         description=values[1] or None,
                         position=int(values[2]),
-                        custom_emoji_id=values[3] if values[3] != "-" else None,
                     )
                 elif action == "admin.product.edit":
-                    if len(values) != 16:
+                    if len(values) != 15:
                         raise ValueError("FIELDS_REQUIRED")
                     await repo.update_product(
                         message.from_user.id,
@@ -958,7 +1055,6 @@ def persistent_router(repo: ShopRepository) -> Router:
                             "requires_kyc": values[12].lower() == "true",
                             "position": int(values[13]),
                             "fixed_price_toman": int(values[14]) if values[14] != "-" else None,
-                            "custom_emoji_id": values[15] if values[15] != "-" else None,
                         },
                     )
                 else:

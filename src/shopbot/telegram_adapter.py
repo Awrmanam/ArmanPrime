@@ -36,6 +36,18 @@ def extract_custom_emoji(entities: list[dict]) -> list[str]:
     ]
 
 
+def extract_message_custom_emoji(message: object | None) -> list[str]:
+    """Extract genuine numeric custom emoji IDs from text and caption entities."""
+    identifiers: list[str] = []
+    for attribute in ("entities", "caption_entities"):
+        for entity in list(getattr(message, attribute, None) or []):
+            entity_type = getattr(entity, "type", None)
+            identifier = getattr(entity, "custom_emoji_id", None)
+            if str(entity_type) == "custom_emoji" and identifier and str(identifier).isdigit():
+                identifiers.append(str(identifier))
+    return identifiers
+
+
 class TelegramAPI:
     """Small raw adapter for Bot API fields not yet exposed by aiogram."""
 

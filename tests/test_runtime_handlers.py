@@ -5,9 +5,12 @@ from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.methods import SendMessage
 
 from shopbot.repository import AccessDenied
-from shopbot.runtime import persistent_router
+from shopbot.runtime import answer_keyboard, persistent_router
+from shopbot.telegram_adapter import Button
 
 
 class RedisFake:
@@ -23,6 +26,12 @@ class RedisFake:
 
     async def delete(self, *keys):
         return sum(self.values.pop(key, None) is not None for key in keys)
+
+    async def scan_iter(self, match):
+        prefix = match.removesuffix("*")
+        for key in list(self.values):
+            if key.startswith(prefix):
+                yield key
 
 
 class CoordinatorFake:
@@ -82,10 +91,12 @@ class RepoFake:
         self.accepted = True
 
     async def categories(self):
-        return [SimpleNamespace(id=uuid4(), title="Category", custom_emoji_id="123")]
+        return [SimpleNamespace(id=uuid4(), title="Category", custom_emoji_id="premium")]
 
     async def owner_categories(self, _):
-        return [SimpleNamespace(id=uuid4(), title="Category", active=True, custom_emoji_id="123")]
+        return [
+            SimpleNamespace(id=uuid4(), title="Category", active=True, custom_emoji_id="premium")
+        ]
 
     async def owner_products(self, _):
         return [SimpleNamespace(id=uuid4(), title="Product", active=True, pricing_override=None)]
@@ -111,9 +122,15 @@ class RepoFake:
     async def products(self, category_id):
         return [
             SimpleNamespace(
-                id=uuid4(), category_id=category_id, title="Product", custom_emoji_id=None
+                id=uuid4(), category_id=category_id, title="Product", custom_emoji_id="premium"
             )
         ]
+
+    async def resolve_emoji_key(self, key):
+        return "123456" if key == "premium" else None
+
+    async def emojis(self, _, active_only=False):
+        return [SimpleNamespace(id=uuid4(), name="premium", custom_emoji_id="123456", active=True)]
 
     async def product(self, product_id):
         return SimpleNamespace(
@@ -199,6 +216,8 @@ class RepoFake:
     claim = AsyncMock(return_value=True)
     deliver = AsyncMock()
     register_emoji = AsyncMock(return_value=SimpleNamespace(name="premium"))
+    set_emoji_active = AsyncMock()
+    set_entity_emoji = AsyncMock()
 
 
 class MessageFake:
@@ -269,8 +288,13 @@ async def test_customer_callback_navigation_and_checkout():
         return message.answers[-1]
 
     catalog = await dispatch("catalog")
+    assert catalog[1]["reply_markup"].inline_keyboard[0][0].icon_custom_emoji_id == "123456"
     category_token = catalog[1]["reply_markup"].inline_keyboard[0][0].callback_data
     await callback(QueryFake(category_token, message))
+    assert (
+        message.answers[-1][1]["reply_markup"].inline_keyboard[0][0].icon_custom_emoji_id
+        == "123456"
+    )
     product_token = message.answers[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data
     await callback(QueryFake(product_token, message))
     buy_token = message.answers[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data
@@ -306,6 +330,19 @@ async def test_buy_gate_provides_actionable_kyc_and_card_buttons():
         for button in row
     }
     assert actions == {"begin_kyc", "begin_card"}
+
+
+@pytest.mark.asyncio
+async def test_missing_or_inactive_registry_emoji_renders_clean_text():
+    repo, message = RepoFake(), MessageFake()
+    repo.resolve_emoji_key = AsyncMock(return_value=None)
+    router = persistent_router(repo)
+    callback = handler(router, "callback_query", "callback")
+    token = await repo.coordinator.issue_callback("catalog", 2)
+    await callback(QueryFake(token, message))
+    button = message.answers[-1][1]["reply_markup"].inline_keyboard[0][0]
+    assert button.text == "Category"
+    assert button.icon_custom_emoji_id is None
 
 
 @pytest.mark.asyncio
@@ -367,6 +404,87 @@ async def test_admin_rbac_menu_queues_and_decision_forms():
     token = await repo.coordinator.issue_callback("admin.button.create", 1, str(page_id))
     await callback(QueryFake(token, owner, actor=1))
     assert await repo.coordinator.redis.get("fsm:1") == f"admin.button:{page_id}"
+
+    category_id = uuid4()
+    token = await repo.coordinator.issue_callback(
+        "admin.entity.emoji", 1, f"category:{category_id}"
+    )
+    await callback(QueryFake(token, owner, actor=1))
+    select_token = owner.answers[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data
+    await callback(QueryFake(select_token, owner, actor=1))
+    repo.set_entity_emoji.assert_awaited_with(1, "category", category_id, "premium")
+
+
+@pytest.mark.asyncio
+async def test_admin_close_cancel_and_commands_clear_actor_state():
+    repo = RepoFake()
+    repo.terms = SimpleNamespace(id=uuid4(), version=1, title="Terms", pages=["Body"])
+    router = persistent_router(repo)
+    callback = handler(router, "callback_query", "callback")
+    owner = MessageFake(actor=1)
+    for key in ("fsm:1", "terms-title:1", "delivery-draft:1:order"):
+        await repo.coordinator.redis.set(key, "temporary")
+    token = await repo.coordinator.issue_callback("admin.close", 1)
+    await callback(QueryFake(token, owner, actor=1))
+    assert not any(
+        key.endswith(":1") or key.startswith("delivery-draft:1:")
+        for key in repo.coordinator.redis.values
+    )
+    assert owner.answers[-1][0] == "پنل مدیریت"
+
+    await repo.coordinator.redis.set("fsm:1", "admin.emoji")
+    admin = handler(router, "message", "admin")
+    await admin(owner)
+    assert await repo.coordinator.redis.get("fsm:1") is None
+    await repo.coordinator.redis.set("fsm:1", "admin.emoji")
+    cancel = handler(router, "message", "cancel")
+    await cancel(owner)
+    assert await repo.coordinator.redis.get("fsm:1") is None
+
+    customer = MessageFake(actor=2)
+    await repo.coordinator.redis.set("fsm:2", "admin.emoji")
+    start = handler(router, "message", "start")
+    await start(customer)
+    assert await repo.coordinator.redis.get("fsm:2") is None
+    assert "Terms" in customer.answers[-1][0]
+
+
+class RejectingKeyboardMessage(MessageFake):
+    def __init__(self, failures, error_text="style is not supported"):
+        super().__init__()
+        self.failures = failures
+        self.error_text = error_text
+        self.attempts = 0
+
+    async def answer(self, text, **kwargs):
+        self.attempts += 1
+        if self.attempts <= self.failures:
+            raise TelegramBadRequest(
+                method=SendMessage(chat_id=2, text=text), message=self.error_text
+            )
+        return await super().answer(text, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_keyboard_feature_rejection_retries_once_without_unicode_fallback():
+    message = RejectingKeyboardMessage(1)
+    await answer_keyboard(
+        message, "Screen", [[Button("Plain title", "c1.token", "primary", "123456")]]
+    )
+    assert message.attempts == 2
+    button = message.answers[-1][1]["reply_markup"].inline_keyboard[0][0]
+    assert button.text == "Plain title"
+    assert button.style is None and button.icon_custom_emoji_id is None
+
+    twice = RejectingKeyboardMessage(2, "icon_custom_emoji_id is not supported")
+    with pytest.raises(TelegramBadRequest):
+        await answer_keyboard(twice, "Screen", [[Button("Plain title", "c1.token", "success")]])
+    assert twice.attempts == 2
+
+    unrelated = RejectingKeyboardMessage(1, "chat not found")
+    with pytest.raises(TelegramBadRequest):
+        await answer_keyboard(unrelated, "Screen", [[Button("Plain title", "c1.token")]])
+    assert unrelated.attempts == 1
 
 
 @pytest.mark.asyncio

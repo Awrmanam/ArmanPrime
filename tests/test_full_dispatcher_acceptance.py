@@ -189,7 +189,7 @@ async def test_full_dispatcher_acceptance_persists_after_reconstruction():
     await telegram.send(100, "/admin")
     await telegram.click(100, "دسته")
     await telegram.click(100, "ایجاد مورد جدید")
-    await telegram.send(100, "Category|Description|1|-")
+    await telegram.send(100, "Category|Description|1")
 
     await telegram.send(100, "/admin")
     await telegram.click(100, "محصول")
@@ -197,7 +197,7 @@ async def test_full_dispatcher_acceptance_persists_after_reconstruction():
     await telegram.click(100, "Category")
     await telegram.send(
         100,
-        "Product|Full description|10|30 days|standard|link|manual warranty|7|60|2|false|true|1|-|-",
+        "Product|Full description|10|30 days|standard|link|manual warranty|7|60|2|false|true|1|-",
     )
 
     await telegram.send(200, "/start")
