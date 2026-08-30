@@ -609,3 +609,53 @@ async def test_admin_text_forms_claim_delivery_and_emoji():
     )
     await emoji_handler(owner)
     assert "Premium Emoji" in owner.answers[-1][0]
+
+
+@pytest.mark.asyncio
+async def test_pricing_wizard_maps_each_value_and_renders_confirmation():
+    repo, owner = RepoFake(), MessageFake(actor=1)
+    router = persistent_router(repo)
+    callback = handler(router, "callback_query", "callback")
+    form = handler(router, "message", "form_text")
+
+    start = await repo.coordinator.issue_callback("admin.pricing", 1)
+    await callback(QueryFake(start, owner, actor=1))
+    mode = owner.answers[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data
+    await callback(QueryFake(mode, owner, actor=1))
+
+    expected = (
+        ("12.5", "percent"),
+        ("1", "platform_fee"),
+        ("2", "payment_fee"),
+        ("3", "warranty_reserve"),
+        ("150000", "fixed_cost_toman"),
+    )
+    accumulated = {"mode": "markup"}
+    for value, field in expected:
+        owner.text = value
+        await form(owner)
+        accumulated[field] = value
+        draft = json.loads(await repo.coordinator.redis.get("admin-draft:1"))
+        assert draft["data"] == accumulated
+
+    assert "پیش‌نمایش فرمول قیمت‌گذاری" in owner.answers[-1][0]
+    confirm_button = owner.answers[-1][1]["reply_markup"].inline_keyboard[0][0]
+    assert confirm_button.text == "تأیید و ثبت"
+    resolved = await repo.coordinator.resolve_callback(confirm_button.callback_data, 1)
+    assert resolved["a"] == "admin.wizard.choice" and resolved["o"] == "confirm"
+
+    restart = await repo.coordinator.issue_callback("admin.pricing", 1)
+    await callback(QueryFake(restart, owner, actor=1))
+    mode = owner.answers[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data
+    await callback(QueryFake(mode, owner, actor=1))
+    owner.text = "10"
+    await form(owner)
+    skip = owner.answers[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data
+    await callback(QueryFake(skip, owner, actor=1))
+    draft = json.loads(await repo.coordinator.redis.get("admin-draft:1"))
+    assert draft["step"] == 3
+    assert draft["data"] == {"mode": "markup", "percent": "10", "platform_fee": "0"}
+    back = owner.answers[-1][1]["reply_markup"].inline_keyboard[-1][1].callback_data
+    await callback(QueryFake(back, owner, actor=1))
+    draft = json.loads(await repo.coordinator.redis.get("admin-draft:1"))
+    assert draft["step"] == 2

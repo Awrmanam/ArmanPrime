@@ -73,6 +73,14 @@ async def answer_keyboard(message: Message, text_value: str, rows: list[list[But
 
 def persistent_router(repo: ShopRepository) -> Router:
     router = Router(name="persistent-commerce")
+    pricing_fields = [
+        None,
+        "percent",
+        "platform_fee",
+        "payment_fee",
+        "warranty_reserve",
+        "fixed_cost_toman",
+    ]
 
     async def clear_actor_state(actor_id: int) -> None:
         keys = [
@@ -805,14 +813,7 @@ def persistent_router(repo: ShopRepository) -> Router:
                 kind, step, data = draft["kind"], draft["step"], draft["data"]
                 fields = {
                     "terms": ["title", "body", "extra"],
-                    "pricing": [
-                        None,
-                        "percent",
-                        "platform_fee",
-                        "payment_fee",
-                        "warranty_reserve",
-                        "fixed_cost_toman",
-                    ],
+                    "pricing": pricing_fields,
                     "category": ["title", "description"],
                     "product": [
                         "title",
@@ -829,7 +830,7 @@ def persistent_router(repo: ShopRepository) -> Router:
                     "delivery": ["content", "activation_link"],
                     "button": ["text"],
                 }
-                index = step - 1 if kind == "pricing" else step
+                index = step
                 field = fields.get(kind, [])[index]
                 if field:
                     data[field] = "0" if kind == "pricing" else None
@@ -1561,14 +1562,7 @@ def persistent_router(repo: ShopRepository) -> Router:
                     "merchant": ["pan", "bank", "holder"],
                     "merchant_edit": ["bank", "holder"],
                     "category": ["title", "description"],
-                    "pricing": [
-                        None,
-                        "percent",
-                        "platform_fee",
-                        "payment_fee",
-                        "warranty_reserve",
-                        "fixed_cost_toman",
-                    ],
+                    "pricing": pricing_fields,
                     "product": [
                         "title",
                         "description",
@@ -1605,7 +1599,7 @@ def persistent_router(repo: ShopRepository) -> Router:
                         raise ValueError("NON_NEGATIVE_NUMBER_REQUIRED")
                     data["stock"], next_step = int(value), 12
                 else:
-                    index = step - 1 if kind == "pricing" else step
+                    index = step
                     field = fields.get(kind, [])[index]
                     if not value:
                         raise ValueError("VALUE_REQUIRED")
