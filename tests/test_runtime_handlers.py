@@ -9,7 +9,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import SendMessage
 
 from shopbot.repository import AccessDenied
-from shopbot.runtime import answer_keyboard, persistent_router
+from shopbot.runtime import answer_keyboard, markup, persistent_router
 from shopbot.telegram_adapter import Button
 
 
@@ -117,7 +117,15 @@ class RepoFake:
         return [SimpleNamespace(id=uuid4(), slug="home")]
 
     async def page_buttons(self, _, page_id):
-        return [SimpleNamespace(id=uuid4(), page_id=page_id, text="Catalog", active=True)]
+        return [
+            SimpleNamespace(
+                id=uuid4(),
+                page_id=page_id,
+                text="Catalog",
+                active=True,
+                custom_emoji_id="premium",
+            )
+        ]
 
     async def products(self, category_id):
         return [
@@ -210,6 +218,7 @@ class RepoFake:
     set_product_pricing_override = AsyncMock()
     create_page_button = AsyncMock(return_value=SimpleNamespace(text="Catalog"))
     update_page_button = AsyncMock()
+    set_button_emoji = AsyncMock()
     review_kyc = AsyncMock()
     review_card = AsyncMock()
     manual_reconcile = AsyncMock()
@@ -342,7 +351,14 @@ async def test_missing_or_inactive_registry_emoji_renders_clean_text():
     await callback(QueryFake(token, message))
     button = message.answers[-1][1]["reply_markup"].inline_keyboard[0][0]
     assert button.text == "Category"
-    assert button.icon_custom_emoji_id is None
+    assert getattr(button, "icon_custom_emoji_id", None) is None
+
+    owner = MessageFake(actor=1)
+    token = await repo.coordinator.issue_callback("admin.page.buttons", 1, str(uuid4()))
+    await callback(QueryFake(token, owner, actor=1))
+    page_button = owner.answers[-1][1]["reply_markup"].inline_keyboard[0][0]
+    assert page_button.text == "Catalog"
+    assert getattr(page_button, "icon_custom_emoji_id", None) is None
 
 
 @pytest.mark.asyncio
@@ -401,6 +417,8 @@ async def test_admin_rbac_menu_queues_and_decision_forms():
     token = await repo.coordinator.issue_callback("admin.page.buttons", 1, str(page_id))
     await callback(QueryFake(token, owner, actor=1))
     assert "دکمه‌های صفحه" in owner.answers[-1][0]
+    page_button = owner.answers[-1][1]["reply_markup"].inline_keyboard[0][0]
+    assert page_button.icon_custom_emoji_id == "123456"
     token = await repo.coordinator.issue_callback("admin.button.create", 1, str(page_id))
     await callback(QueryFake(token, owner, actor=1))
     assert await repo.coordinator.redis.get("fsm:1") == f"admin.button:{page_id}"
@@ -413,6 +431,13 @@ async def test_admin_rbac_menu_queues_and_decision_forms():
     select_token = owner.answers[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data
     await callback(QueryFake(select_token, owner, actor=1))
     repo.set_entity_emoji.assert_awaited_with(1, "category", category_id, "premium")
+
+    button_id = uuid4()
+    token = await repo.coordinator.issue_callback("admin.button.emoji", 1, str(button_id))
+    await callback(QueryFake(token, owner, actor=1))
+    select_token = owner.answers[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data
+    await callback(QueryFake(select_token, owner, actor=1))
+    repo.set_button_emoji.assert_awaited_with(1, button_id, "premium")
 
 
 @pytest.mark.asyncio
@@ -467,6 +492,10 @@ class RejectingKeyboardMessage(MessageFake):
 
 @pytest.mark.asyncio
 async def test_keyboard_feature_rejection_retries_once_without_unicode_fallback():
+    rich = markup([[Button("Plain title", "c1.token", "primary", "123456")]])
+    rich_serialized = rich.inline_keyboard[0][0].model_dump(exclude_none=True)
+    assert rich_serialized["style"] == "primary"
+    assert rich_serialized["icon_custom_emoji_id"] == "123456"
     message = RejectingKeyboardMessage(1)
     await answer_keyboard(
         message, "Screen", [[Button("Plain title", "c1.token", "primary", "123456")]]
@@ -474,7 +503,8 @@ async def test_keyboard_feature_rejection_retries_once_without_unicode_fallback(
     assert message.attempts == 2
     button = message.answers[-1][1]["reply_markup"].inline_keyboard[0][0]
     assert button.text == "Plain title"
-    assert button.style is None and button.icon_custom_emoji_id is None
+    serialized = button.model_dump(exclude_none=True)
+    assert "style" not in serialized and "icon_custom_emoji_id" not in serialized
 
     twice = RejectingKeyboardMessage(2, "icon_custom_emoji_id is not supported")
     with pytest.raises(TelegramBadRequest):
@@ -535,7 +565,7 @@ async def test_admin_text_forms_claim_delivery_and_emoji():
         await form(owner)
         assert "موفقیت" in owner.answers[-1][0]
     await repo.coordinator.redis.set("fsm:1", f"admin.button:{uuid4()}")
-    owner.text = "Catalog|catalog|0|0|primary|-"
+    owner.text = "Catalog|catalog|0|0|primary"
     await form(owner)
     assert "دکمه ثبت" in owner.answers[-1][0]
     await repo.coordinator.redis.set("fsm:1", f"admin.product.pricing:{uuid4()}")

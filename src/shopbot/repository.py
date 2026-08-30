@@ -829,6 +829,24 @@ class ShopRepository:
             await self.audit(session, actor, "button.update", str(button.id))
             return button
 
+    async def set_button_emoji(
+        self, actor: int, button_id: UUID, emoji_name: str | None
+    ) -> ButtonRow:
+        self.owner(actor)
+        async with self.sessions.begin() as session:
+            if emoji_name:
+                emoji = await session.scalar(
+                    select(EmojiRow).where(EmojiRow.name == emoji_name, EmojiRow.active.is_(True))
+                )
+                if not emoji:
+                    raise InvalidState("ACTIVE_EMOJI_REQUIRED")
+            button = await session.get(ButtonRow, button_id, with_for_update=True)
+            if not button:
+                raise InvalidState("BUTTON_NOT_FOUND")
+            button.custom_emoji_id = emoji_name
+            await self.audit(session, actor, "button.emoji", str(button.id), emoji_name or "none")
+            return button
+
     async def register_emoji(self, actor: int, name: str, custom_emoji_id: str) -> EmojiRow:
         self.owner(actor)
         if not custom_emoji_id.isdigit() or not name.strip():

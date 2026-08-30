@@ -405,6 +405,8 @@ async def test_owner_crud_validation_pages_buttons_emojis_and_audit(repository):
         await repository.create_page_button(100, page.id, "X", "x", 0, 0, "purple")
     emoji = await repository.register_emoji(100, "premium", "123456")
     assert emoji.custom_emoji_id == "123456"
+    button = await repository.set_button_emoji(100, button.id, "premium")
+    assert button.custom_emoji_id == "premium"
     assert await repository.resolve_emoji_key("premium") == "123456"
     await repository.set_entity_emoji(100, "category", category.id, "premium")
     await repository.set_entity_emoji(100, "product", product.id, "premium")
