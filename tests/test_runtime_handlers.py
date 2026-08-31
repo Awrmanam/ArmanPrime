@@ -81,7 +81,9 @@ class RepoFake:
             raise AccessDenied
 
     async def user(self, actor, _session):
-        return SimpleNamespace(id=uuid4(), telegram_id=actor, kyc_status="VERIFIED")
+        return SimpleNamespace(
+            id=uuid4(), telegram_id=actor, kyc_status="VERIFIED", risk_status="CLEAR"
+        )
 
     async def current_terms(self, _session):
         return self.terms
@@ -190,7 +192,11 @@ class RepoFake:
         return SimpleNamespace(
             id=uuid4(),
             version=1,
-            snapshot={"title": "Product"},
+            snapshot={
+                "title": "Product",
+                "selected_card_bank": "Bank",
+                "selected_card_masked": "**** 1111",
+            },
             final_toman=100,
             created_at=now,
             expires_at=now + timedelta(minutes=30),
@@ -225,8 +231,21 @@ class RepoFake:
     async def submit_kyc(self, *args):
         return SimpleNamespace(id=uuid4())
 
-    async def submit_customer_card(self, _, bank, pan, __):
+    async def submit_customer_card(
+        self,
+        _,
+        bank,
+        pan,
+        evidence_file_id,
+        evidence_unique_id=None,
+        evidence_type="document",
+        safe_identity=None,
+    ):
         assert len(pan) == 16
+        assert evidence_file_id
+        assert evidence_unique_id
+        assert evidence_type in {"photo", "document"}
+        assert safe_identity
         return SimpleNamespace(bank_name=bank, masked_pan="**** " + pan[-4:])
 
     async def submit_receipt(self, *_):

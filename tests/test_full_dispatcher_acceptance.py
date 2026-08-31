@@ -275,7 +275,7 @@ async def test_full_dispatcher_acceptance_persists_after_reconstruction():
     await telegram.send(100, "واریز با بررسی دستی تطبیق داده شد")
     await telegram.send(100, "/admin")
     await telegram.click(100, "سفارش‌ها")
-    await telegram.click(100, "Claim")
+    await telegram.click(100, "دریافت سفارش")
     await telegram.send(100, "/admin")
     await telegram.click(100, "سفارش‌ها")
     await telegram.click(100, "ثبت تحویل")
