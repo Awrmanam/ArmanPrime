@@ -74,14 +74,7 @@ async def answer_keyboard(message: Message, text_value: str, rows: list[list[But
 
 def persistent_router(repo: ShopRepository) -> Router:
     router = Router(name="persistent-commerce")
-    pricing_fields = [
-        None,
-        "percent",
-        "platform_fee",
-        "payment_fee",
-        "warranty_reserve",
-        "fixed_cost_toman",
-    ]
+    pricing_fields = ["percent"]
 
     async def clear_actor_state(actor_id: int) -> None:
         keys = [
@@ -116,6 +109,8 @@ def persistent_router(repo: ShopRepository) -> Router:
         return json.loads(raw) if raw else {}
 
     async def save_draft(actor: int, draft: dict) -> None:
+        current = await load_draft(actor)
+        draft["version"] = int(current.get("version", 0)) + 1
         await repo.coordinator.redis.set(
             f"admin-draft:{actor}", json.dumps(draft, ensure_ascii=False), ex=900
         )
@@ -162,9 +157,6 @@ def persistent_router(repo: ShopRepository) -> Router:
     async def render_wizard(message: Message, actor: int) -> None:
         draft = await load_draft(actor)
         kind, step, data = draft["kind"], draft["step"], draft["data"]
-        if kind == "pricing" and step == 0:
-            await render_wizard_choice_or_preview(message, actor, kind, step, data)
-            return
         if kind == "rate" and step == 0:
             currencies = ("USD", "RUB", "EUR", "TRY", "AED", "GBP", "CNY", "INR", "SGD", "EGP")
             await answer_keyboard(
@@ -180,10 +172,10 @@ def persistent_router(repo: ShopRepository) -> Router:
                 [await wizard_buttons(actor)],
             )
             return
-        if kind == "product" and step == 11:
+        if kind == "product" and step == 5:
             await answer_keyboard(
                 message,
-                "مرحله ۱۲ از ۲۱\nنوع موجودی را انتخاب کنید.",
+                "مرحله ۶ از ۱۰\nنوع موجودی را انتخاب کنید.",
                 await choice_rows(
                     actor, [("موجودی نامحدود", "unlimited"), ("موجودی محدود", "limited")]
                 ),
@@ -192,7 +184,7 @@ def persistent_router(repo: ShopRepository) -> Router:
         if kind == "product" and step == 120:
             await answer_keyboard(
                 message,
-                "مرحله ۱۳ از ۲۱\nتعداد موجودی را وارد کنید.",
+                "مرحله ۷ از ۱۰\nتعداد موجودی را وارد کنید.",
                 [await wizard_buttons(actor)],
             )
             return
@@ -203,13 +195,6 @@ def persistent_router(repo: ShopRepository) -> Router:
                 message,
                 "مرحله ۴ از ۲۱\nارز هزینه تأمین‌کننده را انتخاب کنید.",
                 await choice_rows(actor, choices),
-            )
-            return
-        if kind == "product" and step == 31:
-            await answer_keyboard(
-                message,
-                "مرحله ۵ از ۲۱\nدرصد حاشیه تبدیل ارز را وارد کنید یا رد کردن را بزنید.",
-                [await wizard_buttons(actor, skip=True)],
             )
             return
         if kind == "product" and step == 160:
@@ -243,23 +228,11 @@ def persistent_router(repo: ShopRepository) -> Router:
             "product": [
                 ("عنوان محصول", False),
                 ("توضیح کامل محصول", False),
-                ("قیمت پایه دلاری", False),
+                ("مبلغ خرید از تأمین‌کننده", False),
                 ("انتخاب ارز", False),
-                ("قیمت ثابت تومانی", True),
-                ("مدت سرویس", True),
-                ("نوع یا پلن", True),
-                ("روش فعال‌سازی", True),
-                ("متن گارانتی", True),
-                ("مدت گارانتی به روز", True),
-                ("زمان تقریبی تحویل به دقیقه", False),
+                ("مدت یا نوع پلن", False),
             ],
-            "pricing": [
-                ("درصد روش انتخاب‌شده", False),
-                ("درصد هزینه پلتفرم", True),
-                ("درصد هزینه پرداخت", True),
-                ("درصد ذخیره گارانتی", True),
-                ("هزینه ثابت اضافه به تومان", True),
-            ],
+            "pricing": [("درصد سود روی هزینه خرید", False)],
         }
         text_steps = definitions.get(kind, [])
         text_index = step - 1 if kind == "pricing" else step
@@ -293,9 +266,7 @@ def persistent_router(repo: ShopRepository) -> Router:
                 5: [("تأیید و ثبت", "confirm")],
             }
         elif kind == "pricing":
-            # Step five still collects the fixed cost. Confirmation belongs to
-            # the following preview step, after every pricing value is present.
-            choices = {6: [("تأیید و ثبت", "confirm")]}
+            choices = {2: [("تأیید و ثبت", "confirm")]}
         elif kind == "rate":
             choices = {3: [("تأیید نرخ", "confirm")]}
         elif kind == "terms":
@@ -318,60 +289,39 @@ def persistent_router(repo: ShopRepository) -> Router:
                 )
             return
         # Wizard-specific continuations with inline choices.
-        if kind == "pricing" and step == 0:
+        if kind == "pricing" and step == 1:
             await answer_keyboard(
                 message,
-                "مرحله ۱ از ۷\nروش قیمت‌گذاری را انتخاب کنید.",
-                await choice_rows(
-                    actor, [("درصد افزایش روی هزینه", "markup"), ("حاشیه سود هدف", "target_margin")]
-                ),
-            )
-        elif kind == "product" and step == 13:
-            await answer_keyboard(
-                message,
-                "مرحله ۱۴ از ۲۰\nآیا احراز هویت لازم است؟",
-                await choice_rows(actor, [("لازم است", "1"), ("لازم نیست", "0")]),
-            )
-        elif kind == "product" and step == 14:
-            await answer_keyboard(
-                message,
-                "مرحله ۱۵ از ۲۰\nوضعیت محصول",
-                await choice_rows(actor, [("فعال", "1"), ("غیرفعال", "0")]),
-            )
-        elif kind == "product" and step == 15:
-            await answer_keyboard(
-                message,
-                "مرحله ۱۶ از ۲۰\nجایگاه نمایش",
-                await choice_rows(actor, [("انتهای فهرست", "0"), ("ابتدای فهرست", "1")]),
-            )
-        elif kind == "product" and step == 16:
-            emoji_choices = [("بدون آیکون", "")] + [
-                (item.name, item.name) for item in await repo.emojis(actor, active_only=True)
-            ]
-            await answer_keyboard(
-                message,
-                "مرحله ۱۷ از ۲۰\nآیکون Premium Emoji",
-                await choice_rows(actor, emoji_choices),
-            )
-        elif kind == "product" and step == 17:
-            await answer_keyboard(
-                message,
-                "مرحله ۱۸ از ۲۰\nروش قیمت‌گذاری محصول",
+                "مرحله ۲ از ۴\nنحوه گرد کردن قیمت نهایی را انتخاب کنید.",
                 await choice_rows(
                     actor,
                     [
-                        ("استفاده از قیمت‌گذاری عمومی", "inherit"),
-                        ("درصد اختصاصی", "markup"),
-                        ("حاشیه سود اختصاصی", "target_margin"),
-                        ("قیمت ثابت تومان", "fixed"),
+                        ("بدون گرد کردن", "1"),
+                        ("نزدیک‌ترین ۱٬۰۰۰ تومان", "1000"),
+                        ("نزدیک‌ترین ۵٬۰۰۰ تومان", "5000"),
+                        ("نزدیک‌ترین ۱۰٬۰۰۰ تومان", "10000"),
                     ],
                 ),
             )
-        elif kind == "product" and step == 18:
+        elif kind == "product" and step == 7:
             await answer_keyboard(
                 message,
-                wizard_preview(kind, data),
-                await choice_rows(actor, [("تأیید و ثبت", "confirm")]),
+                "مرحله ۸ از ۱۰\nآیا احراز هویت لازم است؟",
+                await choice_rows(actor, [("لازم است", "1"), ("لازم نیست", "0")]),
+            )
+        elif kind == "product" and step == 8:
+            preview = await product_preview(data, actor)
+            draft = await load_draft(actor)
+            confirm = await repo.coordinator.issue_callback(
+                "admin.product.confirm",
+                actor,
+                str(draft["version"]),
+                one_time=True,
+            )
+            await answer_keyboard(
+                message,
+                preview,
+                [[Button("تأیید و ثبت", confirm, "success")], await wizard_buttons(actor)],
             )
         elif kind == "page" and step == 2:
             await answer_keyboard(
@@ -478,6 +428,19 @@ def persistent_router(repo: ShopRepository) -> Router:
             )
 
     def wizard_preview(kind: str, data: dict) -> str:
+        if kind == "pricing":
+            rounding = {
+                1: "بدون گرد کردن",
+                1000: "نزدیک‌ترین ۱٬۰۰۰ تومان",
+                5000: "نزدیک‌ترین ۵٬۰۰۰ تومان",
+                10000: "نزدیک‌ترین ۱۰٬۰۰۰ تومان",
+            }[int(data["rounding_increment_toman"])]
+            return (
+                "پیش‌نمایش قیمت‌گذاری\n\n"
+                f"درصد سود روی هزینه خرید: {data['percent']}٪\n"
+                f"نحوه گرد کردن قیمت نهایی: {rounding}\n\n"
+                "هزینه خرید پس از تبدیل ارز و حاشیه تبدیل، در درصد سود ضرب می‌شود."
+            )
         safe = {key: value for key, value in data.items() if key not in {"encrypted_pan"}}
         labels = {
             "terms": "پیش‌نمایش قوانین",
@@ -497,6 +460,40 @@ def persistent_router(repo: ShopRepository) -> Router:
             + "\n".join(f"{key}: {value}" for key, value in safe.items())
         )
 
+    async def product_preview(data: dict, actor: int) -> str:
+        commercial = await repo.product_commercial_preview(actor, data)
+        names = {
+            "USD": "دلار آمریکا",
+            "RUB": "روبل روسیه",
+            "EUR": "یورو",
+            "TRY": "لیر ترکیه",
+            "AED": "درهم امارات",
+            "GBP": "پوند بریتانیا",
+            "CNY": "یوان چین",
+            "INR": "روپیه هند",
+            "SGD": "دلار سنگاپور",
+            "EGP": "پوند مصر",
+        }
+        rate = commercial["rate"]
+        currency = data["base_cost_currency"]
+        stock = "نامحدود" if data.get("unlimited_stock") else f"{data.get('stock', 0):,} عدد"
+        return (
+            "پیش‌نمایش محصول\n\n"
+            f"دسته‌بندی: {commercial['category']}\n"
+            f"نام محصول: {data['title']}\n"
+            f"هزینه خرید: {Decimal(data['base_cost_amount']):,} {names.get(currency, currency)}\n"
+            f"نرخ فعلی: هر ۱ {names.get(currency, currency)} = {rate.toman_per_unit:,.0f} تومان\n"
+            f"زمان دریافت نرخ: {rate.provider_timestamp.isoformat()}\n"
+            f"هزینه خرید به تومان: {commercial['purchase_cost_toman']:,.0f} تومان\n"
+            f"حاشیه تبدیل ارز: {commercial['buffer_percent']}٪\n"
+            f"درصد سود: {commercial['markup_percent']}٪\n"
+            f"قیمت نهایی فروش: {commercial['final_toman']:,} تومان\n"
+            f"مدت: {data['duration']}\n"
+            f"موجودی: {stock}\n"
+            f"احراز هویت: {'لازم است' if data.get('requires_kyc') else 'لازم نیست'}\n"
+            "وضعیت: فعال"
+        )
+
     async def finish_wizard(message: Message, actor: int, draft: dict) -> None:
         kind, data = draft["kind"], draft["data"]
         if kind == "terms":
@@ -511,13 +508,14 @@ def persistent_router(repo: ShopRepository) -> Router:
             )
         elif kind == "pricing":
             config = {
-                "mode": data["mode"],
-                "markup": data["percent"] if data["mode"] == "markup" else "0",
-                "target_margin": data["percent"] if data["mode"] == "target_margin" else "0",
-                "platform_fee": data.get("platform_fee", "0"),
-                "payment_fee": data.get("payment_fee", "0"),
-                "warranty_reserve": data.get("warranty_reserve", "0"),
-                "fixed_cost_toman": int(data.get("fixed_cost_toman", 0)),
+                "mode": "markup",
+                "markup": data["percent"],
+                "target_margin": "0",
+                "platform_fee": "0",
+                "payment_fee": "0",
+                "warranty_reserve": "0",
+                "fixed_cost_toman": 0,
+                "rounding_increment_toman": int(data["rounding_increment_toman"]),
             }
             if data.get("product_id"):
                 await repo.set_product_pricing_override(actor, UUID(data["product_id"]), config)
@@ -571,14 +569,14 @@ def persistent_router(repo: ShopRepository) -> Router:
                 "fixed_price_toman": data.get("fixed_price_toman"),
                 "duration": data.get("duration"),
                 "plan_type": data.get("plan_type"),
-                "activation_method": data.get("activation_method"),
+                "activation_method": None,
                 "warranty_text": data.get("warranty_text"),
-                "warranty_days": int(data.get("warranty_days", 0)),
-                "delivery_minutes": int(data["delivery_minutes"]),
+                "warranty_days": 0,
+                "delivery_minutes": 0,
                 "stock": int(data.get("stock", 0)),
                 "unlimited_stock": bool(data.get("unlimited_stock")),
                 "requires_kyc": bool(data.get("requires_kyc", True)),
-                "position": int(data.get("position", 0)),
+                "position": 0,
             }
             pricing_mode = data.get("pricing_mode", "inherit")
             if pricing_mode == "fixed":
@@ -603,7 +601,7 @@ def persistent_router(repo: ShopRepository) -> Router:
                 row = await repo.create_product(actor, UUID(data["category_id"]), values)
                 if not data.get("active", True):
                     row = await repo.update_product(actor, row.id, {"active": False})
-            await repo.set_entity_emoji(actor, "product", row.id, data.get("emoji"))
+            await repo.set_entity_emoji(actor, "product", row.id, None)
         elif kind == "page":
             # The internal key is generated and is never requested from the owner.
             slug = "page-" + re.sub(r"[^a-z0-9]+", "-", data["title"].lower()).strip("-")
@@ -652,8 +650,8 @@ def persistent_router(repo: ShopRepository) -> Router:
         if value == "confirm":
             await finish_wizard(message, actor, draft)
             return
-        if kind == "pricing" and step == 0:
-            data["mode"], step = value, 1
+        if kind == "pricing" and step == 1:
+            data["rounding_increment_toman"], step = int(value), 2
         elif kind == "rate" and step == 0:
             data["currency_code"], step = value, 1
         elif kind == "merchant" and step == 3:
@@ -681,21 +679,14 @@ def persistent_router(repo: ShopRepository) -> Router:
         elif kind == "category" and step == 4:
             data["emoji"], step = value or None, 5
         elif kind == "product" and step == 3:
-            data["base_cost_currency"], step = value, 31
-        elif kind == "product" and step == 11:
+            data["base_cost_currency"] = value
+            data["currency_buffer_percent"] = "0"
+            step = 4
+        elif kind == "product" and step == 5:
             data["unlimited_stock"] = value == "unlimited"
-            step = 13 if value == "unlimited" else 120
-        elif kind == "product" and step == 13:
-            data["requires_kyc"], step = bool(int(value)), 14
-        elif kind == "product" and step == 14:
-            data["active"], step = bool(int(value)), 15
-        elif kind == "product" and step == 15:
-            data["position"], step = int(value), 16
-        elif kind == "product" and step == 16:
-            data["emoji"], step = value or None, 17
-        elif kind == "product" and step == 17:
-            data["pricing_mode"] = value
-            step = 18 if value == "inherit" else 160
+            step = 7 if value == "unlimited" else 120
+        elif kind == "product" and step == 7:
+            data["requires_kyc"], step = bool(int(value)), 8
         elif kind == "page" and step == 2:
             data["active"], step = bool(int(value)), 3
         elif kind == "appearance" and step == 1:
@@ -780,10 +771,16 @@ def persistent_router(repo: ShopRepository) -> Router:
                 (int(pref.get("order", index)), button)
             )
         rows = [[item[1] for item in sorted(grouped[row])] for row in sorted(grouped)]
+        fx_label = (
+            "Navasan خودکار"
+            if getattr(repo, "fx_mode", "manual") == "navasan"
+            else "حالت دستی اضطراری"
+        )
         await answer_keyboard(
             message,
             "پنل مدیریت\n\n"
-            f"وضعیت آمادگی فروشگاه: {'آماده فروش' if all(status.values()) else 'نیازمند تکمیل'}",
+            f"وضعیت آمادگی فروشگاه: {'آماده فروش' if all(status.values()) else 'نیازمند تکمیل'}\n"
+            f"نرخ ارز: {fx_label}",
             rows,
         )
 
@@ -848,6 +845,16 @@ def persistent_router(repo: ShopRepository) -> Router:
                 await home(query.message, query.from_user.id)
             elif state["a"] == "admin.wizard.choice":
                 await handle_wizard_choice(query.message, query.from_user.id, state["o"])
+            elif state["a"] == "admin.product.confirm":
+                draft = await load_draft(query.from_user.id)
+                if (
+                    not draft
+                    or draft.get("kind") != "product"
+                    or draft.get("step") != 8
+                    or int(state["o"]) != int(draft.get("version", -1))
+                ):
+                    raise AccessDenied("PRODUCT_DRAFT_CHANGED")
+                await finish_wizard(query.message, query.from_user.id, draft)
             elif state["a"] == "admin.wizard.skip":
                 draft = await load_draft(query.from_user.id)
                 if not draft:
@@ -863,13 +870,7 @@ def persistent_router(repo: ShopRepository) -> Router:
                         "description",
                         "base_cost_amount",
                         None,
-                        "fixed_price_toman",
                         "duration",
-                        "plan_type",
-                        "activation_method",
-                        "warranty_text",
-                        "warranty_days",
-                        "delivery_minutes",
                     ],
                     "delivery": ["content", "activation_link"],
                     "button": ["text"],
@@ -892,7 +893,7 @@ def persistent_router(repo: ShopRepository) -> Router:
                 elif draft["step"] == 31:
                     draft["step"] = 3
                 elif draft["step"] == 120:
-                    draft["step"] = 11
+                    draft["step"] = 5
                 elif draft["step"] == 160:
                     draft["step"] = 17
                 else:
@@ -1540,6 +1541,23 @@ def persistent_router(repo: ShopRepository) -> Router:
                 await repo.set_emoji_active(query.from_user.id, UUID(emoji_id), bool(int(active)))
                 await query.message.answer("وضعیت Premium Emoji تغییر کرد.")
             await query.answer()
+        except AccessDenied:
+            log.info("callback expired or rejected", extra={"telegram_id": query.from_user.id})
+            draft = await load_draft(query.from_user.id)
+            if draft and draft.get("kind") == "product" and draft.get("step") == 8:
+                await set_wizard(
+                    query.message,
+                    query.from_user.id,
+                    "product",
+                    8,
+                    draft["data"],
+                )
+                await query.answer(
+                    "این دکمه منقضی شده بود؛ پیش‌نمایش با دکمه تازه نمایش داده شد.",
+                    show_alert=True,
+                )
+            else:
+                await query.answer("این درخواست منقضی شده است؛ دوباره تلاش کنید.", show_alert=True)
         except Exception:
             log.exception("callback rejected", extra={"telegram_id": query.from_user.id})
             await query.answer("درخواست معتبر نیست.", show_alert=True)
@@ -1622,13 +1640,7 @@ def persistent_router(repo: ShopRepository) -> Router:
                         "description",
                         "base_cost_amount",
                         None,
-                        "fixed_price_toman",
                         "duration",
-                        "plan_type",
-                        "activation_method",
-                        "warranty_text",
-                        "warranty_days",
-                        "delivery_minutes",
                     ],
                     "page": ["title", "content"],
                     "button": ["text", "url"],
@@ -1657,7 +1669,7 @@ def persistent_router(repo: ShopRepository) -> Router:
                 elif kind == "product" and step == 120:
                     if not value.isdigit() or int(value) < 0:
                         raise ValueError("NON_NEGATIVE_NUMBER_REQUIRED")
-                    data["stock"], next_step = int(value), 13
+                    data["stock"], next_step = int(value), 7
                 else:
                     index = step
                     field = fields.get(kind, [])[index]
@@ -1842,6 +1854,7 @@ class Runtime:
             settings.admin_telegram_user_id,
             settings.order_notification_chat_id,
         )
+        self.repo.fx_mode = settings.fx_provider
         self.dispatcher.include_router(persistent_router(self.repo))
         self.worker: asyncio.Task | None = None
         api_key = settings.navasan_api_key.get_secret_value()
@@ -1856,6 +1869,8 @@ class Runtime:
             if settings.fx_provider == "navasan" and api_key
             else None
         )
+        self.repo.fx_provider = self.fx_provider
+        self.repo.fx_max_age_minutes = settings.fx_max_age_minutes
         self.next_fx_refresh = self.repo.now()
 
     async def outbox_worker(self) -> None:

@@ -30,6 +30,11 @@ def test_fixed_toman_override():
     assert calculate_price("999", 999, PricingRule(fixed_price_toman=123_457)) == 123_457
 
 
+def test_owner_rounding_increment_applies_exactly_once():
+    rule = PricingRule(markup_percent=Decimal("10"), rounding_increment_toman=5_000)
+    assert calculate_price("20", "1250", rule, "3") == 30_000
+
+
 @pytest.mark.parametrize(
     "rule",
     [

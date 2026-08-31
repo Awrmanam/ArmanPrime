@@ -25,8 +25,10 @@ fi
 if [[ $NON_INTERACTIVE != true ]]; then
 read -rp 'Admin Telegram user ID: ' ADMIN_ID
 read -rp 'Order notification chat ID [same as Owner]: ' ORDER_CHAT; ORDER_CHAT=${ORDER_CHAT:-$ADMIN_ID}
+read -rsp 'Navasan API key [leave empty for manual emergency mode]: ' NAVASAN_API_KEY; echo
 RUN_MODE=polling; WEBHOOK_URL=''; SECURE_PATH=/var/lib/shopbot/secure; BRAND_NAME=''
 fi
+FX_PROVIDER=${FX_PROVIDER:-$( [[ -n ${NAVASAN_API_KEY:-} ]] && echo navasan || echo manual )}
 secret(){ openssl rand -base64 48 | tr -d '\n'; }
 command -v openssl >/dev/null || { echo 'openssl is required' >&2; exit 1; }
 POSTGRES_PASSWORD=$(secret); ENCRYPTION_KEY=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '\n')
@@ -39,7 +41,7 @@ RUN_MODE=$RUN_MODE
 WEBHOOK_URL=$WEBHOOK_URL
 WEBHOOK_SECRET=$(secret)
 SECURE_FILE_PATH=$SECURE_PATH
-FX_PROVIDER=${FX_PROVIDER:-manual}
+FX_PROVIDER=$FX_PROVIDER
 NAVASAN_API_KEY=${NAVASAN_API_KEY:-}
 NAVASAN_BASE_URL=${NAVASAN_BASE_URL:-https://api.navasan.tech/latest/}
 FX_REFRESH_MINUTES=${FX_REFRESH_MINUTES:-360}
@@ -64,6 +66,7 @@ chmod 600 .env
 docker compose build
 docker compose up -d db redis
 docker compose run --rm app alembic upgrade head
+docker compose run --rm app python -m shopbot.fx_bootstrap
 docker compose up -d
 for _ in {1..60}; do curl -fsS http://127.0.0.1:8080/health/ready >/dev/null && break; sleep 2; done
 if ! curl -fsS http://127.0.0.1:8080/health/ready >/dev/null; then

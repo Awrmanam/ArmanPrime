@@ -95,6 +95,7 @@ class PricingRule:
     markup_percent: Decimal | None = None
     target_margin_percent: Decimal | None = None
     fixed_price_toman: int | None = None
+    rounding_increment_toman: int = 1
 
 
 def decimal_value(value: Decimal | int | str) -> Decimal:
@@ -152,7 +153,11 @@ def calculate_price(
         if margin is not None
         else landed * (one + markup / hundred)
     )
-    return int(result.quantize(one, rounding=ROUND_HALF_UP))
+    increment = rule.rounding_increment_toman
+    if increment not in {1, 1000, 5000, 10000}:
+        raise ValueError("unsupported rounding increment")
+    rounded = (result / increment).quantize(one, rounding=ROUND_HALF_UP) * increment
+    return int(rounded)
 
 
 @dataclass

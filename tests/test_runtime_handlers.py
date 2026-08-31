@@ -1,6 +1,7 @@
 import json
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -150,6 +151,18 @@ class RepoFake:
 
     async def active_currency_rates(self, _=None):
         return [SimpleNamespace(currency_code="USD")]
+
+    async def product_commercial_preview(self, _actor, _data):
+        return {
+            "category": "Category",
+            "rate": SimpleNamespace(
+                toman_per_unit=Decimal("50000"), provider_timestamp=datetime.now(UTC)
+            ),
+            "purchase_cost_toman": Decimal("500000"),
+            "buffer_percent": Decimal("0"),
+            "markup_percent": Decimal("10"),
+            "final_toman": 550000,
+        }
 
     async def emojis(self, _, active_only=False):
         return [SimpleNamespace(id=uuid4(), name="premium", custom_emoji_id="123456", active=True)]
@@ -449,6 +462,7 @@ async def test_admin_rbac_menu_queues_and_decision_forms():
         "kind": "button",
         "step": 0,
         "data": {"page_id": str(page_id)},
+        "version": 1,
     }
     wizard_callback = owner.answers[-1][1]["reply_markup"].inline_keyboard[-1][0].callback_data
     assert (await repo.coordinator.resolve_callback(wizard_callback, 1))["a"] == (
@@ -630,53 +644,23 @@ async def test_admin_text_forms_claim_delivery_and_emoji():
 
 
 @pytest.mark.asyncio
-async def test_pricing_wizard_maps_each_value_and_renders_confirmation():
+async def test_simple_pricing_wizard_collects_markup_and_rounding():
     repo, owner = RepoFake(), MessageFake(actor=1)
     router = persistent_router(repo)
     callback = handler(router, "callback_query", "callback")
     form = handler(router, "message", "form_text")
-
     start = await repo.coordinator.issue_callback("admin.pricing", 1)
     await callback(QueryFake(start, owner, actor=1))
-    mode = owner.answers[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data
-    await callback(QueryFake(mode, owner, actor=1))
-
-    expected = (
-        ("12.5", "percent"),
-        ("1", "platform_fee"),
-        ("2", "payment_fee"),
-        ("3", "warranty_reserve"),
-        ("150000", "fixed_cost_toman"),
-    )
-    accumulated = {"mode": "markup"}
-    for value, field in expected:
-        owner.text = value
-        await form(owner)
-        accumulated[field] = value
-        draft = json.loads(await repo.coordinator.redis.get("admin-draft:1"))
-        assert draft["data"] == accumulated
-
-    assert "پیش‌نمایش فرمول قیمت‌گذاری" in owner.answers[-1][0]
-    confirm_button = owner.answers[-1][1]["reply_markup"].inline_keyboard[0][0]
-    assert confirm_button.text == "تأیید و ثبت"
-    resolved = await repo.coordinator.resolve_callback(confirm_button.callback_data, 1)
-    assert resolved["a"] == "admin.wizard.choice" and resolved["o"] == "confirm"
-
-    restart = await repo.coordinator.issue_callback("admin.pricing", 1)
-    await callback(QueryFake(restart, owner, actor=1))
-    mode = owner.answers[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data
-    await callback(QueryFake(mode, owner, actor=1))
-    owner.text = "10"
+    owner.text = "12.5"
     await form(owner)
-    skip = owner.answers[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data
-    await callback(QueryFake(skip, owner, actor=1))
+    rounding = owner.answers[-1][1]["reply_markup"].inline_keyboard[1][0].callback_data
+    await callback(QueryFake(rounding, owner, actor=1))
     draft = json.loads(await repo.coordinator.redis.get("admin-draft:1"))
-    assert draft["step"] == 3
-    assert draft["data"] == {"mode": "markup", "percent": "10", "platform_fee": "0"}
-    back = owner.answers[-1][1]["reply_markup"].inline_keyboard[-1][1].callback_data
-    await callback(QueryFake(back, owner, actor=1))
-    draft = json.loads(await repo.coordinator.redis.get("admin-draft:1"))
-    assert draft["step"] == 2
+    assert draft["data"] == {"percent": "12.5", "rounding_increment_toman": 1000}
+    assert "درصد سود روی هزینه خرید" in owner.answers[-1][0]
+    assert "platform_fee" not in owner.answers[-1][0]
+    confirm = owner.answers[-1][1]["reply_markup"].inline_keyboard[0][0]
+    assert confirm.text == "تأیید و ثبت"
 
 
 @pytest.mark.asyncio
@@ -689,7 +673,7 @@ async def test_limited_stock_sentinel_accepts_quantity_and_opens_kyc_choice():
     await repo.coordinator.redis.set("fsm:1", "admin.wizard", ex=900)
     await repo.coordinator.redis.set(
         "admin-draft:1",
-        json.dumps({"kind": "product", "step": 11, "data": data}),
+        json.dumps({"kind": "product", "step": 5, "data": data}),
         ex=900,
     )
 
@@ -704,7 +688,7 @@ async def test_limited_stock_sentinel_accepts_quantity_and_opens_kyc_choice():
     owner.text = "7"
     await form(owner)
     draft = json.loads(await repo.coordinator.redis.get("admin-draft:1"))
-    assert draft["step"] == 13 and draft["data"]["stock"] == 7
+    assert draft["step"] == 7 and draft["data"]["stock"] == 7
     labels = [
         button.text
         for row in owner.answers[-1][1]["reply_markup"].inline_keyboard
@@ -716,7 +700,7 @@ async def test_limited_stock_sentinel_accepts_quantity_and_opens_kyc_choice():
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("step", "kind", "expected"),
-    ((31, "product", 3), (40, "merchant", 4), (120, "product", 11), (160, "product", 17)),
+    ((31, "product", 3), (40, "merchant", 4), (120, "product", 5), (160, "product", 17)),
 )
 async def test_wizard_sentinel_back_targets(step, kind, expected):
     repo, owner = RepoFake(), MessageFake(actor=1)
@@ -729,3 +713,35 @@ async def test_wizard_sentinel_back_targets(step, kind, expected):
     await callback(QueryFake(back, owner, actor=1))
     draft = json.loads(await repo.coordinator.redis.get("admin-draft:1"))
     assert draft["step"] == expected
+
+
+@pytest.mark.asyncio
+async def test_product_confirmation_is_draft_bound_and_idempotent():
+    repo, owner = RepoFake(), MessageFake(actor=1)
+    repo.create_product = AsyncMock(return_value=SimpleNamespace(id=uuid4()))
+    callback = handler(persistent_router(repo), "callback_query", "callback")
+    data = {
+        "category_id": str(uuid4()),
+        "title": "اشتراک نمونه",
+        "description": "شرح",
+        "base_cost_amount": "20",
+        "base_cost_currency": "RUB",
+        "currency_buffer_percent": "0",
+        "duration": "۳۰ روز",
+        "stock": 3,
+        "unlimited_stock": False,
+        "requires_kyc": True,
+    }
+    await repo.coordinator.redis.set("fsm:1", "admin.wizard", ex=900)
+    await repo.coordinator.redis.set(
+        "admin-draft:1",
+        json.dumps({"kind": "product", "step": 8, "data": data, "version": 4}),
+        ex=900,
+    )
+    confirm = await repo.coordinator.issue_callback("admin.product.confirm", 1, "4", one_time=True)
+    await callback(QueryFake(confirm, owner, actor=1))
+    assert repo.create_product.await_count == 1
+    replay = QueryFake(confirm, owner, actor=1)
+    await callback(replay)
+    assert repo.create_product.await_count == 1
+    assert replay.answers[-1][1]["show_alert"] is True

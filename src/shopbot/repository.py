@@ -559,6 +559,49 @@ class ShopRepository:
             rates = await provider.fetch({validate_currency(code) for code in currencies})
             return await self.persist_provider_rates(rates, max_age_minutes)
 
+    async def product_commercial_preview(self, actor: int, data: dict) -> dict:
+        """Calculate the owner preview with the exact Quote pricing service."""
+        self.owner(actor)
+        currency = validate_currency(data["base_cost_currency"])
+        async with self.sessions() as session:
+            category = await session.get(CategoryRow, UUID(data["category_id"]))
+            rate = await session.scalar(
+                select(RateRow)
+                .where(RateRow.currency_code == currency, RateRow.active.is_(True))
+                .order_by((RateRow.source == "manual_override").desc(), RateRow.version.desc())
+                .limit(1)
+            )
+            pricing = await session.get(ConfigRow, "pricing.global")
+            if not category or not rate or not pricing:
+                raise InvalidState("PRODUCT_PREVIEW_CONFIGURATION_REQUIRED")
+            if rate.source == "api" and rate.valid_until <= self.now():
+                raise InvalidState("CURRENCY_RATE_STALE")
+            config = dict(pricing.value)
+            rule = PricingRule(
+                markup_percent=decimal_value(config.get("markup", "0")),
+                target_margin_percent=(
+                    decimal_value(config["target_margin"])
+                    if config.get("mode") == "target_margin"
+                    else None
+                ),
+                platform_fee_percent=decimal_value(config.get("platform_fee", "0")),
+                payment_fee_percent=decimal_value(config.get("payment_fee", "0")),
+                warranty_reserve_percent=decimal_value(config.get("warranty_reserve", "0")),
+                fixed_cost_toman=int(config.get("fixed_cost_toman", 0)),
+                rounding_increment_toman=int(config.get("rounding_increment_toman", 1)),
+            )
+            buffer = decimal_value(data.get("currency_buffer_percent", "0")) + rate.buffer_percent
+            cost = decimal_value(data["base_cost_amount"]) * rate.toman_per_unit
+            final = calculate_price(data["base_cost_amount"], rate.toman_per_unit, rule, buffer)
+            return {
+                "category": category.title,
+                "rate": rate,
+                "purchase_cost_toman": cost,
+                "buffer_percent": buffer,
+                "markup_percent": decimal_value(config.get("markup", "0")),
+                "final_toman": final,
+            }
+
     async def set_pricing(self, actor: int, config: dict) -> None:
         self.owner(actor)
         # Constructing a rule validates all externally supplied percentage strings.
@@ -572,6 +615,7 @@ class ShopRepository:
                 if config.get("mode") == "target_margin"
                 else None
             ),
+            rounding_increment_toman=int(config.get("rounding_increment_toman", 1)),
         )
         calculate_price("1", 1, rule)
         async with self.sessions.begin() as session:
@@ -1263,6 +1307,7 @@ class ShopRepository:
                         else None
                     ),
                     fixed_price_toman=product.fixed_price_toman,
+                    rounding_increment_toman=int(config.get("rounding_increment_toman", 1)),
                 )
                 effective_rate = rate.toman_per_unit if rate else Decimal("1")
                 currency_buffer = product.currency_buffer_percent + (

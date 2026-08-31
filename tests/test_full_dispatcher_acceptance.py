@@ -181,10 +181,8 @@ async def test_full_dispatcher_acceptance_persists_after_reconstruction():
     await telegram.click(100, "رد کردن")
     await telegram.click(100, "تأیید نرخ")
     await telegram.click(100, "قیمت‌گذاری")
-    await telegram.click(100, "درصد افزایش")
     await telegram.send(100, "10")
-    for value in ("1", "1", "1", "100"):
-        await telegram.send(100, value)
+    await telegram.click(100, "نزدیک‌ترین ۱٬۰۰۰")
     await telegram.click(100, "تأیید و ثبت")
 
     await telegram.send(100, "/admin")
@@ -216,17 +214,10 @@ async def test_full_dispatcher_acceptance_persists_after_reconstruction():
     for value in ("Product", "Full description", "10"):
         await telegram.send(100, value)
     await telegram.click(100, "USD")
-    await telegram.click(100, "رد کردن")
-    await telegram.click(100, "رد کردن")
-    for value in ("30 days", "standard", "link", "manual warranty", "7", "60"):
-        await telegram.send(100, value)
+    await telegram.send(100, "30 days")
     await telegram.click(100, "موجودی محدود")
     await telegram.send(100, "2")
     await telegram.click(100, "لازم است")
-    await telegram.click(100, "فعال")
-    await telegram.click(100, "انتهای فهرست")
-    await telegram.click(100, "بدون آیکون")
-    await telegram.click(100, "استفاده از قیمت‌گذاری عمومی")
     await telegram.click(100, "تأیید و ثبت")
 
     await telegram.send(200, "/start")
