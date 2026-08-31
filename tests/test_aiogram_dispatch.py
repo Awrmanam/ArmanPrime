@@ -65,8 +65,12 @@ class RepoFake:
     def owner(self, _actor):
         raise AccessDenied("OWNER_REQUIRED")
 
-    async def user(self, actor, _session):
-        return SimpleNamespace(telegram_id=actor)
+    async def user(self, actor, _session, *, username=None, display_name=None):
+        return SimpleNamespace(
+            telegram_id=actor,
+            username=username,
+            display_name=display_name,
+        )
 
     async def current_terms(self, _session):
         return self.terms
