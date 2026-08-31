@@ -28,6 +28,12 @@ read -rsp 'Navasan API key [leave empty for manual emergency mode]: ' NAVASAN_AP
 RUN_MODE=polling; WEBHOOK_URL=''; SECURE_PATH=/var/lib/shopbot/secure; BRAND_NAME=''
 fi
 ORDER_CHAT=${ORDER_CHAT:-$ADMIN_ID}
+APP_HOST_PORT=${APP_HOST_PORT:-8080}
+SELECTED_PORT=$(python3 scripts/select_port.py "$APP_HOST_PORT")
+if [[ $SELECTED_PORT != "$APP_HOST_PORT" ]]; then
+  echo "Local port $APP_HOST_PORT is occupied; leaving its service untouched and using $SELECTED_PORT." >&2
+fi
+APP_HOST_PORT=$SELECTED_PORT
 FX_PROVIDER=${FX_PROVIDER:-$( [[ -n ${NAVASAN_API_KEY:-} ]] && echo navasan || echo manual )}
 secret(){ openssl rand -base64 48 | tr -d '\n'; }
 command -v openssl >/dev/null || { echo 'openssl is required' >&2; exit 1; }
@@ -37,6 +43,7 @@ cat >.env <<EOF
 BOT_TOKEN=$BOT_TOKEN
 ADMIN_TELEGRAM_USER_ID=$ADMIN_ID
 ORDER_NOTIFICATION_CHAT_ID=$ORDER_CHAT
+APP_HOST_PORT=$APP_HOST_PORT
 RUN_MODE=$RUN_MODE
 WEBHOOK_URL=$WEBHOOK_URL
 WEBHOOK_SECRET=$(secret)
@@ -68,8 +75,9 @@ docker compose up -d db redis
 docker compose run --rm app alembic upgrade head
 docker compose run --rm app python -m shopbot.fx_bootstrap
 docker compose up -d
-for _ in {1..60}; do curl -fsS http://127.0.0.1:8080/health/ready >/dev/null && break; sleep 2; done
-if ! curl -fsS http://127.0.0.1:8080/health/ready >/dev/null; then
+for _ in {1..60}; do curl -fsS "http://127.0.0.1:$APP_HOST_PORT/health/ready" >/dev/null && break; sleep 2; done
+if ! curl -fsS "http://127.0.0.1:$APP_HOST_PORT/health/ready" >/dev/null; then
   docker compose logs --tail=200 app >&2; exit 1
 fi
-echo 'Installation complete. Send /admin to the bot; no catalog, terms, price, or brand was seeded.'
+echo "Installation complete at http://127.0.0.1:$APP_HOST_PORT. Send /admin to the bot."
+echo 'To resume safely after a failure, rerun: docker compose up -d && docker compose run --rm app python -m shopbot.fx_bootstrap'

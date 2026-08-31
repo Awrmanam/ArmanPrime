@@ -46,6 +46,9 @@ class UserRow(Base):
         server_default=text("'CUS-' || nextval('customer_public_seq')::text"),
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    username: Mapped[str | None] = mapped_column(String(64), index=True)
+    display_name: Mapped[str | None] = mapped_column(Text)
+    last_activity_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class TermsRow(Base):
@@ -158,6 +161,7 @@ class ProductRow(Base):
     reserved: Mapped[int] = mapped_column(Integer, default=0)
     unlimited_stock: Mapped[bool] = mapped_column(Boolean, default=False)
     requires_kyc: Mapped[bool] = mapped_column(Boolean, default=True)
+    requires_verified_source_card: Mapped[bool] = mapped_column(Boolean, default=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     position: Mapped[int] = mapped_column(Integer, default=0)
     custom_emoji_id: Mapped[str | None] = mapped_column(Text)
@@ -177,6 +181,7 @@ class EmojiRow(Base):
     name: Mapped[str] = mapped_column(Text, unique=True)
     custom_emoji_id: Mapped[str] = mapped_column(Text, unique=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    fallback: Mapped[str] = mapped_column(String(16), default="•")
 
 
 class PageRow(Base):

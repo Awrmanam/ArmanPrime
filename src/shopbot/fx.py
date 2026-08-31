@@ -35,7 +35,8 @@ ISO_4217 = frozenset(
 )
 NAVASAN_SYMBOLS = {
     "AED": "aed_sell",
-    "CNY": "cny_sell",
+    "CNY": "cny",
+    "EGP": "egp",
     "EUR": "eur",
     "GBP": "gbp",
     "INR": "inr",
@@ -110,7 +111,7 @@ class NavasanRateProvider:
             symbol = NAVASAN_SYMBOLS.get(code, code.lower())
             item = payload.get(symbol)
             if not isinstance(item, dict):
-                raise RateProviderError("UNKNOWN_PROVIDER_SYMBOL")
+                raise RateProviderError(f"NAVASAN_SYMBOL_MISSING:{code}:{symbol}")
             try:
                 value = Decimal(str(item["value"]))
             except (KeyError, InvalidOperation, TypeError) as exc:

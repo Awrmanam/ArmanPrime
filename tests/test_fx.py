@@ -57,3 +57,23 @@ async def test_navasan_timeout_is_bounded_and_sanitized():
         await provider.fetch({"RUB"})
     assert attempts == 2
     assert "secret-key" not in str(error.value)
+
+
+def test_sanitized_navasan_latest_payload_contract_and_missing_symbol_diagnostic():
+    # Sanitized shape captured from the official /latest response; values are synthetic.
+    payload = {
+        symbol: {"value": str(1000 + index), "date": "2026-08-30T10:00:00Z"}
+        for index, symbol in enumerate(
+            ("usd_sell", "eur", "gbp", "try", "aed_sell", "rub", "cny", "inr", "sgd", "egp")
+        )
+    }
+    currencies = {"USD", "EUR", "GBP", "TRY", "AED", "RUB", "CNY", "INR", "SGD", "EGP"}
+    rates = NavasanRateProvider.parse(payload, currencies)
+    assert {rate.currency_code for rate in rates} == currencies
+    assert next(rate for rate in rates if rate.currency_code == "CNY").provider_symbol == "cny"
+
+    payload.pop("cny")
+    with pytest.raises(RateProviderError, match=r"^NAVASAN_SYMBOL_MISSING:CNY:cny$") as error:
+        NavasanRateProvider.parse(payload, {"CNY"})
+    assert "api_key" not in str(error.value)
+    assert "value" not in str(error.value)

@@ -23,6 +23,7 @@ from .config import Settings
 from .db import create_engine_and_session
 from .fx import NavasanRateProvider
 from .repository import AccessDenied, RedisCoordinator, ShopRepository
+from .rich_text import render_rich_text
 from .security import Vault, mask_pan
 from .telegram_adapter import Button, extract_message_custom_emoji
 
@@ -76,6 +77,29 @@ async def answer_keyboard(message: Message, text_value: str, rows: list[list[But
 def persistent_router(repo: ShopRepository) -> Router:
     router = Router(name="persistent-commerce")
     pricing_fields = ["percent"]
+
+    async def answer_rich_keyboard(
+        message: Message, text_value: str, rows: list[list[Button]]
+    ) -> Message:
+        async def resolver(key: str):
+            return (
+                await repo.resolve_rich_emoji(key) if hasattr(repo, "resolve_rich_emoji") else None
+            )
+
+        rendered = await render_rich_text(text_value, resolver)
+        try:
+            if getattr(getattr(message, "from_user", None), "is_bot", False):
+                return await message.edit_text(
+                    rendered.html, parse_mode="HTML", reply_markup=markup(rows)
+                )
+            return await message.answer(rendered.html, parse_mode="HTML", reply_markup=markup(rows))
+        except TelegramBadRequest as exc:
+            detail = str(exc).lower()
+            if "custom emoji" not in detail and "tg-emoji" not in detail:
+                raise
+            if getattr(getattr(message, "from_user", None), "is_bot", False):
+                return await message.edit_text(rendered.fallback, reply_markup=markup(rows))
+            return await message.answer(rendered.fallback, reply_markup=markup(rows))
 
     async def clear_actor_state(actor_id: int) -> None:
         keys = [
@@ -197,7 +221,7 @@ def persistent_router(repo: ShopRepository) -> Router:
         if kind == "product" and step == 5:
             await answer_keyboard(
                 message,
-                "مرحله ۶ از ۱۰\nنوع موجودی را انتخاب کنید.",
+                "مرحله ۷ از ۱۰\nنوع موجودی را انتخاب کنید.",
                 await choice_rows(
                     actor, [("موجودی نامحدود", "unlimited"), ("موجودی محدود", "limited")]
                 ),
@@ -206,23 +230,33 @@ def persistent_router(repo: ShopRepository) -> Router:
         if kind == "product" and step == 120:
             await answer_keyboard(
                 message,
-                "مرحله ۷ از ۱۰\nتعداد موجودی را وارد کنید.",
+                "مرحله ۷ از ۱۰\nتعداد موجودی محدود را وارد کنید.",
                 [await wizard_buttons(actor)],
             )
             return
         if kind == "product" and step == 3:
-            rates = await repo.active_currency_rates(actor)
-            choices = [(item.currency_code, item.currency_code) for item in rates]
+            choices = [
+                ("🇺🇸 دلار آمریکا — USD", "USD"),
+                ("🇪🇺 یورو — EUR", "EUR"),
+                ("🇬🇧 پوند بریتانیا — GBP", "GBP"),
+                ("🇹🇷 لیر ترکیه — TRY", "TRY"),
+                ("🇦🇪 درهم امارات — AED", "AED"),
+                ("🇷🇺 روبل روسیه — RUB", "RUB"),
+                ("🇨🇳 یوان چین — CNY", "CNY"),
+                ("🇮🇳 روپیه هند — INR", "INR"),
+                ("🇸🇬 دلار سنگاپور — SGD", "SGD"),
+                ("🇪🇬 پوند مصر — EGP", "EGP"),
+            ]
             await answer_keyboard(
                 message,
-                "مرحله ۴ از ۲۱\nارز هزینه تأمین‌کننده را انتخاب کنید.",
+                "مرحله ۵ از ۱۰\nارز هزینه تأمین‌کننده را انتخاب کنید.",
                 await choice_rows(actor, choices),
             )
             return
         if kind == "product" and step == 160:
             await answer_keyboard(
                 message,
-                "مرحله ۱۹ از ۲۰\nمقدار قیمت‌گذاری اختصاصی را وارد کنید.",
+                "تنظیمات تکمیلی محصول\nمقدار قیمت‌گذاری اختصاصی را وارد کنید.",
                 [await wizard_buttons(actor)],
             )
             return
@@ -270,10 +304,14 @@ def persistent_router(repo: ShopRepository) -> Router:
         text_index = step
         if 0 <= text_index < len(text_steps):
             title, optional = text_steps[text_index]
+            if kind == "product":
+                logical_step = {0: 2, 1: 3, 2: 4, 4: 6}[step]
+                progress = f"مرحله {logical_step} از ۱۰"
+            else:
+                progress = f"مرحله {step + 1} از {len(text_steps) + 2}"
             await answer_keyboard(
                 message,
-                f"{title}\n\nمرحله {step + 1} از {len(text_steps) + 2}\n"
-                "هر بار فقط همین مقدار را ارسال کنید.",
+                f"{title}\n\n{progress}\nهر بار فقط همین مقدار را ارسال کنید.",
                 [await wizard_buttons(actor, skip=optional)],
             )
             return
@@ -367,7 +405,7 @@ def persistent_router(repo: ShopRepository) -> Router:
             )
             await answer_keyboard(
                 message,
-                preview,
+                f"مرحله ۹ از ۱۰\n\n{preview}",
                 [[Button("تأیید و ثبت", confirm, "success")], await wizard_buttons(actor)],
             )
         elif kind == "page" and step == 2:
@@ -564,6 +602,12 @@ def persistent_router(repo: ShopRepository) -> Router:
                 data["rate"],
                 buffer_percent=data.get("buffer_percent", "0"),
             )
+            suspended = await repo.coordinator.redis.get(f"suspended-product:{actor}")
+            if suspended:
+                await repo.coordinator.redis.delete(f"suspended-product:{actor}")
+                product_draft = json.loads(suspended)
+                await set_wizard(message, actor, "product", 3, product_draft["data"])
+                return
         elif kind == "pricing":
             config = {
                 "mode": "markup",
@@ -743,6 +787,21 @@ def persistent_router(repo: ShopRepository) -> Router:
         elif kind == "kyc_page" and step == 9:
             data["emoji"], step = value or None, 10
         elif kind == "product" and step == 3:
+            rates = {item.currency_code for item in await repo.active_currency_rates(actor)}
+            if value not in rates:
+                configure = await repo.coordinator.issue_callback(
+                    "admin.product.configure_rate", actor, value, one_time=True
+                )
+                await answer_keyboard(
+                    message,
+                    f"برای ارز {value} هنوز نرخ معتبر فعالی وجود ندارد. "
+                    "ابتدا نرخ را ثبت یا دریافت کنید؛ پیش‌نویس محصول حفظ می‌شود.",
+                    [
+                        [Button("تنظیم نرخ این ارز", configure, "primary")],
+                        await wizard_buttons(actor),
+                    ],
+                )
+                return
             data["base_cost_currency"] = value
             data["currency_buffer_percent"] = "0"
             step = 4
@@ -850,7 +909,7 @@ def persistent_router(repo: ShopRepository) -> Router:
             if getattr(repo, "fx_mode", "manual") == "navasan"
             else "حالت دستی اضطراری"
         )
-        await answer_keyboard(
+        await answer_rich_keyboard(
             message,
             "پنل مدیریت\n\n"
             f"وضعیت آمادگی فروشگاه: {'آماده فروش' if all(status.values()) else 'نیازمند تکمیل'}\n"
@@ -880,7 +939,7 @@ def persistent_router(repo: ShopRepository) -> Router:
                 icon,
             )
 
-        await answer_keyboard(
+        await answer_rich_keyboard(
             message,
             (
                 f"{config.get('title', 'به فروشگاه خوش آمدید')}\n\n"
@@ -904,10 +963,7 @@ def persistent_router(repo: ShopRepository) -> Router:
                         "account", labels.get("account", "حساب کاربری"), "account"
                     ),
                 ],
-                [
-                    await storefront_button("kyc", "احراز هویت", "begin_kyc"),
-                    await storefront_button("cards", "کارت‌های بانکی", "begin_card"),
-                ],
+                [await storefront_button("kyc", "احراز هویت", "begin_kyc")],
                 [await storefront_button("support", labels.get("support", "پشتیبانی"), "support")],
             ],
         )
@@ -936,7 +992,12 @@ def persistent_router(repo: ShopRepository) -> Router:
             await message.answer("درخواست‌های شما بیش از حد مجاز است.")
             return
         async with repo.sessions.begin() as session:
-            await repo.user(message.from_user.id, session)
+            await repo.user(
+                message.from_user.id,
+                session,
+                username=getattr(message.from_user, "username", None),
+                display_name=getattr(message.from_user, "full_name", None),
+            )
             terms = await repo.current_terms(session)
             accepted = terms and await repo.has_current_consent(message.from_user.id, session)
         if not terms:
@@ -952,7 +1013,7 @@ def persistent_router(repo: ShopRepository) -> Router:
             terms.version,
             one_time=True,
         )
-        await answer_keyboard(
+        await answer_rich_keyboard(
             message,
             f"{terms.title}\n\n{terms.pages[0]}",
             [[Button("تأیید قوانین", token, "success")]],
@@ -995,6 +1056,7 @@ def persistent_router(repo: ShopRepository) -> Router:
                 "kyc": "احراز هویت کاربران",
                 "cards": "بررسی کارت‌های بانکی",
                 "system": "هشدارهای سیستم",
+                "users": "کاربران و ورودهای جدید",
             }
             for key, title in names.items():
                 if not topics.get(key):
@@ -1836,7 +1898,9 @@ def persistent_router(repo: ShopRepository) -> Router:
                     )
                     rows.append([Button(category.title, choose)])
                 if rows:
-                    await answer_keyboard(query.message, "ابتدا دسته محصول را انتخاب کنید.", rows)
+                    await answer_keyboard(
+                        query.message, "مرحله ۱ از ۱۰\nدسته محصول را انتخاب کنید.", rows
+                    )
                 else:
                     await query.message.answer("ابتدا یک دسته فعال بسازید.")
             elif state["a"] == "admin.product.create.category":
@@ -1945,6 +2009,23 @@ def persistent_router(repo: ShopRepository) -> Router:
                 await set_wizard(query.message, query.from_user.id, kind, 0, data)
             elif state["a"] == "admin.terms":
                 await set_wizard(query.message, query.from_user.id, "terms", 0, {})
+            elif state["a"] == "admin.product.configure_rate":
+                repo.owner(query.from_user.id)
+                draft = await load_draft(query.from_user.id)
+                if draft.get("kind") != "product" or draft.get("step") != 3:
+                    raise AccessDenied("PRODUCT_DRAFT_CHANGED")
+                await repo.coordinator.redis.set(
+                    f"suspended-product:{query.from_user.id}",
+                    json.dumps(draft, ensure_ascii=False),
+                    ex=900,
+                )
+                await set_wizard(
+                    query.message,
+                    query.from_user.id,
+                    "rate",
+                    1,
+                    {"currency_code": state["o"]},
+                )
             elif state["a"] in {
                 "admin.rate",
                 "admin.pricing",
@@ -2535,6 +2616,17 @@ class Runtime:
                         body = f"سفارش {payload['public_code']} توسط مدیر دریافت شد."
                     elif row.kind == "DELIVERY_RECORDED":
                         body = f"تحویل سفارش {payload['public_code']} ثبت و برای مشتری ارسال شد."
+                    elif row.kind == "NEW_CUSTOMER":
+                        username = f"@{payload['username']}" if payload.get("username") else "ندارد"
+                        body = (
+                            "کاربر جدید\n"
+                            f"شماره مشتری: {payload['public_code']}\n"
+                            f"نام: {payload.get('display_name') or 'ثبت‌نشده'}\n"
+                            f"نام کاربری: {username}\n"
+                            f"شناسه تلگرام: {payload['telegram_id']}\n"
+                            f"زمان ثبت: {payload['created_at']}\n"
+                            f"احراز هویت: {payload['kyc_status']}"
+                        )
                     elif row.kind in {"KYC_DECISION", "CARD_DECISION"}:
                         body = (
                             "درخواست شما تأیید شد."

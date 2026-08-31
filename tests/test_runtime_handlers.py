@@ -80,7 +80,7 @@ class RepoFake:
         if actor != self.owner_id:
             raise AccessDenied
 
-    async def user(self, actor, _session):
+    async def user(self, actor, _session, **_identity):
         return SimpleNamespace(
             id=uuid4(), telegram_id=actor, kyc_status="VERIFIED", risk_status="CLEAR"
         )
@@ -363,21 +363,21 @@ async def test_management_supergroup_setup_creates_topics_once():
         status="administrator", can_manage_topics=True
     )
     owner.bot.create_forum_topic.side_effect = [
-        SimpleNamespace(message_thread_id=value) for value in (10, 11, 12, 13)
+        SimpleNamespace(message_thread_id=value) for value in (10, 11, 12, 13, 14)
     ]
     await handler(router, "message", "setup_admin_group")(owner)
-    assert owner.bot.create_forum_topic.await_count == 4
+    assert owner.bot.create_forum_topic.await_count == 5
     repo.configure_management_group.assert_awaited_once_with(
         1,
         -1001,
-        {"orders": 10, "kyc": 11, "cards": 12, "system": 13},
+        {"orders": 10, "kyc": 11, "cards": 12, "system": 13, "users": 14},
     )
     repo.management_group.return_value = {
         "chat_id": -1001,
-        "topics": {"orders": 10, "kyc": 11, "cards": 12, "system": 13},
+        "topics": {"orders": 10, "kyc": 11, "cards": 12, "system": 13, "users": 14},
     }
     await handler(router, "message", "setup_admin_group")(owner)
-    assert owner.bot.create_forum_topic.await_count == 4
+    assert owner.bot.create_forum_topic.await_count == 5
 
 
 @pytest.mark.asyncio
@@ -875,6 +875,75 @@ async def test_limited_stock_sentinel_accepts_quantity_and_opens_kyc_choice():
         for button in row
     ]
     assert "لازم است" in labels and "لازم نیست" in labels
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("choice", "expected"), (("1", "لازم است"), ("0", "لازم نیست")))
+async def test_product_kyc_choice_uses_current_callback_and_matches_preview(choice, expected):
+    repo, owner = RepoFake(), MessageFake(actor=1)
+    callback = handler(persistent_router(repo), "callback_query", "callback")
+    data = {
+        "category_id": str(uuid4()),
+        "title": "Product",
+        "description": "Description",
+        "base_cost_amount": "10",
+        "base_cost_currency": "USD",
+        "currency_buffer_percent": "0",
+        "duration": "30 days",
+        "stock": 1,
+        "unlimited_stock": False,
+    }
+    await repo.coordinator.redis.set(
+        "admin-draft:1",
+        json.dumps({"kind": "product", "step": 7, "data": data, "version": 8}),
+        ex=900,
+    )
+    token = await repo.coordinator.issue_callback(
+        "admin.wizard.choice", 1, choice, version=8, one_time=True
+    )
+    query = QueryFake(token, owner, actor=1)
+    await callback(query)
+    assert not query.answers or not query.answers[-1][1].get("show_alert")
+    assert f"احراز هویت: {expected}" in owner.answers[-1][0]
+    draft = json.loads(await repo.coordinator.redis.get("admin-draft:1"))
+    assert draft["data"]["requires_kyc"] is (choice == "1")
+
+
+@pytest.mark.asyncio
+async def test_product_currency_list_is_stable_and_missing_rate_preserves_draft():
+    repo, owner = RepoFake(), MessageFake(actor=1)
+    router = persistent_router(repo)
+    callback = handler(router, "callback_query", "callback")
+    form = handler(router, "message", "form_text")
+    data = {"category_id": str(uuid4()), "title": "Product"}
+    await repo.coordinator.redis.set("fsm:1", "admin.wizard", ex=900)
+    await repo.coordinator.redis.set(
+        "admin-draft:1",
+        json.dumps({"kind": "product", "step": 2, "data": data, "version": 4}),
+        ex=900,
+    )
+    owner.text = "10"
+    await form(owner)
+    currencies = {
+        button.text.rsplit("—", 1)[-1].strip()
+        for row in owner.answers[-1][1]["reply_markup"].inline_keyboard
+        for button in row
+        if "—" in button.text
+    }
+    assert currencies == {"USD", "EUR", "GBP", "TRY", "AED", "RUB", "CNY", "INR", "SGD", "EGP"}
+
+    draft = json.loads(await repo.coordinator.redis.get("admin-draft:1"))
+    eur = next(
+        button.callback_data
+        for row in owner.answers[-1][1]["reply_markup"].inline_keyboard
+        for button in row
+        if button.text.endswith("EUR")
+    )
+    await callback(QueryFake(eur, owner, actor=1))
+    unchanged = json.loads(await repo.coordinator.redis.get("admin-draft:1"))
+    assert unchanged == draft
+    assert "نرخ معتبر" in owner.answers[-1][0]
+    assert "تنظیم نرخ" in owner.answers[-1][1]["reply_markup"].inline_keyboard[0][0].text
 
 
 @pytest.mark.asyncio

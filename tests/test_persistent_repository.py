@@ -135,7 +135,7 @@ async def test_management_topics_receive_kyc_and_card_media_without_pan(reposito
     await repository.configure_management_group(
         100,
         -100123,
-        {"orders": 10, "kyc": 11, "cards": 12, "system": 13},
+        {"orders": 10, "kyc": 11, "cards": 12, "system": 13, "users": 14},
     )
     kyc = await repository.submit_kyc(
         200, "kyc-photo", "kyc-photo-unique", "photo", "کاربر آزمایشی"
@@ -170,7 +170,7 @@ async def test_management_group_validation_system_routing_and_disconnect(reposit
     with pytest.raises(InvalidState, match="MANAGEMENT_TOPICS_REQUIRED"):
         await repository.configure_management_group(100, -100123, {"orders": 10})
 
-    topics = {"orders": 10, "kyc": 11, "cards": 12, "system": 13}
+    topics = {"orders": 10, "kyc": 11, "cards": 12, "system": 13, "users": 14}
     await repository.configure_management_group(100, -100123, topics)
     group = await repository.management_group(100)
     assert group["chat_id"] == -100123 and group["topics"] == topics

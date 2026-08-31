@@ -144,13 +144,51 @@ class ShopRepository:
     def now() -> datetime:
         return datetime.now(UTC)
 
-    async def user(self, telegram_id: int, session: AsyncSession) -> UserRow:
+    async def user(
+        self,
+        telegram_id: int,
+        session: AsyncSession,
+        *,
+        username: str | None = None,
+        display_name: str | None = None,
+    ) -> UserRow:
         row = await session.scalar(select(UserRow).where(UserRow.telegram_id == telegram_id))
         if row:
+            if username is not None:
+                row.username = username
+            if display_name:
+                row.display_name = display_name
+            row.last_activity_at = self.now()
             return row
-        row = UserRow(telegram_id=telegram_id, created_at=self.now())
+        row = UserRow(
+            telegram_id=telegram_id,
+            username=username,
+            display_name=display_name,
+            created_at=self.now(),
+            last_activity_at=self.now(),
+        )
         session.add(row)
         await session.flush()
+        chat_id, thread_id = await self._outbox_target(session, "users")
+        session.add(
+            OutboxRow(
+                kind="NEW_CUSTOMER",
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                entity_type="user",
+                entity_id=row.id,
+                event_key=f"customer.created:{row.id}",
+                payload={
+                    "public_code": row.public_code,
+                    "telegram_id": telegram_id,
+                    "username": username,
+                    "display_name": display_name,
+                    "created_at": row.created_at.isoformat(),
+                    "kyc_status": "شروع نشده",
+                },
+                available_at=self.now(),
+            )
+        )
         return row
 
     async def management_group(self, actor: int | None = None) -> dict | None:
@@ -162,7 +200,7 @@ class ShopRepository:
 
     async def configure_management_group(self, actor: int, chat_id: int, topics: dict) -> None:
         self.owner(actor)
-        required = {"orders", "kyc", "cards", "system"}
+        required = {"orders", "kyc", "cards", "system", "users"}
         if set(topics) != required or not all(
             isinstance(value, int) and value > 0 for value in topics.values()
         ):
@@ -1014,6 +1052,9 @@ class ShopRepository:
                 reserved=0,
                 unlimited_stock=bool(values.get("unlimited_stock", False)),
                 requires_kyc=bool(values.get("requires_kyc", True)),
+                requires_verified_source_card=bool(
+                    values.get("requires_verified_source_card", True)
+                ),
                 active=True,
                 position=int(values.get("position", 0)),
                 custom_emoji_id=values.get("custom_emoji_id"),
@@ -1043,6 +1084,7 @@ class ShopRepository:
             "stock",
             "unlimited_stock",
             "requires_kyc",
+            "requires_verified_source_card",
             "active",
             "position",
             "custom_emoji_id",
@@ -1483,6 +1525,13 @@ class ShopRepository:
                 select(EmojiRow).where(EmojiRow.name == key, EmojiRow.active.is_(True))
             )
             return emoji.custom_emoji_id if emoji else None
+
+    async def resolve_rich_emoji(self, key: str) -> tuple[str, str] | None:
+        async with self.sessions() as session:
+            emoji = await session.scalar(
+                select(EmojiRow).where(EmojiRow.name == key, EmojiRow.active.is_(True))
+            )
+            return (emoji.custom_emoji_id, emoji.fallback) if emoji else None
 
     async def set_entity_emoji(
         self, actor: int, entity: str, object_id: UUID, emoji_name: str | None
