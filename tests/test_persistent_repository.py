@@ -131,6 +131,41 @@ async def test_persistent_acceptance_path_survives_new_session(repository):
 
 
 @pytest.mark.asyncio
+async def test_management_topics_receive_kyc_and_card_media_without_pan(repository):
+    await repository.configure_management_group(
+        100,
+        -100123,
+        {"orders": 10, "kyc": 11, "cards": 12, "system": 13},
+    )
+    kyc = await repository.submit_kyc(
+        200, "kyc-photo", "kyc-photo-unique", "photo", "کاربر آزمایشی"
+    )
+    card = await repository.submit_customer_card(
+        200,
+        "بانک آزمایشی",
+        "4111111111111111",
+        "card-document",
+        "card-document-unique",
+        "document",
+        "کاربر آزمایشی",
+    )
+    async with repository.sessions() as session:
+        events = list(
+            (
+                await session.scalars(
+                    select(OutboxRow)
+                    .where(OutboxRow.kind.in_(("KYC_REVIEW", "CARD_REVIEW")))
+                    .order_by(OutboxRow.kind)
+                )
+            ).all()
+        )
+    assert {event.message_thread_id for event in events} == {11, 12}
+    assert {event.payload["file_type"] for event in events} == {"photo", "document"}
+    assert kyc.public_code.startswith("KYC-") and card.public_code.startswith("CRD-")
+    assert "4111111111111111" not in repr([event.payload for event in events])
+
+
+@pytest.mark.asyncio
 async def test_gates_requote_reservation_and_duplicate_receipt(repository):
     product, card = await configure_checkout(repository)
     with pytest.raises(AccessDenied):

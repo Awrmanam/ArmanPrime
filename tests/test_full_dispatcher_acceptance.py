@@ -230,14 +230,14 @@ async def test_full_dispatcher_acceptance_persists_after_reconstruction():
     assert getattr(transport.calls[-1], "show_alert", False) is True
     await telegram.click(200, "Product")
     await telegram.click(200, "خرید")
-    assert "برای خرید، KYC" in telegram.last_message_text()
+    assert "احراز هویت" in telegram.last_message_text()
     assert "5555555555554444" not in "\n".join(telegram.message_texts())
 
-    await telegram.click(200, "ارسال مدارک احراز هویت")
+    await telegram.click(200, "شروع احراز هویت")
     await telegram.send(200, photo_unique="kyc-evidence")
     await telegram.send(100, "/admin")
     await telegram.click(100, "احراز هویت")
-    await telegram.click(100, "تأیید KYC")
+    await telegram.click(100, "تأیید احراز هویت")
     await telegram.send(100, "مدرک هویتی به‌صورت دستی بررسی شد")
 
     await telegram.send(200, "/start")

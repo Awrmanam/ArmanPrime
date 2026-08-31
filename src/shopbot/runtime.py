@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import html
 import json
 import logging
 import re
@@ -254,6 +255,16 @@ def persistent_router(repo: ShopRepository) -> Router:
                 ("مدت یا نوع پلن", False),
             ],
             "pricing": [("درصد سود روی هزینه خرید", False)],
+            "kyc_page": [
+                ("عنوان صفحه احراز هویت", False),
+                ("توضیح فرایند", False),
+                ("مدارک موردنیاز", False),
+                ("دلیل نیاز به احراز هویت", False),
+                ("هشدار حریم خصوصی", False),
+                ("زمان تقریبی بررسی", False),
+                ("نشانی پشتیبانی", True),
+                ("متن دکمه شروع", False),
+            ],
         }
         text_steps = definitions.get(kind, [])
         text_index = step
@@ -288,6 +299,17 @@ def persistent_router(repo: ShopRepository) -> Router:
             }
         elif kind == "pricing":
             choices = {2: [("تأیید و ثبت", "confirm")]}
+        elif kind == "kyc_page":
+            choices = {
+                8: [
+                    ("پیش‌فرض", "default"),
+                    ("اصلی", "primary"),
+                    ("موفق", "success"),
+                    ("هشدار", "danger"),
+                ],
+                9: [("بدون آیکون", "")],
+                10: [("انتشار صفحه", "confirm")],
+            }
         elif kind == "rate":
             choices = {3: [("تأیید نرخ", "confirm")]}
         elif kind == "terms":
@@ -298,6 +320,10 @@ def persistent_router(repo: ShopRepository) -> Router:
             choices = {}
         if kind == "category" and step == 4:
             choices[4] += [
+                (emoji.name, emoji.name) for emoji in await repo.emojis(actor, active_only=True)
+            ]
+        if kind == "kyc_page" and step == 9:
+            choices[9] += [
                 (emoji.name, emoji.name) for emoji in await repo.emojis(actor, active_only=True)
             ]
         if step in choices and choices[step]:
@@ -462,6 +488,17 @@ def persistent_router(repo: ShopRepository) -> Router:
                 f"نحوه گرد کردن قیمت نهایی: {rounding}\n\n"
                 "هزینه خرید پس از تبدیل ارز و حاشیه تبدیل، در درصد سود ضرب می‌شود."
             )
+        if kind == "kyc_page":
+            return (
+                "پیش‌نمایش صفحه احراز هویت\n\n"
+                f"عنوان: {data['title']}\n"
+                f"توضیحات: {data['explanation']}\n"
+                f"مدارک موردنیاز: {data['documents']}\n"
+                f"دلیل بررسی: {data['reason']}\n"
+                f"حریم خصوصی: {data['privacy']}\n"
+                f"زمان بررسی: {data['review_time']}\n"
+                f"متن دکمه: {data['start_label']}"
+            )
         safe = {key: value for key, value in data.items() if key not in {"encrypted_pan"}}
         labels = {
             "terms": "پیش‌نمایش قوانین",
@@ -542,6 +579,8 @@ def persistent_router(repo: ShopRepository) -> Router:
                 await repo.set_product_pricing_override(actor, UUID(data["product_id"]), config)
             else:
                 await repo.set_pricing(actor, config)
+        elif kind == "kyc_page":
+            await repo.set_kyc_page(actor, data)
         elif kind == "merchant":
             await repo.create_merchant_card_encrypted(
                 actor,
@@ -699,6 +738,10 @@ def persistent_router(repo: ShopRepository) -> Router:
             data["position"], step = int(value), 4
         elif kind == "category" and step == 4:
             data["emoji"], step = value or None, 5
+        elif kind == "kyc_page" and step == 8:
+            data["style"], step = value, 9
+        elif kind == "kyc_page" and step == 9:
+            data["emoji"], step = value or None, 10
         elif kind == "product" and step == 3:
             data["base_cost_currency"] = value
             data["currency_buffer_percent"] = "0"
@@ -763,6 +806,8 @@ def persistent_router(repo: ShopRepository) -> Router:
             "page",
             "emoji",
             "appearance",
+            "kyc_page",
+            "management",
             "audit",
             "close",
         )
@@ -783,8 +828,10 @@ def persistent_router(repo: ShopRepository) -> Router:
             "page": ("صفحات سفارشی", "default", 8),
             "emoji": ("Premium Emoji", "default", 9),
             "appearance": ("ظاهر پنل", "primary", 10),
-            "audit": ("Audit", "default", 11),
-            "close": ("بازگشت", "danger", 12),
+            "kyc_page": ("صفحه احراز هویت", "primary", 11),
+            "management": ("مرکز بررسی و اعلان‌ها", "primary", 12),
+            "audit": ("گزارش فعالیت‌ها", "default", 13),
+            "close": ("بازگشت", "danger", 14),
         }
         grouped: dict[int, list[tuple[int, Button]]] = {}
         for index, name in enumerate(names):
@@ -812,31 +859,79 @@ def persistent_router(repo: ShopRepository) -> Router:
         )
 
     async def home(message: Message, actor_id: int) -> None:
+        config = await repo.storefront_config() if hasattr(repo, "storefront_config") else {}
         actions = {}
-        for action in ("catalog", "account", "begin_kyc", "begin_card", "my_orders"):
+        for action in ("catalog", "account", "support", "my_orders", "begin_kyc", "begin_card"):
             actions[action] = await repo.coordinator.issue_callback(action, actor_id)
+        labels = config.get("labels", {})
+        button_config = config.get("buttons", {})
+
+        async def storefront_button(slot: str, label: str, action: str, style: str = "default"):
+            configured = button_config.get(slot, {})
+            icon = (
+                await repo.resolve_emoji_key(configured.get("emoji"))
+                if configured.get("emoji")
+                else None
+            )
+            return Button(
+                configured.get("label", label),
+                actions[action],
+                configured.get("style", style),
+                icon,
+            )
+
         await answer_keyboard(
             message,
-            "صفحه اصلی",
+            (
+                f"{config.get('title', 'به فروشگاه خوش آمدید')}\n\n"
+                f"{config.get('introduction', 'محصول موردنظر خود را از فروشگاه انتخاب کنید.')}\n"
+                f"{config.get('benefits', '')}"
+            ).strip(),
             [
-                [Button("فروشگاه", actions["catalog"], "primary")],
-                [Button("حساب کاربری", actions["account"])],
-                [Button("احراز هویت", actions["begin_kyc"])],
-                [Button("کارت‌های بانکی", actions["begin_card"])],
-                [Button("سفارش‌های من", actions["my_orders"])],
+                [
+                    await storefront_button(
+                        "catalog",
+                        labels.get("catalog", "فروشگاه و خرید اشتراک"),
+                        "catalog",
+                        "primary",
+                    )
+                ],
+                [
+                    await storefront_button(
+                        "orders", labels.get("orders", "سفارش‌های من"), "my_orders"
+                    ),
+                    await storefront_button(
+                        "account", labels.get("account", "حساب کاربری"), "account"
+                    ),
+                ],
+                [
+                    await storefront_button("kyc", "احراز هویت", "begin_kyc"),
+                    await storefront_button("cards", "کارت‌های بانکی", "begin_card"),
+                ],
+                [await storefront_button("support", labels.get("support", "پشتیبانی"), "support")],
             ],
         )
+
+    async def customer_navigation(actor: int, parent: str = "home") -> list[Button]:
+        back = await repo.coordinator.issue_callback(f"nav.{parent}", actor, one_time=False)
+        main = await repo.coordinator.issue_callback("nav.home", actor, one_time=False)
+        return [Button("بازگشت", back), Button("منوی اصلی", main, "primary")]
+
+    async def kyc_page_config() -> dict:
+        if hasattr(repo, "kyc_page"):
+            return await repo.kyc_page()
+        return {
+            "title": "احراز هویت",
+            "explanation": "برای تکمیل خرید، مدرک هویتی خود را ارسال کنید.",
+            "privacy": "اطلاعات فقط برای بررسی درخواست استفاده می‌شود.",
+            "review_time": "درخواست پس از بررسی دستی نتیجه‌گیری می‌شود.",
+            "start_label": "شروع احراز هویت",
+            "style": "primary",
+        }
 
     @router.message(Command("start"))
     async def start(message: Message) -> None:
         await clear_actor_state(message.from_user.id)
-        try:
-            repo.owner(message.from_user.id)
-        except AccessDenied:
-            pass
-        else:
-            await admin_home(message, message.from_user.id)
-            return
         if not await repo.coordinator.rate_limit("start", message.from_user.id, 10, 60):
             await message.answer("درخواست‌های شما بیش از حد مجاز است.")
             return
@@ -862,6 +957,57 @@ def persistent_router(repo: ShopRepository) -> Router:
             f"{terms.title}\n\n{terms.pages[0]}",
             [[Button("تأیید قوانین", token, "success")]],
         )
+
+    @router.message(Command("setup_admin_group"))
+    async def setup_admin_group(message: Message) -> None:
+        try:
+            repo.owner(message.from_user.id)
+            if message.chat.type != "supergroup":
+                await message.answer("این دستور باید داخل یک سوپرگروه خصوصی اجرا شود.")
+                return
+            if getattr(message.chat, "username", None):
+                await message.answer(
+                    "مرکز بررسی باید یک سوپرگروه خصوصی و بدون نام کاربری عمومی باشد."
+                )
+                return
+            if not getattr(message.chat, "is_forum", False):
+                await message.answer("ابتدا Topics را در تنظیمات این سوپرگروه فعال کنید.")
+                return
+            me = await message.bot.get_me()
+            membership = await message.bot.get_chat_member(message.chat.id, me.id)
+            member_status = getattr(membership.status, "value", membership.status)
+            if member_status not in {"administrator", "creator"} or not getattr(
+                membership, "can_manage_topics", False
+            ):
+                await message.answer(
+                    "ربات باید مدیر گروه باشد و اجازه مدیریت Topic، "
+                    "ارسال رسانه و پیام را داشته باشد."
+                )
+                return
+            existing = await repo.management_group(message.from_user.id)
+            topics = (
+                dict(existing.get("topics", {}))
+                if existing and int(existing["chat_id"]) == message.chat.id
+                else {}
+            )
+            names = {
+                "orders": "سفارش‌ها و پرداخت‌ها",
+                "kyc": "احراز هویت کاربران",
+                "cards": "بررسی کارت‌های بانکی",
+                "system": "هشدارهای سیستم",
+            }
+            for key, title in names.items():
+                if not topics.get(key):
+                    created = await message.bot.create_forum_topic(message.chat.id, title)
+                    topics[key] = created.message_thread_id
+            await repo.configure_management_group(message.from_user.id, message.chat.id, topics)
+            await message.answer("مرکز مدیریت و چهار Topic بررسی با موفقیت متصل شدند.")
+        except AccessDenied:
+            await message.answer("فقط مالک فروشگاه اجازه راه‌اندازی مرکز مدیریت را دارد.")
+        except TelegramBadRequest:
+            await message.answer(
+                "ساخت Topic انجام نشد؛ دسترسی‌های ربات و فعال بودن Forum را بررسی کنید."
+            )
 
     @router.callback_query(F.data.startswith("c1."))
     async def callback(query: CallbackQuery) -> None:
@@ -900,6 +1046,16 @@ def persistent_router(repo: ShopRepository) -> Router:
                     ],
                     "delivery": ["content", "activation_link"],
                     "button": ["text"],
+                    "kyc_page": [
+                        "title",
+                        "explanation",
+                        "documents",
+                        "reason",
+                        "privacy",
+                        "review_time",
+                        "support_target",
+                        "start_label",
+                    ],
                 }
                 if kind == "product" and step == 31:
                     data["currency_buffer_percent"] = "0"
@@ -938,33 +1094,216 @@ def persistent_router(repo: ShopRepository) -> Router:
                     icon = await repo.resolve_emoji_key(category.custom_emoji_id)
                     rows.append([Button(category.title, token, "default", icon)])
                 if rows:
+                    rows.append(await customer_navigation(query.from_user.id))
                     await answer_keyboard(query.message, "دسته‌بندی‌ها", rows)
                 else:
                     await query.message.answer("دسته فعالی وجود ندارد.")
             elif state["a"] == "account":
-                async with repo.sessions.begin() as session:
-                    user = await repo.user(query.from_user.id, session)
-                cards = await repo.verified_cards(query.from_user.id)
-                await query.message.answer(
-                    f"وضعیت KYC: {user.kyc_status}\nکارت‌های تأییدشده: {len(cards)}"
+                if hasattr(repo, "account_summary"):
+                    summary = await repo.account_summary(query.from_user.id)
+                else:
+                    async with repo.sessions.begin() as session:
+                        user = await repo.user(query.from_user.id, session)
+                    cards = await repo.verified_cards(query.from_user.id)
+                    orders = await repo.customer_orders(query.from_user.id)
+                    summary = {
+                        "public_code": "ثبت‌شده",
+                        "kyc_status": user.kyc_status,
+                        "verified_cards": len(cards),
+                        "total_orders": len(orders),
+                        "active_orders": len(orders),
+                        "created_at": None,
+                    }
+                statuses = {
+                    "NOT_STARTED": "شروع نشده",
+                    "PENDING": "در انتظار بررسی",
+                    "UNDER_REVIEW": "در حال بررسی",
+                    "REJECTED": "رد شده",
+                    "VERIFIED": "تأیید شده",
+                    "BLOCKED": "مسدود",
+                }
+                registered_at = (
+                    summary["created_at"].date().isoformat() if summary["created_at"] else "ثبت‌شده"
+                )
+                await answer_keyboard(
+                    query.message,
+                    "حساب کاربری\n\n"
+                    f"نام: {getattr(query.from_user, 'full_name', 'کاربر فروشگاه')}\n"
+                    f"شماره مشتری: {summary['public_code']}\n"
+                    f"احراز هویت: {statuses.get(summary['kyc_status'], 'نامشخص')}\n"
+                    f"کارت‌های تأییدشده: {summary['verified_cards']}\n"
+                    f"همه سفارش‌ها: {summary['total_orders']}\n"
+                    f"سفارش‌های فعال: {summary['active_orders']}\n"
+                    f"تاریخ عضویت: {registered_at}",
+                    [
+                        [
+                            Button(
+                                "سفارش‌های من",
+                                await repo.coordinator.issue_callback(
+                                    "my_orders", query.from_user.id
+                                ),
+                            ),
+                            Button(
+                                "کارت‌های بانکی من",
+                                await repo.coordinator.issue_callback(
+                                    "customer.cards", query.from_user.id
+                                ),
+                            ),
+                        ],
+                        [
+                            Button(
+                                "احراز هویت",
+                                await repo.coordinator.issue_callback(
+                                    "begin_kyc", query.from_user.id
+                                ),
+                            ),
+                            Button(
+                                "پشتیبانی",
+                                await repo.coordinator.issue_callback(
+                                    "support", query.from_user.id
+                                ),
+                            ),
+                        ],
+                        await customer_navigation(query.from_user.id),
+                    ],
                 )
             elif state["a"] == "my_orders":
                 orders = await repo.customer_orders(query.from_user.id)
                 text_value = (
                     "\n".join(
-                        f"{item.id} | {item.status} | {item.amount_toman} تومان" for item in orders
+                        f"{getattr(item, 'public_code', 'سفارش')} — {item.amount_toman:,} تومان"
+                        for item in orders
                     )
                     or "سفارشی وجود ندارد."
                 )
-                await query.message.answer(text_value)
+                await answer_keyboard(
+                    query.message, text_value, [await customer_navigation(query.from_user.id)]
+                )
+            elif state["a"] == "customer.cards":
+                cards = await repo.customer_cards(query.from_user.id)
+                card_status = {
+                    "PENDING_VERIFICATION": "در انتظار بررسی",
+                    "VERIFIED": "تأیید شده",
+                    "REJECTED": "رد شده",
+                }
+                text_value = (
+                    "\n".join(
+                        f"{item.bank_name} — {item.masked_pan} — "
+                        f"{card_status.get(item.status, 'در حال بررسی')}"
+                        for item in cards
+                    )
+                    or "هنوز کارت بانکی ثبت نشده است."
+                )
+                add = await repo.coordinator.issue_callback("begin_card", query.from_user.id)
+                await answer_keyboard(
+                    query.message,
+                    f"کارت‌های بانکی من\n\n{text_value}",
+                    [
+                        [Button("ثبت کارت جدید", add, "primary")],
+                        await customer_navigation(query.from_user.id, "account"),
+                    ],
+                )
+            elif state["a"] in {"nav.home", "nav.catalog", "nav.account"}:
+                if state["a"] == "nav.home":
+                    await home(query.message, query.from_user.id)
+                elif state["a"] == "nav.account":
+                    account = await repo.coordinator.issue_callback("account", query.from_user.id)
+                    await answer_keyboard(
+                        query.message,
+                        "بازگشت به حساب کاربری",
+                        [
+                            [Button("نمایش حساب کاربری", account, "primary")],
+                            await customer_navigation(query.from_user.id),
+                        ],
+                    )
+                else:
+                    categories_token = await repo.coordinator.issue_callback(
+                        "catalog", query.from_user.id
+                    )
+                    await answer_keyboard(
+                        query.message,
+                        "بازگشت به فروشگاه",
+                        [
+                            [Button("مشاهده دسته‌بندی‌ها", categories_token, "primary")],
+                            await customer_navigation(query.from_user.id),
+                        ],
+                    )
+            elif state["a"] == "support":
+                config = (
+                    await repo.storefront_config() if hasattr(repo, "storefront_config") else {}
+                )
+                await answer_keyboard(
+                    query.message,
+                    config.get(
+                        "support_text", "برای دریافت راهنمایی با پشتیبانی فروشگاه تماس بگیرید."
+                    ),
+                    [await customer_navigation(query.from_user.id)],
+                )
+            elif state["a"] == "admin.management":
+                repo.owner(query.from_user.id)
+                group = await repo.management_group(query.from_user.id)
+                test = await repo.coordinator.issue_callback(
+                    "admin.management.test", query.from_user.id, one_time=True
+                )
+                disconnect = await repo.coordinator.issue_callback(
+                    "admin.management.disconnect", query.from_user.id, one_time=True
+                )
+                await answer_keyboard(
+                    query.message,
+                    "مرکز بررسی و اعلان‌ها\n\n"
+                    + (
+                        "اتصال برقرار است و Topicهای بررسی ذخیره شده‌اند."
+                        if group
+                        else "هنوز متصل نشده است. دستور /setup_admin_group را "
+                        "در سوپرگروه اجرا کنید."
+                    ),
+                    [
+                        [Button("ارسال اعلان آزمایشی", test, "primary")],
+                        [
+                            Button(
+                                "بازسازی Topic گم‌شده",
+                                await repo.coordinator.issue_callback(
+                                    "admin.management.rebuild", query.from_user.id
+                                ),
+                            )
+                        ],
+                        [Button("قطع اتصال", disconnect, "danger")],
+                    ],
+                )
+            elif state["a"] == "admin.management.test":
+                await repo.enqueue_management_test(query.from_user.id)
+                await query.message.answer("اعلان آزمایشی در صف ارسال قرار گرفت.")
+            elif state["a"] == "admin.management.disconnect":
+                await repo.disconnect_management_group(query.from_user.id)
+                await query.message.answer("اتصال مرکز مدیریت قطع شد.")
+            elif state["a"] == "admin.management.rebuild":
+                repo.owner(query.from_user.id)
+                await query.message.answer(
+                    "برای بازسازی Topic گم‌شده، /setup_admin_group را همین‌جا اجرا کنید."
+                )
             elif state["a"] in {"begin_kyc", "begin_card"}:
                 target = "kyc.document" if state["a"] == "begin_kyc" else "card.bank"
+                if target == "kyc.document":
+                    async with repo.sessions.begin() as session:
+                        user = await repo.user(query.from_user.id, session)
+                    if user.kyc_status in {"PENDING", "UNDER_REVIEW"}:
+                        await answer_keyboard(
+                            query.message,
+                            "مدرک شما ثبت شده و در انتظار بررسی است. ارسال دوباره لازم نیست.",
+                            [await customer_navigation(query.from_user.id)],
+                        )
+                        return
                 await repo.coordinator.redis.set(f"fsm:{query.from_user.id}", target, ex=900)
-                await query.message.answer(
-                    "تصویر یا فایل مدرک هویتی را ارسال کنید."
-                    if target == "kyc.document"
-                    else "نام بانک را ارسال کنید."
-                )
+                if target == "kyc.document":
+                    page = await kyc_page_config()
+                    await answer_keyboard(
+                        query.message,
+                        f"{page['title']}\n\n{page['explanation']}\n\n{page['privacy']}\n{page['review_time']}\n\n"
+                        "اکنون تصویر یا فایل مدرک هویتی را ارسال کنید.",
+                        [await customer_navigation(query.from_user.id)],
+                    )
+                else:
+                    await query.message.answer("نام بانک را ارسال کنید.")
             elif state["a"] == "category":
                 rows = []
                 for product in await repo.products(UUID(state["o"])):
@@ -974,6 +1313,7 @@ def persistent_router(repo: ShopRepository) -> Router:
                     icon = await repo.resolve_emoji_key(product.custom_emoji_id)
                     rows.append([Button(product.title, token, "default", icon)])
                 if rows:
+                    rows.append(await customer_navigation(query.from_user.id, "catalog"))
                     await answer_keyboard(query.message, "محصولات", rows)
                 else:
                     await query.message.answer("محصول فعالی وجود ندارد.")
@@ -991,9 +1331,81 @@ def persistent_router(repo: ShopRepository) -> Router:
                     f"فعال‌سازی: {product.activation_method or '-'}\n"
                     f"گارانتی: {product.warranty_text or '-'}\n"
                     f"زمان تحویل: {product.delivery_minutes} دقیقه",
-                    [[Button("خرید", buy, "success")]],
+                    [
+                        [Button("خرید", buy, "success")],
+                        await customer_navigation(query.from_user.id, "catalog"),
+                    ],
+                )
+            elif state["a"] == "resume_checkout":
+                product = await repo.product(UUID(state["o"]))
+                if not product:
+                    catalog = await repo.coordinator.issue_callback("catalog", query.from_user.id)
+                    await answer_keyboard(
+                        query.message,
+                        "محصول قبلی دیگر در دسترس نیست؛ دوباره از فروشگاه انتخاب کنید.",
+                        [[Button("بازگشت به فروشگاه", catalog, "primary")]],
+                    )
+                    return
+                buy = await repo.coordinator.issue_callback(
+                    "buy", query.from_user.id, str(product.id), one_time=True
+                )
+                await answer_keyboard(
+                    query.message,
+                    f"ادامه خرید\n\n{product.title}\n{product.description}",
+                    [
+                        [Button("ادامه خرید", buy, "primary")],
+                        await customer_navigation(query.from_user.id, "catalog"),
+                    ],
                 )
             elif state["a"] == "buy":
+                await repo.coordinator.redis.set(
+                    f"pending-checkout:{query.from_user.id}", state["o"], ex=86400
+                )
+                async with repo.sessions.begin() as session:
+                    user = await repo.user(query.from_user.id, session)
+                if user.risk_status == "BLOCKED":
+                    await answer_keyboard(
+                        query.message,
+                        "امکان خرید برای این حساب وجود ندارد.",
+                        [await customer_navigation(query.from_user.id)],
+                    )
+                    return
+                if user.kyc_status != "VERIFIED":
+                    page = await kyc_page_config()
+                    begin = await repo.coordinator.issue_callback("begin_kyc", query.from_user.id)
+                    detail = (
+                        await repo.kyc_status_detail(query.from_user.id)
+                        if hasattr(repo, "kyc_status_detail")
+                        else {"reason": None}
+                    )
+                    if user.kyc_status in {"PENDING", "UNDER_REVIEW"}:
+                        text_value = "مدرک شما در انتظار بررسی است."
+                    elif user.kyc_status == "REJECTED":
+                        rejection_reason = detail.get("reason") or (
+                            "برای اطلاعات بیشتر با پشتیبانی تماس بگیرید."
+                        )
+                        text_value = (
+                            "درخواست قبلی تأیید نشد. دلیل: "
+                            f"{rejection_reason}\n"
+                            "می‌توانید مدرک اصلاح‌شده را دوباره ارسال کنید."
+                        )
+                    else:
+                        text_value = page["explanation"]
+                    await answer_keyboard(
+                        query.message,
+                        f"{page['title']}\n\n{text_value}",
+                        [
+                            [
+                                Button(
+                                    page.get("start_label", "شروع احراز هویت"),
+                                    begin,
+                                    page.get("style", "primary"),
+                                )
+                            ],
+                            await customer_navigation(query.from_user.id, "catalog"),
+                        ],
+                    )
+                    return
                 rows = []
                 for card in await repo.verified_cards(query.from_user.id):
                     token = await repo.coordinator.issue_callback(
@@ -1002,21 +1414,15 @@ def persistent_router(repo: ShopRepository) -> Router:
                     rows.append([Button(f"{card.bank_name} — {card.masked_pan}", token)])
                 has_verified_cards = bool(rows)
                 if not has_verified_cards:
-                    kyc = await repo.coordinator.issue_callback(
-                        "begin_kyc", query.from_user.id, one_time=False
-                    )
                     card = await repo.coordinator.issue_callback(
                         "begin_card", query.from_user.id, one_time=False
                     )
-                    rows = [
-                        [Button("ارسال مدارک احراز هویت", kyc, "primary")],
-                        [Button("ثبت کارت بانکی", card)],
-                    ]
+                    rows = [[Button("ثبت کارت بانکی", card, "primary")]]
                 await answer_keyboard(
                     query.message,
                     "کارت مبدأ تأییدشده را انتخاب کنید."
                     if has_verified_cards
-                    else "برای خرید، KYC و کارت بانکی تأییدشده لازم است.",
+                    else "برای ادامه خرید، یک کارت بانکی تأییدشده ثبت کنید.",
                     rows,
                 )
             elif state["a"] == "quote":
@@ -1028,7 +1434,8 @@ def persistent_router(repo: ShopRepository) -> Router:
                 await answer_keyboard(
                     query.message,
                     f"چک نهایی\n{quote.snapshot['title']}\nمبلغ: {quote.final_toman} تومان\n"
-                    "اعتبار قیمت: ۳۰ دقیقه",
+                    f"کارت مبدأ: {quote.snapshot['selected_card_bank']} — "
+                    f"{quote.snapshot['selected_card_masked']}\nاعتبار قیمت: ۳۰ دقیقه",
                     [[Button("تأیید و ادامه", final, "success")]],
                 )
             elif state["a"] == "final":
@@ -1078,8 +1485,21 @@ def persistent_router(repo: ShopRepository) -> Router:
                         )
                         rows.extend(
                             [
-                                [Button(f"تأیید KYC {item.id}", approve, "success")],
-                                [Button(f"رد KYC {item.id}", reject, "danger")],
+                                [
+                                    Button(
+                                        "تأیید احراز هویت "
+                                        f"{getattr(item, 'public_code', 'درخواست')}",
+                                        approve,
+                                        "success",
+                                    )
+                                ],
+                                [
+                                    Button(
+                                        f"رد {getattr(item, 'public_code', 'درخواست')}",
+                                        reject,
+                                        "danger",
+                                    )
+                                ],
                             ]
                         )
                 elif state["a"] == "admin.cards":
@@ -1108,8 +1528,11 @@ def persistent_router(repo: ShopRepository) -> Router:
                         if payment and payment.receipt_file_id:
                             await query.message.answer_photo(
                                 payment.receipt_file_id,
-                                caption=f"Order ID: {item.id}\nوضعیت: {item.status}\n"
-                                "رسید به‌تنهایی اثبات پرداخت نیست.",
+                                caption=(
+                                    f"سفارش: {getattr(item, 'public_code', 'ثبت‌شده')}\n"
+                                    "وضعیت: در انتظار بررسی دستی\n"
+                                    "رسید به‌تنهایی اثبات پرداخت نیست."
+                                ),
                             )
                         if item.status in {"AWAITING_RECONCILIATION", "MANUAL_REVIEW"}:
                             approve = await repo.coordinator.issue_callback(
@@ -1126,7 +1549,13 @@ def persistent_router(repo: ShopRepository) -> Router:
                             )
                             rows.extend(
                                 [
-                                    [Button(f"تأیید پرداخت {item.id}", approve, "success")],
+                                    [
+                                        Button(
+                                            f"تأیید پرداخت {getattr(item, 'public_code', 'سفارش')}",
+                                            approve,
+                                            "success",
+                                        )
+                                    ],
                                     [Button("رد پرداخت", reject, "danger")],
                                 ]
                             )
@@ -1134,7 +1563,15 @@ def persistent_router(repo: ShopRepository) -> Router:
                             claim = await repo.coordinator.issue_callback(
                                 "admin.order.claim", query.from_user.id, str(item.id), one_time=True
                             )
-                            rows.append([Button(f"Claim {item.id}", claim, "primary")])
+                            rows.append(
+                                [
+                                    Button(
+                                        f"دریافت سفارش {getattr(item, 'public_code', 'ثبت‌شده')}",
+                                        claim,
+                                        "primary",
+                                    )
+                                ]
+                            )
                         elif (
                             item.status == "PROCESSING"
                             and item.assigned_admin_id == query.from_user.id
@@ -1145,12 +1582,29 @@ def persistent_router(repo: ShopRepository) -> Router:
                                 str(item.id),
                                 one_time=True,
                             )
-                            rows.append([Button(f"ثبت تحویل {item.id}", deliver, "success")])
+                            rows.append(
+                                [
+                                    Button(
+                                        f"ثبت تحویل {getattr(item, 'public_code', 'سفارش ثبت‌شده')}",
+                                        deliver,
+                                        "success",
+                                    )
+                                ]
+                            )
                 else:
                     events = await repo.audit_events(query.from_user.id)
+                    audit_labels = {
+                        "kyc.manual_review": "بررسی احراز هویت",
+                        "customer_card.manual_review": "بررسی کارت بانکی",
+                        "payment.manual_approve": "تأیید دستی پرداخت",
+                        "payment.manual_reject": "رد دستی پرداخت",
+                        "order.claim": "دریافت سفارش توسط مدیر",
+                        "order.deliver": "ثبت تحویل سفارش",
+                    }
                     text = (
                         "\n".join(
-                            f"{item.at.isoformat()} | {item.action} | {item.target}"
+                            f"{item.at.isoformat()} — "
+                            f"{audit_labels.get(item.action, 'فعالیت مدیریتی')}"
                             for item in events
                         )
                         or "رویدادی وجود ندارد."
@@ -1494,6 +1948,7 @@ def persistent_router(repo: ShopRepository) -> Router:
             elif state["a"] in {
                 "admin.rate",
                 "admin.pricing",
+                "admin.kyc_page",
             }:
                 await set_wizard(query.message, query.from_user.id, state["a"].split(".")[1], 0, {})
             elif state["a"].startswith(("admin.kyc.", "admin.card.", "admin.payment.")):
@@ -1555,10 +2010,10 @@ def persistent_router(repo: ShopRepository) -> Router:
                 await answer_keyboard(query.message, "Premium Emoji Registry", rows)
             elif state["a"] == "admin.emoji.register":
                 repo.owner(query.from_user.id)
-                await repo.coordinator.redis.set(f"fsm:{query.from_user.id}", "admin.emoji", ex=900)
-                await query.message.answer(
-                    "نام ایموجی را در پاسخ به پیامی دارای Premium Custom Emoji ارسال کنید."
+                await repo.coordinator.redis.set(
+                    f"fsm:{query.from_user.id}", "admin.emoji.name", ex=900
                 )
+                await query.message.answer("یک نام کوتاه برای آیکون ثبت کنید.")
             elif state["a"] == "admin.emoji.toggle":
                 repo.owner(query.from_user.id)
                 emoji_id, active = state["o"].split(":", 1)
@@ -1670,6 +2125,16 @@ def persistent_router(repo: ShopRepository) -> Router:
                     "button": ["text", "url"],
                     "delivery": ["content", "activation_link"],
                     "appearance": ["label"],
+                    "kyc_page": [
+                        "title",
+                        "explanation",
+                        "documents",
+                        "reason",
+                        "privacy",
+                        "review_time",
+                        "support_target",
+                        "start_label",
+                    ],
                 }
                 if kind in {"merchant", "merchant_edit"} and step == 40:
                     if not value.isdigit() or int(value) <= 0:
@@ -1745,16 +2210,34 @@ def persistent_router(repo: ShopRepository) -> Router:
                 )
             except AccessDenied:
                 await message.answer("دسترسی مجاز نیست.")
-        elif state == "admin.emoji":
+        elif state == "admin.emoji.name":
             try:
                 repo.owner(message.from_user.id)
-                identifiers = extract_message_custom_emoji(message.reply_to_message)
-                if not message.text.strip() or not identifiers:
-                    raise ValueError("NAME_AND_CUSTOM_EMOJI_REQUIRED")
-                emoji = await repo.register_emoji(
-                    message.from_user.id, message.text.strip(), identifiers[0]
+                name = message.text.strip()
+                if not name or len(name) > 40:
+                    raise ValueError("INVALID_EMOJI_NAME")
+                await repo.coordinator.redis.set(f"emoji-name:{message.from_user.id}", name, ex=900)
+                await repo.coordinator.redis.set(
+                    f"fsm:{message.from_user.id}", "admin.emoji.media", ex=900
                 )
+                await message.answer(
+                    "اکنون یک پیام دارای Premium Custom Emoji ارسال کنید یا به آن پاسخ دهید."
+                )
+            except (AccessDenied, ValueError):
+                await message.answer("نام باید کوتاه و معتبر باشد.")
+        elif state in {"admin.emoji", "admin.emoji.media"}:
+            try:
+                repo.owner(message.from_user.id)
+                identifiers = extract_message_custom_emoji(message) or extract_message_custom_emoji(
+                    message.reply_to_message
+                )
+                stored_name = await repo.coordinator.redis.get(f"emoji-name:{message.from_user.id}")
+                name = stored_name or message.text.strip()
+                if not name or not identifiers:
+                    raise ValueError("NAME_AND_CUSTOM_EMOJI_REQUIRED")
+                emoji = await repo.register_emoji(message.from_user.id, name, identifiers[0])
                 await clear_actor_state(message.from_user.id)
+                await repo.coordinator.redis.delete(f"emoji-name:{message.from_user.id}")
                 await message.answer(f"Premium Emoji ثبت شد: {emoji.name}")
             except Exception:
                 log.exception("emoji registration failed")
@@ -1765,9 +2248,14 @@ def persistent_router(repo: ShopRepository) -> Router:
                 action, object_id = state.rsplit(":", 1)
                 approved = action.endswith(".approve")
                 if action.startswith("admin.kyc."):
-                    await repo.review_kyc(
-                        message.from_user.id, UUID(object_id), approved, message.text
-                    )
+                    if action.endswith(".resubmit"):
+                        await repo.request_kyc_resubmission(
+                            message.from_user.id, UUID(object_id), message.text
+                        )
+                    else:
+                        await repo.review_kyc(
+                            message.from_user.id, UUID(object_id), approved, message.text
+                        )
                 elif action.startswith("admin.card."):
                     await repo.review_card(
                         message.from_user.id, UUID(object_id), approved, message.text
@@ -1819,12 +2307,17 @@ def persistent_router(repo: ShopRepository) -> Router:
                     obj.file_id,
                     obj.file_unique_id,
                     file_type,
+                    html.escape(getattr(message.from_user, "full_name", "کاربر فروشگاه")),
                 )
                 await repo.coordinator.redis.delete(f"receipt-order:{message.from_user.id}")
                 await message.answer("رسید ثبت شد؛ رسید به‌تنهایی اثبات پرداخت نیست.")
             elif state == "kyc.document":
                 await repo.submit_kyc(
-                    message.from_user.id, obj.file_id, obj.file_unique_id, file_type
+                    message.from_user.id,
+                    obj.file_id,
+                    obj.file_unique_id,
+                    file_type,
+                    html.escape(getattr(message.from_user, "full_name", "کاربر فروشگاه")),
                 )
                 await repo.coordinator.redis.delete(f"fsm:{message.from_user.id}")
                 await message.answer("مدرک KYC برای بررسی دستی ثبت شد.")
@@ -1834,7 +2327,13 @@ def persistent_router(repo: ShopRepository) -> Router:
                 if not bank or not envelope:
                     raise ValueError("CARD_FORM_EXPIRED")
                 card = await repo.submit_customer_card(
-                    message.from_user.id, bank, repo.vault.decrypt(envelope), obj.file_id
+                    message.from_user.id,
+                    bank,
+                    repo.vault.decrypt(envelope),
+                    obj.file_id,
+                    obj.file_unique_id,
+                    file_type,
+                    html.escape(getattr(message.from_user, "full_name", "کاربر فروشگاه")),
                 )
                 await repo.coordinator.redis.delete(
                     f"fsm:{message.from_user.id}",
@@ -1941,12 +2440,86 @@ class Runtime:
             if not row:
                 return False
             try:
-                if row.payload.get("receipt_file_id"):
-                    await self.bot.send_photo(
-                        row.chat_id,
-                        row.payload["receipt_file_id"],
-                        caption=f"{row.kind}\nOrder ID: {row.payload['order_id']}\n"
-                        "رسید به‌تنهایی اثبات پرداخت نیست.",
+                payload = row.payload
+                message_thread_id = getattr(row, "message_thread_id", None)
+                thread = {"message_thread_id": message_thread_id} if message_thread_id else {}
+                file_id = payload.get("file_id") or payload.get("receipt_file_id")
+                keyboard = None
+                if row.kind in {"KYC_REVIEW", "CARD_REVIEW", "PAYMENT_REVIEW"}:
+                    action_type = {
+                        "KYC_REVIEW": "kyc",
+                        "CARD_REVIEW": "card",
+                        "PAYMENT_REVIEW": "payment",
+                    }[row.kind]
+                    labels = {
+                        "KYC_REVIEW": ("تأیید احراز هویت", "رد درخواست"),
+                        "CARD_REVIEW": ("تأیید کارت بانکی", "رد کارت"),
+                        "PAYMENT_REVIEW": ("تأیید دستی پرداخت", "رد پرداخت"),
+                    }[row.kind]
+                    approve = await self.repo.coordinator.issue_callback(
+                        f"admin.{action_type}.approve",
+                        self.repo.owner_id,
+                        str(getattr(row, "entity_id", "")),
+                        one_time=True,
+                    )
+                    reject = await self.repo.coordinator.issue_callback(
+                        f"admin.{action_type}.reject",
+                        self.repo.owner_id,
+                        str(getattr(row, "entity_id", "")),
+                        one_time=True,
+                    )
+                    review_rows = [
+                        [Button(labels[0], approve, "success"), Button(labels[1], reject, "danger")]
+                    ]
+                    if row.kind in {"KYC_REVIEW", "CARD_REVIEW"}:
+                        resubmit = await self.repo.coordinator.issue_callback(
+                            f"admin.{action_type}.resubmit",
+                            self.repo.owner_id,
+                            str(getattr(row, "entity_id", "")),
+                            one_time=True,
+                        )
+                        review_rows.append([Button("درخواست ارسال مجدد", resubmit, "primary")])
+                    keyboard = markup(review_rows)
+                if file_id:
+                    if row.kind == "KYC_REVIEW":
+                        caption = (
+                            f"درخواست احراز هویت {payload['public_code']}\n"
+                            f"شناسه تلگرام: {payload['telegram_id']}\n"
+                            f"کاربر: {payload.get('safe_identity') or 'ثبت‌نشده'}\n"
+                            f"زمان ثبت: {payload['submitted_at']}\n"
+                            f"وضعیت: {payload['status']}"
+                        )
+                    elif row.kind == "CARD_REVIEW":
+                        caption = (
+                            f"بررسی کارت {payload['public_code']}\n"
+                            f"شناسه تلگرام: {payload['telegram_id']}\n"
+                            f"کاربر: {payload.get('safe_identity') or 'ثبت‌نشده'}\n"
+                            f"زمان ثبت: {payload['submitted_at']}\n"
+                            f"بانک: {payload['bank_name']}\n"
+                            f"شماره کارت: {payload['masked_pan']}"
+                        )
+                    elif row.kind == "PAYMENT_REVIEW" and payload.get("public_code"):
+                        caption = (
+                            f"بررسی پرداخت سفارش {payload['public_code']}\n"
+                            f"محصول: {payload['product_title']}\n"
+                            f"مشتری: {payload.get('safe_identity') or 'ثبت‌نشده'}\n"
+                            f"زمان ارسال: {payload['submitted_at']}\n"
+                            f"مبلغ: {payload['amount_toman']:,} تومان\n"
+                            f"کارت مبدأ: {payload.get('source_bank') or 'نامشخص'} — "
+                            f"{payload.get('source_masked') or 'ثبت نشده'}\n"
+                            "وضعیت: "
+                            f"{'پرداخت دیرهنگام' if payload['late'] else 'در انتظار تطبیق دستی'}\n"
+                            f"{payload['warning']}"
+                        )
+                    else:
+                        caption = "رسید پرداخت ثبت‌شده\nرسید به‌تنهایی اثبات پرداخت نیست."
+                    sender = (
+                        self.bot.send_photo
+                        if payload.get("file_type", "photo") == "photo"
+                        else self.bot.send_document
+                    )
+                    await sender(
+                        row.chat_id, file_id, caption=caption, reply_markup=keyboard, **thread
                     )
                 else:
                     if row.kind == "FX_RATE_STALE":
@@ -1954,13 +2527,36 @@ class Runtime:
                             "نرخ ارز منقضی شده است و فروش جدید آن ارز متوقف شد.\n"
                             f"ارز: {row.payload['currency']}"
                         )
+                    elif payload.get("text"):
+                        body = payload["text"]
+                    elif row.kind == "FULFILLMENT_READY":
+                        body = f"سفارش {payload['public_code']} آماده انجام است."
+                    elif row.kind == "ORDER_CLAIMED":
+                        body = f"سفارش {payload['public_code']} توسط مدیر دریافت شد."
+                    elif row.kind == "DELIVERY_RECORDED":
+                        body = f"تحویل سفارش {payload['public_code']} ثبت و برای مشتری ارسال شد."
+                    elif row.kind in {"KYC_DECISION", "CARD_DECISION"}:
+                        body = (
+                            "درخواست شما تأیید شد."
+                            if payload["approved"]
+                            else "درخواست شما تأیید نشد. دلیل: "
+                            f"{payload.get('reason') or 'اعلام نشده'}"
+                        )
+                        pending = await self.repo.coordinator.redis.get(
+                            f"pending-checkout:{row.chat_id}"
+                        )
+                        if payload.get("resume") and pending:
+                            resume = await self.repo.coordinator.issue_callback(
+                                "resume_checkout", row.chat_id, pending, one_time=True
+                            )
+                            keyboard = markup([[Button("ادامه خرید", resume, "primary")]])
                     else:
-                        body = f"{row.kind}\nOrder ID: {row.payload['order_id']}"
+                        body = "یک رویداد جدید فروشگاه ثبت شد."
                     if row.kind == "ORDER_DELIVERED":
                         body += f"\n\n{row.payload['content']}"
                         if row.payload.get("activation_link"):
                             body += f"\n{row.payload['activation_link']}"
-                    await self.bot.send_message(row.chat_id, body)
+                    await self.bot.send_message(row.chat_id, body, reply_markup=keyboard, **thread)
                 row.sent_at = self.repo.now()
             except Exception as exc:
                 row.attempts += 1

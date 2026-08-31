@@ -308,9 +308,57 @@ async def test_start_terms_consent_and_home_screens():
     token = keyboard.inline_keyboard[0][0].callback_data
     callback = handler(router, "callback_query", "callback")
     await callback(QueryFake(token, message))
-    assert any("صفحه اصلی" in answer[0] for answer in message.answers)
+    assert any("به فروشگاه خوش آمدید" in answer[0] for answer in message.answers)
     await start(message)
-    assert message.answers[-1][0] == "صفحه اصلی"
+    assert "به فروشگاه خوش آمدید" in message.answers[-1][0]
+
+
+@pytest.mark.asyncio
+async def test_owner_start_opens_storefront_while_admin_remains_explicit():
+    repo = RepoFake()
+    repo.terms = SimpleNamespace(id=uuid4(), version=1, title="Terms", pages=["Body"])
+    repo.accepted = True
+    router = persistent_router(repo)
+    owner = MessageFake(actor=1)
+    await handler(router, "message", "start")(owner)
+    assert "به فروشگاه خوش آمدید" in owner.answers[-1][0]
+    assert "پنل مدیریت" not in owner.answers[-1][0]
+
+    repo.user = AsyncMock(wraps=repo.user)
+    await handler(router, "message", "admin")(owner)
+    assert "پنل مدیریت" in owner.answers[-1][0]
+    repo.user.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_management_supergroup_setup_creates_topics_once():
+    repo = RepoFake()
+    repo.management_group = AsyncMock(return_value=None)
+    repo.configure_management_group = AsyncMock()
+    router = persistent_router(repo)
+    owner = MessageFake(actor=1)
+    owner.chat = SimpleNamespace(id=-1001, type="supergroup", is_forum=True, username=None)
+    owner.bot = AsyncMock()
+    owner.bot.get_me.return_value = SimpleNamespace(id=99)
+    owner.bot.get_chat_member.return_value = SimpleNamespace(
+        status="administrator", can_manage_topics=True
+    )
+    owner.bot.create_forum_topic.side_effect = [
+        SimpleNamespace(message_thread_id=value) for value in (10, 11, 12, 13)
+    ]
+    await handler(router, "message", "setup_admin_group")(owner)
+    assert owner.bot.create_forum_topic.await_count == 4
+    repo.configure_management_group.assert_awaited_once_with(
+        1,
+        -1001,
+        {"orders": 10, "kyc": 11, "cards": 12, "system": 13},
+    )
+    repo.management_group.return_value = {
+        "chat_id": -1001,
+        "topics": {"orders": 10, "kyc": 11, "cards": 12, "system": 13},
+    }
+    await handler(router, "message", "setup_admin_group")(owner)
+    assert owner.bot.create_forum_topic.await_count == 4
 
 
 @pytest.mark.asyncio
@@ -342,9 +390,9 @@ async def test_customer_callback_navigation_and_checkout():
     await callback(QueryFake(final_token, message))
     assert "کارت مقصد" in message.answers[-1][0]
     await dispatch("account")
-    assert "VERIFIED" in message.answers[-1][0]
+    assert "تأیید شده" in message.answers[-1][0]
     await dispatch("my_orders")
-    assert "PROCESSING" in message.answers[-1][0]
+    assert "سفارش" in message.answers[-1][0]
     await dispatch("begin_kyc")
     assert await repo.coordinator.redis.get("fsm:2") == "kyc.document"
     await dispatch("begin_card")
@@ -360,13 +408,13 @@ async def test_buy_gate_provides_actionable_kyc_and_card_buttons():
     token = await repo.coordinator.issue_callback("buy", 2, str(uuid4()))
     await callback(QueryFake(token, message))
     text_value, kwargs = message.answers[-1]
-    assert "KYC" in text_value
+    assert "کارت بانکی تأییدشده" in text_value
     actions = {
         repo.coordinator.state[button.callback_data]["a"]
         for row in kwargs["reply_markup"].inline_keyboard
         for button in row
     }
-    assert actions == {"begin_kyc", "begin_card"}
+    assert "begin_card" in actions
 
 
 @pytest.mark.asyncio

@@ -24,10 +24,10 @@ PY
 fi
 if [[ $NON_INTERACTIVE != true ]]; then
 read -rp 'Admin Telegram user ID: ' ADMIN_ID
-read -rp 'Order notification chat ID [same as Owner]: ' ORDER_CHAT; ORDER_CHAT=${ORDER_CHAT:-$ADMIN_ID}
 read -rsp 'Navasan API key [leave empty for manual emergency mode]: ' NAVASAN_API_KEY; echo
 RUN_MODE=polling; WEBHOOK_URL=''; SECURE_PATH=/var/lib/shopbot/secure; BRAND_NAME=''
 fi
+ORDER_CHAT=${ORDER_CHAT:-$ADMIN_ID}
 FX_PROVIDER=${FX_PROVIDER:-$( [[ -n ${NAVASAN_API_KEY:-} ]] && echo navasan || echo manual )}
 secret(){ openssl rand -base64 48 | tr -d '\n'; }
 command -v openssl >/dev/null || { echo 'openssl is required' >&2; exit 1; }

@@ -15,6 +15,8 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
@@ -37,6 +39,13 @@ class UserRow(Base):
     telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
     kyc_status: Mapped[str] = mapped_column(String(32), default="NOT_STARTED", index=True)
     risk_status: Mapped[str] = mapped_column(String(16), default="CLEAR")
+    public_code: Mapped[str] = mapped_column(
+        String(20),
+        unique=True,
+        index=True,
+        server_default=text("'CUS-' || nextval('customer_public_seq')::text"),
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class TermsRow(Base):
@@ -62,6 +71,12 @@ class ConsentRow(Base):
 class KYCRow(Base):
     __tablename__ = "kyc_submissions"
     id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    public_code: Mapped[str] = mapped_column(
+        String(20),
+        unique=True,
+        index=True,
+        server_default=text("'KYC-' || nextval('kyc_public_seq')::text"),
+    )
     user_id: Mapped[UUID] = mapped_column(ForeignKey("users.id"), index=True)
     status: Mapped[str] = mapped_column(String(32), index=True)
     file_id: Mapped[str] = mapped_column(Text)
@@ -78,6 +93,12 @@ class CustomerCardRow(Base):
     __tablename__ = "customer_cards"
     __table_args__ = (Index("ix_customer_cards_owner_status", "user_id", "status"),)
     id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    public_code: Mapped[str] = mapped_column(
+        String(20),
+        unique=True,
+        index=True,
+        server_default=text("'CRD-' || nextval('card_public_seq')::text"),
+    )
     user_id: Mapped[UUID] = mapped_column(ForeignKey("users.id"))
     bank_name: Mapped[str] = mapped_column(Text)
     encrypted_pan: Mapped[str] = mapped_column(Text)
@@ -86,6 +107,10 @@ class CustomerCardRow(Base):
     fingerprint: Mapped[str] = mapped_column(String(64), unique=True)
     status: Mapped[str] = mapped_column(String(32), index=True)
     evidence_file_id: Mapped[str] = mapped_column(Text)
+    evidence_unique_id: Mapped[str] = mapped_column(Text, unique=True)
+    evidence_type: Mapped[str] = mapped_column(String(16))
+    reason: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     verified_by: Mapped[int | None] = mapped_column(BigInteger)
 
@@ -228,6 +253,12 @@ class ReservationRow(Base):
 class OrderRow(Base):
     __tablename__ = "orders"
     id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    public_code: Mapped[str] = mapped_column(
+        String(20),
+        unique=True,
+        index=True,
+        server_default=text("'ORD-' || nextval('order_public_seq')::text"),
+    )
     user_id: Mapped[UUID] = mapped_column(ForeignKey("users.id"), index=True)
     quote_id: Mapped[UUID] = mapped_column(ForeignKey("price_quotes.id"), unique=True)
     amount_toman: Mapped[int] = mapped_column(BigInteger)
@@ -263,6 +294,12 @@ class OutboxRow(Base):
     id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
     kind: Mapped[str] = mapped_column(String(32), index=True)
     chat_id: Mapped[int] = mapped_column(BigInteger)
+    message_thread_id: Mapped[int | None] = mapped_column(Integer)
+    entity_type: Mapped[str | None] = mapped_column(String(32), index=True)
+    entity_id: Mapped[UUID | None] = mapped_column(PGUUID(as_uuid=True), index=True)
+    event_key: Mapped[str] = mapped_column(
+        String(160), unique=True, default=lambda: f"event:{uuid4()}"
+    )
     payload: Mapped[dict] = mapped_column(JSONB)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)

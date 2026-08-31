@@ -156,7 +156,10 @@ async def test_real_dispatcher_processes_start_consent_and_home():
     )
 
     sent_texts = [call.text for call in session.calls if isinstance(call, SendMessage)]
-    assert sent_texts == ["Terms\n\nBody", "صفحه اصلی"]
+    assert sent_texts == [
+        "Terms\n\nBody",
+        "به فروشگاه خوش آمدید\n\nمحصول موردنظر خود را از فروشگاه انتخاب کنید.",
+    ]
     assert repo.accepted is True
     home_call = [call for call in session.calls if isinstance(call, SendMessage)][-1]
     assert all(

@@ -148,10 +148,181 @@ class ShopRepository:
         row = await session.scalar(select(UserRow).where(UserRow.telegram_id == telegram_id))
         if row:
             return row
-        row = UserRow(telegram_id=telegram_id)
+        row = UserRow(telegram_id=telegram_id, created_at=self.now())
         session.add(row)
         await session.flush()
         return row
+
+    async def management_group(self, actor: int | None = None) -> dict | None:
+        if actor is not None:
+            self.owner(actor)
+        async with self.sessions() as session:
+            row = await session.get(ConfigRow, "management.group")
+            return dict(row.value) if row else None
+
+    async def configure_management_group(self, actor: int, chat_id: int, topics: dict) -> None:
+        self.owner(actor)
+        required = {"orders", "kyc", "cards", "system"}
+        if set(topics) != required or not all(
+            isinstance(value, int) and value > 0 for value in topics.values()
+        ):
+            raise InvalidState("MANAGEMENT_TOPICS_REQUIRED")
+        async with self.sessions.begin() as session:
+            value = {"chat_id": chat_id, "topics": topics, "connected_at": self.now().isoformat()}
+            row = await session.get(ConfigRow, "management.group", with_for_update=True)
+            if row:
+                row.value, row.updated_at = value, self.now()
+            else:
+                session.add(ConfigRow(key="management.group", value=value, updated_at=self.now()))
+            await self.audit(session, actor, "management_group.configure", str(chat_id))
+
+    async def disconnect_management_group(self, actor: int) -> None:
+        self.owner(actor)
+        async with self.sessions.begin() as session:
+            row = await session.get(ConfigRow, "management.group", with_for_update=True)
+            if row:
+                await session.delete(row)
+            await self.audit(session, actor, "management_group.disconnect", "management.group")
+
+    async def enqueue_management_test(self, actor: int) -> None:
+        self.owner(actor)
+        async with self.sessions.begin() as session:
+            chat_id, thread_id = await self._outbox_target(session, "system")
+            session.add(
+                OutboxRow(
+                    kind="SYSTEM_TEST",
+                    chat_id=chat_id,
+                    message_thread_id=thread_id,
+                    event_key=f"system.test:{actor}:{int(self.now().timestamp())}",
+                    payload={"text": "اتصال مرکز مدیریت با موفقیت آزمایش شد."},
+                    available_at=self.now(),
+                )
+            )
+
+    async def _outbox_target(self, session: AsyncSession, topic: str) -> tuple[int, int | None]:
+        row = await session.get(ConfigRow, "management.group")
+        if row:
+            value = row.value
+            thread = value.get("topics", {}).get(topic)
+            if thread:
+                return int(value["chat_id"]), int(thread)
+        return self.order_chat_id, None
+
+    async def storefront_config(self) -> dict:
+        async with self.sessions() as session:
+            row = await session.get(ConfigRow, "storefront.appearance")
+            return dict(row.value) if row else {}
+
+    async def set_storefront_config(self, actor: int, value: dict) -> None:
+        self.owner(actor)
+        allowed_slots = {"catalog", "orders", "account", "support", "kyc", "cards", "back", "home"}
+        for slot, button in value.get("buttons", {}).items():
+            if slot not in allowed_slots or button.get("style", "default") not in {
+                "default",
+                "primary",
+                "success",
+                "danger",
+            }:
+                raise InvalidState("INVALID_STOREFRONT_BUTTON")
+            if button.get("emoji") and not await self.resolve_emoji_key(button["emoji"]):
+                raise InvalidState("ACTIVE_EMOJI_REQUIRED")
+        async with self.sessions.begin() as session:
+            row = await session.get(ConfigRow, "storefront.appearance", with_for_update=True)
+            if row:
+                row.value, row.updated_at = value, self.now()
+            else:
+                session.add(
+                    ConfigRow(key="storefront.appearance", value=value, updated_at=self.now())
+                )
+            await self.audit(session, actor, "storefront.appearance.publish", "storefront")
+
+    async def kyc_page(self) -> dict:
+        async with self.sessions() as session:
+            row = await session.get(ConfigRow, "storefront.kyc")
+            return (
+                dict(row.value)
+                if row
+                else {
+                    "title": "احراز هویت",
+                    "explanation": "برای تکمیل خرید، مدرک هویتی خود را برای بررسی دستی ارسال کنید.",
+                    "privacy": "اطلاعات شما فقط برای بررسی این درخواست استفاده می‌شود.",
+                    "review_time": "زمان بررسی به حجم درخواست‌ها بستگی دارد.",
+                    "start_label": "شروع احراز هویت",
+                    "style": "primary",
+                }
+            )
+
+    async def set_kyc_page(self, actor: int, value: dict) -> None:
+        self.owner(actor)
+        required = {
+            "title",
+            "explanation",
+            "documents",
+            "reason",
+            "privacy",
+            "review_time",
+            "support_target",
+            "start_label",
+            "style",
+        }
+        if (
+            not required.issubset(value)
+            or value["style"] not in {"default", "primary", "success", "danger"}
+            or not all(str(value[key]).strip() for key in required - {"support_target"})
+        ):
+            raise InvalidState("INVALID_KYC_PAGE")
+        if value.get("emoji") and not await self.resolve_emoji_key(value["emoji"]):
+            raise InvalidState("ACTIVE_EMOJI_REQUIRED")
+        async with self.sessions.begin() as session:
+            row = await session.get(ConfigRow, "storefront.kyc", with_for_update=True)
+            if row:
+                row.value, row.updated_at = value, self.now()
+            else:
+                session.add(ConfigRow(key="storefront.kyc", value=value, updated_at=self.now()))
+            await self.audit(session, actor, "storefront.kyc.publish", "storefront.kyc")
+
+    async def account_summary(self, telegram_id: int) -> dict:
+        async with self.sessions.begin() as session:
+            user = await self.user(telegram_id, session)
+            verified_cards = await session.scalar(
+                select(func.count(CustomerCardRow.id)).where(
+                    CustomerCardRow.user_id == user.id, CustomerCardRow.status == "VERIFIED"
+                )
+            )
+            total_orders = await session.scalar(
+                select(func.count(OrderRow.id)).where(OrderRow.user_id == user.id)
+            )
+            active_orders = await session.scalar(
+                select(func.count(OrderRow.id)).where(
+                    OrderRow.user_id == user.id,
+                    OrderRow.status.not_in(
+                        ("DELIVERED", "CANCELLED", "REFUNDED", "PAYMENT_EXPIRED")
+                    ),
+                )
+            )
+            return {
+                "public_code": user.public_code,
+                "kyc_status": user.kyc_status,
+                "verified_cards": int(verified_cards or 0),
+                "total_orders": int(total_orders or 0),
+                "active_orders": int(active_orders or 0),
+                "created_at": user.created_at,
+            }
+
+    async def kyc_status_detail(self, telegram_id: int) -> dict:
+        async with self.sessions.begin() as session:
+            user = await self.user(telegram_id, session)
+            submission = await session.scalar(
+                select(KYCRow)
+                .where(KYCRow.user_id == user.id)
+                .order_by(KYCRow.created_at.desc())
+                .limit(1)
+            )
+            return {
+                "status": user.kyc_status,
+                "reason": submission.reason if submission else None,
+                "public_code": submission.public_code if submission else None,
+            }
 
     async def current_terms(self, session: AsyncSession) -> TermsRow | None:
         return await session.scalar(
@@ -319,11 +490,36 @@ class ShopRepository:
                 ).all()
             )
 
+    async def customer_cards(self, telegram_id: int) -> list[CustomerCardRow]:
+        async with self.sessions.begin() as session:
+            user = await self.user(telegram_id, session)
+            return list(
+                (
+                    await session.scalars(
+                        select(CustomerCardRow)
+                        .where(CustomerCardRow.user_id == user.id)
+                        .order_by(CustomerCardRow.created_at.desc())
+                    )
+                ).all()
+            )
+
     async def submit_kyc(
-        self, telegram_id: int, file_id: str, unique_id: str, file_type: str
+        self,
+        telegram_id: int,
+        file_id: str,
+        unique_id: str,
+        file_type: str,
+        safe_identity: str | None = None,
     ) -> KYCRow:
         async with self.sessions.begin() as session:
             user = await self.user(telegram_id, session)
+            existing = await session.scalar(
+                select(KYCRow)
+                .where(KYCRow.user_id == user.id, KYCRow.status.in_(("PENDING", "UNDER_REVIEW")))
+                .with_for_update()
+            )
+            if existing:
+                raise InvalidState("KYC_ALREADY_PENDING")
             user.kyc_status = "PENDING"
             row = KYCRow(
                 user_id=user.id,
@@ -335,7 +531,30 @@ class ShopRepository:
                 created_at=self.now(),
             )
             session.add(row)
-            await self.audit(session, telegram_id, "kyc.submit", str(row.id))
+            await session.flush()
+            chat_id, thread_id = await self._outbox_target(session, "kyc")
+            session.add(
+                OutboxRow(
+                    kind="KYC_REVIEW",
+                    chat_id=chat_id,
+                    message_thread_id=thread_id,
+                    entity_type="kyc",
+                    entity_id=row.id,
+                    event_key=f"kyc.submitted:{row.id}",
+                    payload={
+                        "public_code": row.public_code,
+                        "telegram_id": telegram_id,
+                        "safe_identity": safe_identity,
+                        "file_id": file_id,
+                        "file_unique_id": unique_id,
+                        "file_type": file_type,
+                        "status": "در انتظار بررسی",
+                        "submitted_at": row.created_at.isoformat(),
+                    },
+                    available_at=self.now(),
+                )
+            )
+            await self.audit(session, telegram_id, "kyc.submit", row.public_code)
             return row
 
     async def review_kyc(
@@ -349,11 +568,64 @@ class ShopRepository:
             if not row or not reason.strip():
                 raise InvalidState("KYC_AND_REASON_REQUIRED")
             user = await session.get(UserRow, row.user_id, with_for_update=True)
-            row.status = user.kyc_status = "VERIFIED" if approved else "REJECTED"
+            target_status = "VERIFIED" if approved else "REJECTED"
+            if row.status == target_status:
+                return
+            if row.status not in {"PENDING", "UNDER_REVIEW"}:
+                raise InvalidState("KYC_REVIEW_ALREADY_FINAL")
+            row.status = user.kyc_status = target_status
             row.evidence_level = "MANUALLY_REVIEWED"
             row.reviewer_id, row.reason, row.reviewed_at = actor, reason, self.now()
             await self.audit(
                 session, actor, "kyc.manual_review", str(row.id), f"decision={row.status}"
+            )
+            session.add(
+                OutboxRow(
+                    kind="KYC_DECISION",
+                    chat_id=user.telegram_id,
+                    entity_type="kyc",
+                    entity_id=row.id,
+                    event_key=f"kyc.decision:{row.id}:{row.status}",
+                    payload={
+                        "public_code": row.public_code,
+                        "approved": approved,
+                        "reason": reason if not approved else None,
+                        "resume": approved,
+                    },
+                    available_at=self.now(),
+                )
+            )
+
+    async def request_kyc_resubmission(self, actor: int, submission_id: UUID, reason: str) -> None:
+        self.owner(actor)
+        if not reason.strip():
+            raise InvalidState("REASON_REQUIRED")
+        async with self.sessions.begin() as session:
+            row = await session.scalar(
+                select(KYCRow).where(KYCRow.id == submission_id).with_for_update()
+            )
+            if not row or row.status not in {"PENDING", "UNDER_REVIEW", "REJECTED"}:
+                raise InvalidState("KYC_REVIEW_ALREADY_FINAL")
+            user = await session.get(UserRow, row.user_id, with_for_update=True)
+            row.status, row.reason = "RESUBMISSION_REQUESTED", reason
+            row.reviewer_id, row.reviewed_at = actor, self.now()
+            user.kyc_status = "REJECTED"
+            await self.audit(session, actor, "kyc.resubmission_requested", row.public_code)
+            session.add(
+                OutboxRow(
+                    kind="KYC_DECISION",
+                    chat_id=user.telegram_id,
+                    entity_type="kyc",
+                    entity_id=row.id,
+                    event_key=f"kyc.resubmit:{row.id}",
+                    payload={
+                        "public_code": row.public_code,
+                        "approved": False,
+                        "reason": reason,
+                        "resume": False,
+                    },
+                    available_at=self.now(),
+                )
             )
 
     async def review_card(self, actor: int, card_id: UUID, approved: bool, reason: str) -> None:
@@ -366,14 +638,37 @@ class ShopRepository:
             )
             if not card:
                 raise InvalidState("CARD_NOT_FOUND")
-            card.status = "VERIFIED" if approved else "REJECTED"
+            target_status = "VERIFIED" if approved else "REJECTED"
+            if card.status == target_status:
+                return
+            if card.status != "PENDING_VERIFICATION":
+                raise InvalidState("CARD_REVIEW_ALREADY_FINAL")
+            card.status = target_status
+            card.reason = reason
             card.verified_by, card.verified_at = actor, self.now() if approved else None
+            user = await session.get(UserRow, card.user_id)
             await self.audit(
                 session,
                 actor,
                 "customer_card.manual_review",
                 str(card.id),
                 f"decision={card.status}",
+            )
+            session.add(
+                OutboxRow(
+                    kind="CARD_DECISION",
+                    chat_id=user.telegram_id,
+                    entity_type="card",
+                    entity_id=card.id,
+                    event_key=f"card.decision:{card.id}:{card.status}",
+                    payload={
+                        "public_code": card.public_code,
+                        "approved": approved,
+                        "reason": reason if not approved else None,
+                        "resume": approved,
+                    },
+                    available_at=self.now(),
+                )
             )
 
     async def kyc_queue(self, actor: int) -> list[KYCRow]:
@@ -1213,7 +1508,14 @@ class ShopRepository:
             )
 
     async def submit_customer_card(
-        self, telegram_id: int, bank: str, pan: str, evidence_file_id: str
+        self,
+        telegram_id: int,
+        bank: str,
+        pan: str,
+        evidence_file_id: str,
+        evidence_unique_id: str | None = None,
+        evidence_type: str = "document",
+        safe_identity: str | None = None,
     ) -> CustomerCardRow:
         digits = "".join(c for c in pan if c.isdigit())
         if len(digits) != 16:
@@ -1229,9 +1531,37 @@ class ShopRepository:
                 fingerprint=pan_fingerprint(digits, self.hmac_key),
                 status="PENDING_VERIFICATION",
                 evidence_file_id=evidence_file_id,
+                evidence_unique_id=evidence_unique_id or f"legacy:{evidence_file_id}",
+                evidence_type=evidence_type,
+                created_at=self.now(),
             )
             session.add(row)
-            await self.audit(session, telegram_id, "customer_card.submit", str(row.id))
+            await session.flush()
+            chat_id, thread_id = await self._outbox_target(session, "cards")
+            session.add(
+                OutboxRow(
+                    kind="CARD_REVIEW",
+                    chat_id=chat_id,
+                    message_thread_id=thread_id,
+                    entity_type="card",
+                    entity_id=row.id,
+                    event_key=f"card.submitted:{row.id}",
+                    payload={
+                        "public_code": row.public_code,
+                        "telegram_id": telegram_id,
+                        "safe_identity": safe_identity,
+                        "bank_name": row.bank_name,
+                        "masked_pan": row.masked_pan,
+                        "file_id": evidence_file_id,
+                        "file_unique_id": row.evidence_unique_id,
+                        "file_type": evidence_type,
+                        "status": "در انتظار بررسی",
+                        "submitted_at": row.created_at.isoformat(),
+                    },
+                    available_at=self.now(),
+                )
+            )
+            await self.audit(session, telegram_id, "customer_card.submit", row.public_code)
             return row
 
     async def create_quote(self, telegram_id: int, product_id: UUID, card_id: UUID) -> QuoteRow:
@@ -1280,10 +1610,15 @@ class ShopRepository:
                         raise InvalidState("CURRENCY_RATE_NOT_CONFIGURED")
                     if rate.source == "api" and rate.valid_until <= self.now():
                         async with self.sessions.begin() as notification_session:
+                            chat_id, thread_id = await self._outbox_target(
+                                notification_session, "system"
+                            )
                             notification_session.add(
                                 OutboxRow(
                                     kind="FX_RATE_STALE",
-                                    chat_id=self.notification_chat_id,
+                                    chat_id=chat_id,
+                                    message_thread_id=thread_id,
+                                    event_key=f"fx.stale:{product.base_cost_currency}:{rate.version}",
                                     payload={"currency": product.base_cost_currency},
                                     available_at=self.now(),
                                 )
@@ -1339,6 +1674,9 @@ class ShopRepository:
                         "rate_version": rate.version if rate else None,
                         "currency_buffer_percent": str(currency_buffer),
                         "pricing": config,
+                        "selected_card_id": str(card.id),
+                        "selected_card_bank": card.bank_name,
+                        "selected_card_masked": card.masked_pan,
                     },
                     rate=int(effective_rate),
                     final_toman=final,
@@ -1376,6 +1714,17 @@ class ShopRepository:
                 )
                 if existing:
                     return existing
+                selected_card = await session.scalar(
+                    select(CustomerCardRow)
+                    .where(
+                        CustomerCardRow.id == quote.selected_card_id,
+                        CustomerCardRow.user_id == user.id,
+                        CustomerCardRow.status == "VERIFIED",
+                    )
+                    .with_for_update()
+                )
+                if not selected_card:
+                    raise AccessDenied("VERIFIED_OWN_CARD_REQUIRED")
                 today = self.now().replace(hour=0, minute=0, second=0, microsecond=0)
                 merchants = list(
                     (
@@ -1478,7 +1827,13 @@ class ShopRepository:
             return fresh
 
     async def submit_receipt(
-        self, telegram_id: int, order_id: UUID, file_id: str, unique_id: str, file_type: str
+        self,
+        telegram_id: int,
+        order_id: UUID,
+        file_id: str,
+        unique_id: str,
+        file_type: str,
+        safe_identity: str | None = None,
     ) -> PaymentRow:
         async with self.sessions.begin() as session:
             user = await self.user(telegram_id, session)
@@ -1496,19 +1851,35 @@ class ShopRepository:
             late = self.now() >= quote.expires_at
             payment.status = "LATE_PAYMENT_REVIEW" if late else "AWAITING_RECONCILIATION"
             order.status = "MANUAL_REVIEW" if late else "AWAITING_RECONCILIATION"
+            product = await session.get(ProductRow, quote.product_id)
+            chat_id, thread_id = await self._outbox_target(session, "orders")
             session.add(
                 OutboxRow(
                     kind="PAYMENT_REVIEW",
-                    chat_id=self.order_chat_id,
+                    chat_id=chat_id,
+                    message_thread_id=thread_id,
+                    entity_type="order",
+                    entity_id=order.id,
+                    event_key=f"receipt.submitted:{payment.id}:{unique_id}",
                     payload={
-                        "order_id": str(order.id),
-                        "receipt_file_id": file_id,
-                        "warning": "receipt_is_not_payment_proof",
+                        "public_code": order.public_code,
+                        "telegram_id": telegram_id,
+                        "safe_identity": safe_identity,
+                        "product_title": product.title,
+                        "amount_toman": order.amount_toman,
+                        "source_bank": quote.snapshot.get("selected_card_bank"),
+                        "source_masked": quote.snapshot.get("selected_card_masked"),
+                        "file_id": file_id,
+                        "file_unique_id": unique_id,
+                        "file_type": file_type,
+                        "late": late,
+                        "warning": "رسید به‌تنهایی اثبات پرداخت نیست.",
+                        "submitted_at": payment.submitted_at.isoformat(),
                     },
                     available_at=self.now(),
                 )
             )
-            await self.audit(session, telegram_id, "receipt.submit", str(order.id))
+            await self.audit(session, telegram_id, "receipt.submit", order.public_code)
             return payment
 
     async def manual_reconcile(
@@ -1536,11 +1907,16 @@ class ShopRepository:
                 reason,
             )
             if approved:
+                chat_id, thread_id = await self._outbox_target(session, "orders")
                 session.add(
                     OutboxRow(
                         kind="FULFILLMENT_READY",
-                        chat_id=self.order_chat_id,
-                        payload={"order_id": str(order_id)},
+                        chat_id=chat_id,
+                        message_thread_id=thread_id,
+                        entity_type="order",
+                        entity_id=order_id,
+                        event_key=f"fulfillment.ready:{order_id}",
+                        payload={"order_id": str(order_id), "public_code": order.public_code},
                         available_at=self.now(),
                     )
                 )
@@ -1559,6 +1935,24 @@ class ShopRepository:
             )
             if result.rowcount != 1:
                 raise InvalidState("ALREADY_CLAIMED")
+            claimed = await session.get(OrderRow, order_id)
+            chat_id, thread_id = await self._outbox_target(session, "orders")
+            session.add(
+                OutboxRow(
+                    kind="ORDER_CLAIMED",
+                    chat_id=chat_id,
+                    message_thread_id=thread_id,
+                    entity_type="order",
+                    entity_id=order_id,
+                    event_key=f"order.claimed:{order_id}",
+                    payload={
+                        "order_id": str(order_id),
+                        "public_code": claimed.public_code,
+                        "actor_id": actor,
+                    },
+                    available_at=self.now(),
+                )
+            )
             await self.audit(session, actor, "order.claim", str(order_id))
             return True
 
@@ -1603,11 +1997,27 @@ class ShopRepository:
                 OutboxRow(
                     kind="ORDER_DELIVERED",
                     chat_id=user.telegram_id,
+                    entity_type="order",
+                    entity_id=order.id,
+                    event_key=f"order.delivered:{order.id}",
                     payload={
                         "order_id": str(order.id),
                         "content": content,
                         "activation_link": activation_link,
                     },
+                    available_at=self.now(),
+                )
+            )
+            management_chat, management_thread = await self._outbox_target(session, "orders")
+            session.add(
+                OutboxRow(
+                    kind="DELIVERY_RECORDED",
+                    chat_id=management_chat,
+                    message_thread_id=management_thread,
+                    entity_type="order",
+                    entity_id=order.id,
+                    event_key=f"order.delivery.recorded:{order.id}",
+                    payload={"order_id": str(order.id), "public_code": order.public_code},
                     available_at=self.now(),
                 )
             )
