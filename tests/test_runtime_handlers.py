@@ -677,3 +677,55 @@ async def test_pricing_wizard_maps_each_value_and_renders_confirmation():
     await callback(QueryFake(back, owner, actor=1))
     draft = json.loads(await repo.coordinator.redis.get("admin-draft:1"))
     assert draft["step"] == 2
+
+
+@pytest.mark.asyncio
+async def test_limited_stock_sentinel_accepts_quantity_and_opens_kyc_choice():
+    repo, owner = RepoFake(), MessageFake(actor=1)
+    router = persistent_router(repo)
+    callback = handler(router, "callback_query", "callback")
+    form = handler(router, "message", "form_text")
+    data = {"title": "Product", "unlimited_stock": False}
+    await repo.coordinator.redis.set("fsm:1", "admin.wizard", ex=900)
+    await repo.coordinator.redis.set(
+        "admin-draft:1",
+        json.dumps({"kind": "product", "step": 11, "data": data}),
+        ex=900,
+    )
+
+    limited = await repo.coordinator.issue_callback(
+        "admin.wizard.choice", 1, "limited", one_time=True
+    )
+    await callback(QueryFake(limited, owner, actor=1))
+    draft = json.loads(await repo.coordinator.redis.get("admin-draft:1"))
+    assert draft["step"] == 120
+    assert "تعداد موجودی" in owner.answers[-1][0]
+
+    owner.text = "7"
+    await form(owner)
+    draft = json.loads(await repo.coordinator.redis.get("admin-draft:1"))
+    assert draft["step"] == 13 and draft["data"]["stock"] == 7
+    labels = [
+        button.text
+        for row in owner.answers[-1][1]["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    assert "لازم است" in labels and "لازم نیست" in labels
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("step", "kind", "expected"),
+    ((31, "product", 3), (40, "merchant", 4), (120, "product", 11), (160, "product", 17)),
+)
+async def test_wizard_sentinel_back_targets(step, kind, expected):
+    repo, owner = RepoFake(), MessageFake(actor=1)
+    callback = handler(persistent_router(repo), "callback_query", "callback")
+    await repo.coordinator.redis.set("fsm:1", "admin.wizard", ex=900)
+    await repo.coordinator.redis.set(
+        "admin-draft:1", json.dumps({"kind": kind, "step": step, "data": {}}), ex=900
+    )
+    back = await repo.coordinator.issue_callback("admin.wizard.back", 1, one_time=True)
+    await callback(QueryFake(back, owner, actor=1))
+    draft = json.loads(await repo.coordinator.redis.get("admin-draft:1"))
+    assert draft["step"] == expected

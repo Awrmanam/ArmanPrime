@@ -889,8 +889,12 @@ def persistent_router(repo: ShopRepository) -> Router:
                     raise AccessDenied("FORM_EXPIRED")
                 if draft["step"] == 40:
                     draft["step"] = 4 if draft["kind"] == "merchant" else 3
+                elif draft["step"] == 31:
+                    draft["step"] = 3
+                elif draft["step"] == 120:
+                    draft["step"] = 11
                 elif draft["step"] == 160:
-                    draft["step"] = 16
+                    draft["step"] = 17
                 else:
                     draft["step"] = max(0, draft["step"] - 1)
                 await set_wizard(
@@ -1650,10 +1654,10 @@ def persistent_router(repo: ShopRepository) -> Router:
                     if not value.startswith("https://"):
                         raise ValueError("HTTPS_URL_REQUIRED")
                     data["action"], next_step = value, 2
-                elif kind == "product" and step == 11:
+                elif kind == "product" and step == 120:
                     if not value.isdigit() or int(value) < 0:
                         raise ValueError("NON_NEGATIVE_NUMBER_REQUIRED")
-                    data["stock"], next_step = int(value), 12
+                    data["stock"], next_step = int(value), 13
                 else:
                     index = step
                     field = fields.get(kind, [])[index]
