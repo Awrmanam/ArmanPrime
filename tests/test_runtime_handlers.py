@@ -458,16 +458,30 @@ async def test_admin_rbac_menu_queues_and_decision_forms():
     await callback(QueryFake(token, owner, actor=1))
     assert await repo.coordinator.redis.get("fsm:1") == "admin.wizard"
     draft = json.loads(await repo.coordinator.redis.get("admin-draft:1"))
-    assert draft == {
-        "kind": "button",
-        "step": 0,
-        "data": {"page_id": str(page_id)},
-        "version": 1,
-    }
+    assert draft["kind"] == "button"
+    assert draft["step"] == 0
+    assert draft["data"] == {"page_id": str(page_id)}
+    assert isinstance(draft["version"], int) and draft["version"] > 0
     wizard_callback = owner.answers[-1][1]["reply_markup"].inline_keyboard[-1][0].callback_data
-    assert (await repo.coordinator.resolve_callback(wizard_callback, 1))["a"] == (
-        "admin.wizard.back"
+    wizard_state = await repo.coordinator.resolve_callback(wizard_callback, 1)
+    assert wizard_state["a"] == "admin.wizard.back"
+    assert wizard_state["v"] == draft["version"]
+
+    stale = await repo.coordinator.issue_callback(
+        "admin.wizard.choice", 1, "confirm", version=draft["version"] - 1, one_time=True
     )
+    stale_query = QueryFake(stale, owner, actor=1)
+    await callback(stale_query)
+    assert json.loads(await repo.coordinator.redis.get("admin-draft:1")) == draft
+    assert stale_query.answers[-1][1]["show_alert"] is True
+
+    await callback(QueryFake(wizard_callback, owner, actor=1))
+    advanced = json.loads(await repo.coordinator.redis.get("admin-draft:1"))
+    assert advanced["version"] > draft["version"]
+    replay = QueryFake(wizard_callback, owner, actor=1)
+    await callback(replay)
+    assert json.loads(await repo.coordinator.redis.get("admin-draft:1")) == advanced
+    assert replay.answers[-1][1]["show_alert"] is True
 
     category_id = uuid4()
     token = await repo.coordinator.issue_callback(
@@ -646,14 +660,28 @@ async def test_admin_text_forms_claim_delivery_and_emoji():
 @pytest.mark.asyncio
 async def test_simple_pricing_wizard_collects_markup_and_rounding():
     repo, owner = RepoFake(), MessageFake(actor=1)
+    repo.set_pricing = AsyncMock()
     router = persistent_router(repo)
     callback = handler(router, "callback_query", "callback")
     form = handler(router, "message", "form_text")
     start = await repo.coordinator.issue_callback("admin.pricing", 1)
     await callback(QueryFake(start, owner, actor=1))
+    assert "درصد سود" in owner.answers[-1][0]
+    assert "پیش‌نمایش" not in owner.answers[-1][0]
+
+    owner.text = "نامعتبر"
+    await form(owner)
+    draft = json.loads(await repo.coordinator.redis.get("admin-draft:1"))
+    assert draft["step"] == 0 and draft["data"] == {}
+
     owner.text = "12.5"
     await form(owner)
-    rounding = owner.answers[-1][1]["reply_markup"].inline_keyboard[1][0].callback_data
+    rounding_buttons = {
+        button.text: button.callback_data
+        for row in owner.answers[-1][1]["reply_markup"].inline_keyboard
+        for button in row
+    }
+    rounding = rounding_buttons["گرد کردن به ۱٬۰۰۰ تومان"]
     await callback(QueryFake(rounding, owner, actor=1))
     draft = json.loads(await repo.coordinator.redis.get("admin-draft:1"))
     assert draft["data"] == {"percent": "12.5", "rounding_increment_toman": 1000}
@@ -661,6 +689,12 @@ async def test_simple_pricing_wizard_collects_markup_and_rounding():
     assert "platform_fee" not in owner.answers[-1][0]
     confirm = owner.answers[-1][1]["reply_markup"].inline_keyboard[0][0]
     assert confirm.text == "تأیید و ثبت"
+    await callback(QueryFake(confirm.callback_data, owner, actor=1))
+    repo.set_pricing.assert_awaited_once()
+    replay = QueryFake(confirm.callback_data, owner, actor=1)
+    await callback(replay)
+    repo.set_pricing.assert_awaited_once()
+    assert replay.answers[-1][1]["show_alert"] is True
 
 
 @pytest.mark.asyncio
@@ -673,12 +707,12 @@ async def test_limited_stock_sentinel_accepts_quantity_and_opens_kyc_choice():
     await repo.coordinator.redis.set("fsm:1", "admin.wizard", ex=900)
     await repo.coordinator.redis.set(
         "admin-draft:1",
-        json.dumps({"kind": "product", "step": 5, "data": data}),
+        json.dumps({"kind": "product", "step": 5, "data": data, "version": 3}),
         ex=900,
     )
 
     limited = await repo.coordinator.issue_callback(
-        "admin.wizard.choice", 1, "limited", one_time=True
+        "admin.wizard.choice", 1, "limited", version=3, one_time=True
     )
     await callback(QueryFake(limited, owner, actor=1))
     draft = json.loads(await repo.coordinator.redis.get("admin-draft:1"))
@@ -707,9 +741,11 @@ async def test_wizard_sentinel_back_targets(step, kind, expected):
     callback = handler(persistent_router(repo), "callback_query", "callback")
     await repo.coordinator.redis.set("fsm:1", "admin.wizard", ex=900)
     await repo.coordinator.redis.set(
-        "admin-draft:1", json.dumps({"kind": kind, "step": step, "data": {}}), ex=900
+        "admin-draft:1",
+        json.dumps({"kind": kind, "step": step, "data": {}, "version": 2}),
+        ex=900,
     )
-    back = await repo.coordinator.issue_callback("admin.wizard.back", 1, one_time=True)
+    back = await repo.coordinator.issue_callback("admin.wizard.back", 1, version=2, one_time=True)
     await callback(QueryFake(back, owner, actor=1))
     draft = json.loads(await repo.coordinator.redis.get("admin-draft:1"))
     assert draft["step"] == expected

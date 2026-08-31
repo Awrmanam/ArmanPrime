@@ -116,12 +116,20 @@ def persistent_router(repo: ShopRepository) -> Router:
         )
 
     async def wizard_buttons(actor: int, *, skip: bool = False) -> list[Button]:
+        draft = await load_draft(actor)
+        version = int(draft.get("version", 0))
         result = []
         if skip:
-            token = await repo.coordinator.issue_callback("admin.wizard.skip", actor, one_time=True)
+            token = await repo.coordinator.issue_callback(
+                "admin.wizard.skip", actor, version=version, one_time=True
+            )
             result.append(Button("رد کردن", token))
-        back = await repo.coordinator.issue_callback("admin.wizard.back", actor, one_time=True)
-        cancel = await repo.coordinator.issue_callback("admin.wizard.cancel", actor, one_time=True)
+        back = await repo.coordinator.issue_callback(
+            "admin.wizard.back", actor, version=version, one_time=True
+        )
+        cancel = await repo.coordinator.issue_callback(
+            "admin.wizard.cancel", actor, version=version, one_time=True
+        )
         result.extend((Button("بازگشت", back), Button("لغو", cancel, "danger")))
         return result
 
@@ -145,10 +153,12 @@ def persistent_router(repo: ShopRepository) -> Router:
         await render_wizard(target, actor)
 
     async def choice_rows(actor: int, choices: list[tuple[str, str]]) -> list[list[Button]]:
+        draft = await load_draft(actor)
+        version = int(draft.get("version", 0))
         rows = []
         for label, value in choices:
             token = await repo.coordinator.issue_callback(
-                "admin.wizard.choice", actor, value, one_time=True
+                "admin.wizard.choice", actor, value, version=version, one_time=True
             )
             rows.append([Button(label, token)])
         rows.append(await wizard_buttons(actor))
@@ -157,6 +167,17 @@ def persistent_router(repo: ShopRepository) -> Router:
     async def render_wizard(message: Message, actor: int) -> None:
         draft = await load_draft(actor)
         kind, step, data = draft["kind"], draft["step"], draft["data"]
+        pricing_complete = {"percent", "rounding_increment_toman"}.issubset(data)
+        if kind == "pricing" and (
+            (step == 1 and "percent" not in data) or (step == 2 and not pricing_complete)
+        ):
+            await save_draft(actor, {"kind": "pricing", "step": 0, "data": {}})
+            await answer_keyboard(
+                message,
+                "اطلاعات قیمت‌گذاری ناقص بود. لطفاً درصد سود را دوباره وارد کنید.",
+                [await wizard_buttons(actor)],
+            )
+            return
         if kind == "rate" and step == 0:
             currencies = ("USD", "RUB", "EUR", "TRY", "AED", "GBP", "CNY", "INR", "SGD", "EGP")
             await answer_keyboard(
@@ -235,7 +256,7 @@ def persistent_router(repo: ShopRepository) -> Router:
             "pricing": [("درصد سود روی هزینه خرید", False)],
         }
         text_steps = definitions.get(kind, [])
-        text_index = step - 1 if kind == "pricing" else step
+        text_index = step
         if 0 <= text_index < len(text_steps):
             title, optional = text_steps[text_index]
             await answer_keyboard(
@@ -297,9 +318,9 @@ def persistent_router(repo: ShopRepository) -> Router:
                     actor,
                     [
                         ("بدون گرد کردن", "1"),
-                        ("نزدیک‌ترین ۱٬۰۰۰ تومان", "1000"),
-                        ("نزدیک‌ترین ۵٬۰۰۰ تومان", "5000"),
-                        ("نزدیک‌ترین ۱۰٬۰۰۰ تومان", "10000"),
+                        ("گرد کردن به ۱٬۰۰۰ تومان", "1000"),
+                        ("گرد کردن به ۵٬۰۰۰ تومان", "5000"),
+                        ("گرد کردن به ۱۰٬۰۰۰ تومان", "10000"),
                     ],
                 ),
             )
@@ -711,6 +732,12 @@ def persistent_router(repo: ShopRepository) -> Router:
             data["choice"], step = value, step + 1
         await set_wizard(message, actor, kind, step, data)
 
+    async def require_current_wizard_callback(actor: int, state: dict) -> dict:
+        draft = await load_draft(actor)
+        if not draft or int(state.get("v", -1)) != int(draft.get("version", -2)):
+            raise AccessDenied("WIZARD_DRAFT_CHANGED")
+        return draft
+
     async def admin_home(message: Message, actor_id: int) -> None:
         repo.owner(actor_id)
         status = await repo.setup_status(actor_id)
@@ -844,6 +871,7 @@ def persistent_router(repo: ShopRepository) -> Router:
                 await repo.accept_terms(query.from_user.id, UUID(state["o"]))
                 await home(query.message, query.from_user.id)
             elif state["a"] == "admin.wizard.choice":
+                await require_current_wizard_callback(query.from_user.id, state)
                 await handle_wizard_choice(query.message, query.from_user.id, state["o"])
             elif state["a"] == "admin.product.confirm":
                 draft = await load_draft(query.from_user.id)
@@ -856,9 +884,7 @@ def persistent_router(repo: ShopRepository) -> Router:
                     raise AccessDenied("PRODUCT_DRAFT_CHANGED")
                 await finish_wizard(query.message, query.from_user.id, draft)
             elif state["a"] == "admin.wizard.skip":
-                draft = await load_draft(query.from_user.id)
-                if not draft:
-                    raise AccessDenied("FORM_EXPIRED")
+                draft = await require_current_wizard_callback(query.from_user.id, state)
                 kind, step, data = draft["kind"], draft["step"], draft["data"]
                 fields = {
                     "terms": ["title", "body", "extra"],
@@ -885,9 +911,7 @@ def persistent_router(repo: ShopRepository) -> Router:
                     data[field] = "0" if kind in {"pricing", "rate"} else None
                 await set_wizard(query.message, query.from_user.id, kind, step + 1, data)
             elif state["a"] == "admin.wizard.back":
-                draft = await load_draft(query.from_user.id)
-                if not draft:
-                    raise AccessDenied("FORM_EXPIRED")
+                draft = await require_current_wizard_callback(query.from_user.id, state)
                 if draft["step"] == 40:
                     draft["step"] = 4 if draft["kind"] == "merchant" else 3
                 elif draft["step"] == 31:

@@ -181,5 +181,5 @@ async def test_real_dispatcher_processes_start_consent_and_home():
     )
     denial = [call for call in session.calls if isinstance(call, AnswerCallbackQuery)][-1]
     assert denial.show_alert is True
-    assert denial.text == "درخواست معتبر نیست."
+    assert denial.text == "این درخواست منقضی شده است؛ دوباره تلاش کنید."
     await bot.session.close()

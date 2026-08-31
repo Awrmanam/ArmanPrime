@@ -182,7 +182,7 @@ async def test_full_dispatcher_acceptance_persists_after_reconstruction():
     await telegram.click(100, "تأیید نرخ")
     await telegram.click(100, "قیمت‌گذاری")
     await telegram.send(100, "10")
-    await telegram.click(100, "نزدیک‌ترین ۱٬۰۰۰")
+    await telegram.click(100, "گرد کردن به ۱٬۰۰۰ تومان")
     await telegram.click(100, "تأیید و ثبت")
 
     await telegram.send(100, "/admin")
