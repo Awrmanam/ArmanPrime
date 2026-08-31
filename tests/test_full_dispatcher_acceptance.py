@@ -241,7 +241,9 @@ async def test_full_dispatcher_acceptance_persists_after_reconstruction():
     await telegram.send(100, "مدرک هویتی به‌صورت دستی بررسی شد")
 
     await telegram.send(200, "/start")
-    await telegram.click(200, "کارت‌های بانکی")
+    await telegram.click(200, "حساب کاربری")
+    await telegram.click(200, "کارت‌های بانکی من")
+    await telegram.click(200, "ثبت کارت جدید")
     await telegram.send(200, "Customer Bank")
     await telegram.send(200, "4111111111111111")
     await telegram.send(200, photo_unique="card-evidence")
