@@ -166,6 +166,26 @@ async def test_management_topics_receive_kyc_and_card_media_without_pan(reposito
 
 
 @pytest.mark.asyncio
+async def test_management_group_validation_system_routing_and_disconnect(repository):
+    with pytest.raises(InvalidState, match="MANAGEMENT_TOPICS_REQUIRED"):
+        await repository.configure_management_group(100, -100123, {"orders": 10})
+
+    topics = {"orders": 10, "kyc": 11, "cards": 12, "system": 13}
+    await repository.configure_management_group(100, -100123, topics)
+    group = await repository.management_group(100)
+    assert group["chat_id"] == -100123 and group["topics"] == topics
+    assert group["connected_at"]
+    await repository.enqueue_management_test(100)
+    async with repository.sessions() as session:
+        event = await session.scalar(select(OutboxRow).where(OutboxRow.kind == "SYSTEM_TEST"))
+        assert event.chat_id == -100123 and event.message_thread_id == 13
+        assert event.payload["text"] == "اتصال مرکز مدیریت با موفقیت آزمایش شد."
+
+    await repository.disconnect_management_group(100)
+    assert await repository.management_group(100) is None
+
+
+@pytest.mark.asyncio
 async def test_gates_requote_reservation_and_duplicate_receipt(repository):
     product, card = await configure_checkout(repository)
     with pytest.raises(AccessDenied):

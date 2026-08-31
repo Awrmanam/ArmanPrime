@@ -437,6 +437,85 @@ async def test_buy_gate_provides_actionable_kyc_and_card_buttons():
 
 
 @pytest.mark.asyncio
+async def test_blocked_user_cannot_reach_cards_or_quote():
+    repo, message = RepoFake(), MessageFake()
+    repo.user = AsyncMock(
+        return_value=SimpleNamespace(
+            id=uuid4(), telegram_id=2, kyc_status="VERIFIED", risk_status="BLOCKED"
+        )
+    )
+    repo.verified_cards = AsyncMock()
+    repo.create_quote = AsyncMock()
+    callback = handler(persistent_router(repo), "callback_query", "callback")
+    buy = await repo.coordinator.issue_callback("buy", 2, str(uuid4()))
+
+    await callback(QueryFake(buy, message))
+
+    assert "امکان خرید" in message.answers[-1][0]
+    repo.verified_cards.assert_not_awaited()
+    repo.create_quote.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    (
+        ("NOT_STARTED", "برای تکمیل خرید"),
+        ("PENDING", "در انتظار بررسی"),
+        ("UNDER_REVIEW", "در انتظار بررسی"),
+        ("REJECTED", "مدرک خوانا نبود"),
+    ),
+)
+async def test_buy_kyc_states_render_controlled_persian_pages(status, expected):
+    repo, message = RepoFake(), MessageFake()
+    repo.user = AsyncMock(
+        return_value=SimpleNamespace(
+            id=uuid4(), telegram_id=2, kyc_status=status, risk_status="CLEAR"
+        )
+    )
+    repo.kyc_status_detail = AsyncMock(
+        return_value={"reason": "مدرک خوانا نبود" if status == "REJECTED" else None}
+    )
+    repo.verified_cards = AsyncMock()
+    callback = handler(persistent_router(repo), "callback_query", "callback")
+    product_id = uuid4()
+    buy = await repo.coordinator.issue_callback("buy", 2, str(product_id))
+
+    await callback(QueryFake(buy, message))
+
+    assert expected in message.answers[-1][0]
+    assert await repo.coordinator.redis.get("pending-checkout:2") == str(product_id)
+    repo.verified_cards.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resume_checkout_recovers_product_or_catalog_safely():
+    repo, message = RepoFake(), MessageFake()
+    callback = handler(persistent_router(repo), "callback_query", "callback")
+    product_id = uuid4()
+    resume = await repo.coordinator.issue_callback(
+        "resume_checkout", 2, str(product_id), one_time=True
+    )
+    await callback(QueryFake(resume, message))
+    assert "ادامه خرید" in message.answers[-1][0]
+    actions = {
+        repo.coordinator.state[button.callback_data]["a"]
+        for row in message.answers[-1][1]["reply_markup"].inline_keyboard
+        for button in row
+    }
+    assert "buy" in actions
+
+    repo.product = AsyncMock(return_value=None)
+    expired_product = await repo.coordinator.issue_callback(
+        "resume_checkout", 2, str(uuid4()), one_time=True
+    )
+    await callback(QueryFake(expired_product, message))
+    assert "دیگر در دسترس نیست" in message.answers[-1][0]
+    fallback = message.answers[-1][1]["reply_markup"].inline_keyboard[0][0].callback_data
+    assert repo.coordinator.state[fallback]["a"] == "catalog"
+
+
+@pytest.mark.asyncio
 async def test_missing_or_inactive_registry_emoji_renders_clean_text():
     repo, message = RepoFake(), MessageFake()
     repo.resolve_emoji_key = AsyncMock(return_value=None)
