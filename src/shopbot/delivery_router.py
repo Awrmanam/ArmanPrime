@@ -211,7 +211,8 @@ class DeliveryFlow:
                 self.repo,
                 message,
                 f"ثبت تحویل\n\n{_title(context)}\nروش انجام: {method}\n\n"
-                "اگر فعال‌سازی انجام شده، می‌توانید مستقیم تحویل را ثبت کنید یا برای مشتری توضیح اضافه کنید.",
+                "اگر فعال‌سازی انجام شده، می‌توانید مستقیم تحویل را ثبت کنید "
+                "یا برای مشتری توضیح اضافه کنید.",
                 [
                     [Button("فعال‌سازی انجام شد", complete, "success")],
                     [Button("افزودن توضیح", note, "primary")],
@@ -321,7 +322,7 @@ class DeliveryFlow:
             try:
                 _, order_raw, step = state.split(":", 2)
                 order_id = UUID(order_raw)
-                context = await self._context(actor, order_id)
+                await self._context(actor, order_id)
                 data = await self._load_draft(actor, order_id)
                 value = message.text.strip()
                 if not value:
