@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi.testclient import TestClient
 
+import shopbot.enhanced as enhanced_module
 import shopbot.runtime as runtime_module
 from shopbot.config import Settings
 
@@ -117,7 +118,7 @@ def test_webhook_secret_dispatch_and_lifecycle(monkeypatch):
 
 def test_api_module_builds_application(monkeypatch):
     marker = object()
-    monkeypatch.setattr(runtime_module, "create_app", lambda _: marker)
+    monkeypatch.setattr(enhanced_module, "create_app", lambda _: marker)
     sys.modules.pop("shopbot.api", None)
     module = importlib.import_module("shopbot.api")
     assert module.app is marker
