@@ -44,8 +44,7 @@ async def _send(
         plain_rows = None
         if rows:
             plain_rows = [
-                [Button(button.text, button.callback_data) for button in row]
-                for row in rows
+                [Button(button.text, button.callback_data) for button in row] for row in rows
             ]
         return await message.answer(
             rendered.fallback,
@@ -158,9 +157,7 @@ class DeliveryFlow:
 
     async def _save_draft(self, actor: int, order_id: UUID, data: dict) -> None:
         encrypted = self.repo.vault.encrypt(json.dumps(data, ensure_ascii=False))
-        await self.repo.coordinator.redis.set(
-            self._draft_key(actor, order_id), encrypted, ex=1800
-        )
+        await self.repo.coordinator.redis.set(self._draft_key(actor, order_id), encrypted, ex=1800)
 
     async def _clear(self, actor: int, order_id: UUID) -> None:
         await self.repo.coordinator.redis.delete(
@@ -172,11 +169,7 @@ class DeliveryFlow:
         self.repo.owner(actor)
         async with self.repo.sessions() as session:
             order = await session.get(OrderRow, order_id)
-            if (
-                not order
-                or order.status != "PROCESSING"
-                or order.assigned_admin_id != actor
-            ):
+            if not order or order.status != "PROCESSING" or order.assigned_admin_id != actor:
                 raise AccessDenied("CLAIMING_ADMIN_REQUIRED")
 
     async def _context(self, actor: int, order_id: UUID) -> dict:
@@ -345,8 +338,7 @@ class DeliveryFlow:
                     await _send(
                         self.repo,
                         message,
-                        "رمز عبور اکانت آماده را ارسال کنید.\n"
-                        "پیام شما بعد از پردازش حذف می‌شود.",
+                        "رمز عبور اکانت آماده را ارسال کنید.\nپیام شما بعد از پردازش حذف می‌شود.",
                     )
                 elif step == "password":
                     data["password"] = value
