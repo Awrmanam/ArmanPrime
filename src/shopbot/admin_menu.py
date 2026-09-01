@@ -7,7 +7,6 @@ from aiogram.types import CallbackQuery, Message
 from .repository import AccessDenied, ShopRepository
 from .telegram_adapter import Button
 
-
 ADMIN_SECTIONS: dict[str, tuple[str, str, tuple[tuple[str, str, str], ...]]] = {
     "catalog": (
         "🛍 فروشگاه و محصولات",
