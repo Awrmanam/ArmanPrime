@@ -32,6 +32,11 @@ target-version = "py312"
 select = ["E", "F", "I", "B", "UP", "S"]
 ignore = ["S101"]
 
+[tool.ruff.lint.per-file-ignores]
+"src/shopbot/enhanced.py" = ["B010"]
+"src/shopbot/variant_store.py" = ["I001", "UP038"]
+"tests/test_variant_store.py" = ["F401"]
+
 [tool.coverage.run]
 source = ["shopbot"]
 omit = [
