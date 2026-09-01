@@ -58,7 +58,7 @@ ADMIN_SECTIONS: dict[str, tuple[str, str, tuple[tuple[str, str, str], ...]]] = {
 ADMIN_HOME_TEXT = (
     "⚙️ پنل مدیریت\n\nبخش موردنظر را انتخاب کنید. تنظیمات مرتبط داخل همان بخش قرار دارند."
 )
-LEGACY_ADMIN_PREFIX = "پنل مدیریت\n\nوضعیت آمادگی فروشگاه:"
+LEGACY_ADMIN_PREFIX = "پنل مدیریت"
 
 
 async def _menu_token(repo: ShopRepository, actor_id: int, section: str) -> str:
