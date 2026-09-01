@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import contextlib
-import html
 import json
 import secrets
 from uuid import UUID
@@ -279,6 +278,12 @@ class DeliveryFlow:
                     await self._context(actor, order_id)
                     await self._save_draft(actor, order_id, {})
                     await self._preview(query.message, actor, order_id)
+                elif action == "custom_link":
+                    await self._context(actor, order_id)
+                    await self._set_state(actor, order_id, "custom_link")
+                    await _send(self.repo, query.message, "لینک تحویل را ارسال کنید.")
+                elif action == "preview":
+                    await self._preview(query.message, actor, order_id)
                 elif action == "confirm":
                     context = await self._context(actor, order_id)
                     data = await self._load_draft(actor, order_id)
@@ -294,7 +299,13 @@ class DeliveryFlow:
                     )
                 elif action == "cancel":
                     await self._clear(actor, order_id)
-                    await _send(self.repo, query.message, "فرایند تحویل لغو شد؛ سفارش همچنان در حال انجام است.")
+                    await _send(
+                        self.repo,
+                        query.message,
+                        "فرایند تحویل لغو شد؛ سفارش همچنان در حال انجام است.",
+                    )
+                else:
+                    raise AccessDenied("DELIVERY_CALLBACK_ACTION_INVALID")
                 await query.answer()
             except (AccessDenied, InvalidState, ValueError) as exc:
                 with contextlib.suppress(Exception):
@@ -349,26 +360,27 @@ class DeliveryFlow:
                 elif step == "content":
                     data["content"] = value
                     await self._save_draft(actor, order_id, data)
-                    if context.get("fulfillment_type") == "custom":
-                        add_link = await self.issue("custom_link", actor, str(order_id))
-                        preview = await self.issue("preview", actor, str(order_id))
-                        await self.repo.coordinator.redis.delete(f"fsm:{actor}")
-                        await _send(
-                            self.repo,
-                            message,
-                            "آیا همراه این تحویل لینک هم لازم است؟",
-                            [
-                                [Button("افزودن لینک", add_link, "primary")],
-                                [Button("بدون لینک", preview, "success")],
-                            ],
-                        )
-                    else:
-                        await self._preview(message, actor, order_id)
+                    add_link = await self.issue("custom_link", actor, str(order_id))
+                    preview = await self.issue("preview", actor, str(order_id))
+                    await self.repo.coordinator.redis.delete(f"fsm:{actor}")
+                    await _send(
+                        self.repo,
+                        message,
+                        "آیا همراه این تحویل لینک هم لازم است؟",
+                        [
+                            [Button("افزودن لینک", add_link, "primary")],
+                            [Button("بدون لینک", preview, "success")],
+                        ],
+                    )
+                elif step == "custom_link":
+                    if not value.startswith(("https://", "http://")):
+                        raise InvalidState("DELIVERY_LINK_INVALID")
+                    data["link"] = value
+                    await self._save_draft(actor, order_id, data)
+                    await self._preview(message, actor, order_id)
+                else:
+                    raise InvalidState("DELIVERY_STEP_INVALID")
             except (AccessDenied, InvalidState, ValueError):
-                await message.answer("مقدار معتبر نیست؛ همان اطلاعات خواسته‌شده را دوباره ارسال کنید.")
-
-        @self.router.callback_query(F.data.startswith(_CALLBACK_PREFIX))
-        async def delivery_secondary_callback(query: CallbackQuery) -> None:
-            # Kept intentionally unreachable: all d1 callbacks are handled above.
-            # This function documents that no callback should fall through to legacy routers.
-            raise SkipHandler
+                await message.answer(
+                    "مقدار معتبر نیست؛ همان اطلاعات خواسته‌شده را دوباره ارسال کنید."
+                )
