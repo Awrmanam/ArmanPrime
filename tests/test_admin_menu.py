@@ -1,4 +1,8 @@
-from shopbot.admin_menu import ADMIN_HOME_TEXT, ADMIN_SECTIONS, LEGACY_ADMIN_PREFIX
+from shopbot.admin_menu import (
+    ADMIN_HOME_TEXT,
+    ADMIN_SECTIONS,
+    LEGACY_ADMIN_PREFIX,
+)
 
 
 def test_admin_menu_is_grouped_and_keeps_management_actions():
