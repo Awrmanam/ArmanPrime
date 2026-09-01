@@ -137,5 +137,8 @@ async def test_verification_gate_keeps_exact_variant_checkout(monkeypatch):
         f"pending-checkout:{actor_id}", str(legacy_product_id), ex=86400
     )
     await store.create_quote(checkout_id, actor_id, None)
-    assert await repo.coordinator.redis.get(f"pending-variant-checkout:{actor_id}") is None
+    assert (
+        await repo.coordinator.redis.get(f"pending-variant-checkout:{actor_id}")
+        is None
+    )
     assert await repo.coordinator.redis.get(f"pending-checkout:{actor_id}") is None
