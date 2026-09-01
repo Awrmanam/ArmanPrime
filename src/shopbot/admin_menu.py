@@ -56,8 +56,7 @@ ADMIN_SECTIONS: dict[str, tuple[str, str, tuple[tuple[str, str, str], ...]]] = {
 }
 
 ADMIN_HOME_TEXT = (
-    "⚙️ پنل مدیریت\n\n"
-    "بخش موردنظر را انتخاب کنید. تنظیمات مرتبط داخل همان بخش قرار دارند."
+    "⚙️ پنل مدیریت\n\nبخش موردنظر را انتخاب کنید. تنظیمات مرتبط داخل همان بخش قرار دارند."
 )
 LEGACY_ADMIN_PREFIX = "پنل مدیریت\n\nوضعیت آمادگی فروشگاه:"
 
@@ -84,9 +83,7 @@ async def _legacy_token(repo: ShopRepository, actor_id: int, action: str) -> str
     return await repo.coordinator.issue_callback(action, actor_id, one_time=False)
 
 
-async def admin_home_view(
-    repo: ShopRepository, actor_id: int
-) -> tuple[str, list[list[Button]]]:
+async def admin_home_view(repo: ShopRepository, actor_id: int) -> tuple[str, list[list[Button]]]:
     repo.owner(actor_id)
     rows: list[list[Button]] = []
     section_styles = {
