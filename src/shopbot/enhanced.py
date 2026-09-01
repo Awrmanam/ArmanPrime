@@ -26,6 +26,18 @@ def _button_feature_rejected(exc: TelegramBadRequest) -> bool:
     )
 
 
+def _drop_legacy_admin_handlers(router):
+    """Keep the legacy feature router, but never let it own /admin or /setup."""
+    blocked = {"admin", "setup"}
+    handlers = router.message.handlers
+    handlers[:] = [
+        handler
+        for handler in handlers
+        if getattr(getattr(handler, "callback", None), "__name__", "") not in blocked
+    ]
+    return router
+
+
 def _install_transport_patch() -> None:
     global _TRANSPORT_PATCHED
     if _TRANSPORT_PATCHED:
@@ -312,7 +324,8 @@ def create_app(settings):
     dispatcher.include_router(delivery_flow.router)
     dispatcher.include_router(build_admin_menu_router(repo))
     dispatcher.include_router(build_variant_router(repo, store))
-    dispatcher.include_router(runtime_module.persistent_router(repo))
+    legacy_router = _drop_legacy_admin_handlers(runtime_module.persistent_router(repo))
+    dispatcher.include_router(legacy_router)
     runtime.dispatcher = dispatcher
 
     _install_transport_patch()
