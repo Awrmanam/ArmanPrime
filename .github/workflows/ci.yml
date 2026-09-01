@@ -38,8 +38,7 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e '.[dev]'
       - run: ruff check .
-      - name: Show formatter diff for admin menu
-        run: ruff format --diff src/shopbot/admin_menu.py
+      - run: ruff format --check .
       - run: alembic upgrade head
       - run: pytest -q
       - run: pytest --cov=src --cov-report=term-missing --cov-report=xml --cov-fail-under=80
