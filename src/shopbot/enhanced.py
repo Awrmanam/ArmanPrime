@@ -102,8 +102,63 @@ def create_app(settings):
     store = VariantStore(repo)
 
     legacy_issue_callback = repo.coordinator.issue_callback
-    setattr(repo, "_legacy_issue_callback", legacy_issue_callback)
+
+    async def variant_legacy_issue_callback(
+        action: str,
+        actor_id: int,
+        object_id: str = "",
+        version: int = 1,
+        *,
+        one_time: bool = False,
+        ttl: int = 1800,
+    ) -> str:
+        # Variant checkout should open the card center first. This prevents a
+        # second registration flow when the customer already has a pending or
+        # verified card, while the legacy storefront keeps its original behavior.
+        routed_action = "customer.cards" if action == "begin_card" else action
+        return await legacy_issue_callback(
+            routed_action,
+            actor_id,
+            object_id,
+            version,
+            one_time=one_time,
+            ttl=ttl,
+        )
+
+    setattr(repo, "_legacy_issue_callback", variant_legacy_issue_callback)
     setattr(repo, "variant_store", store)
+
+    original_mark_waiting_gate = store.mark_waiting_gate
+
+    async def bridged_mark_waiting_gate(self, checkout_id: UUID) -> None:
+        await original_mark_waiting_gate(checkout_id)
+        checkout = await self.checkout(checkout_id)
+        if checkout and checkout.get("telegram_id") is not None:
+            actor_id = int(checkout["telegram_id"])
+            await repo.coordinator.redis.set(
+                f"pending-variant-checkout:{actor_id}",
+                str(checkout_id),
+                ex=86400,
+            )
+
+    store.mark_waiting_gate = types.MethodType(bridged_mark_waiting_gate, store)
+
+    original_create_quote = store.create_quote
+
+    async def bridged_create_quote(
+        self,
+        checkout_id: UUID,
+        telegram_id: int,
+        card_id: UUID | None,
+    ):
+        quote = await original_create_quote(checkout_id, telegram_id, card_id)
+        await repo.coordinator.redis.delete(
+            f"pending-variant-checkout:{telegram_id}",
+            f"pending-checkout:{telegram_id}",
+        )
+        return quote
+
+    store.create_quote = types.MethodType(bridged_create_quote, store)
 
     async def routed_issue_callback(
         self,
@@ -140,6 +195,26 @@ def create_app(settings):
                 ttl=ttl,
             )
         if action == "resume_checkout" and object_id:
+            pending_variant = await repo.coordinator.redis.get(
+                f"pending-variant-checkout:{actor_id}"
+            )
+            if pending_variant:
+                with contextlib.suppress(ValueError):
+                    checkout_id = UUID(pending_variant)
+                    checkout = await store.checkout(checkout_id, actor_id)
+                    if checkout and checkout["status"] in {
+                        "INPUT",
+                        "READY",
+                        "WAITING_GATE",
+                        "QUOTED",
+                    }:
+                        return await store.issue_callback(
+                            "resume",
+                            actor_id,
+                            str(checkout_id),
+                            one_time=one_time,
+                            ttl=ttl,
+                        )
             with contextlib.suppress(ValueError):
                 pending = await store.pending_for_legacy_product(
                     actor_id, UUID(object_id)
