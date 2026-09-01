@@ -65,11 +65,7 @@ class FakeStore:
             return None
         if telegram_id is not None and telegram_id != self.actor_id:
             return None
-        return {
-            "id": checkout_id,
-            "telegram_id": self.actor_id,
-            "status": "WAITING_GATE",
-        }
+        return {"id": checkout_id, "telegram_id": self.actor_id, "status": "WAITING_GATE"}
 
     async def create_quote(self, checkout_id, telegram_id, card_id):
         self.quote_calls.append((checkout_id, telegram_id, card_id))
@@ -117,28 +113,19 @@ async def test_verification_gate_keeps_exact_variant_checkout(monkeypatch):
     enhanced.create_app(SimpleNamespace())
 
     await store.mark_waiting_gate(checkout_id)
-    assert (
-        await repo.coordinator.redis.get(f"pending-variant-checkout:{actor_id}")
-        == str(checkout_id)
-    )
+    pending_key = f"pending-variant-checkout:{actor_id}"
+    assert await repo.coordinator.redis.get(pending_key) == str(checkout_id)
 
     resume = await repo.coordinator.issue_callback(
-        "resume_checkout",
-        actor_id,
-        str(legacy_product_id),
-        one_time=True,
+        "resume_checkout", actor_id, str(legacy_product_id), one_time=True
     )
     assert resume == f"variant:resume:{actor_id}:{checkout_id}"
 
     cards = await repo._legacy_issue_callback("begin_card", actor_id)
     assert cards == f"legacy:customer.cards:{actor_id}:"
 
-    await repo.coordinator.redis.set(
-        f"pending-checkout:{actor_id}", str(legacy_product_id), ex=86400
-    )
+    legacy_key = f"pending-checkout:{actor_id}"
+    await repo.coordinator.redis.set(legacy_key, str(legacy_product_id), ex=86400)
     await store.create_quote(checkout_id, actor_id, None)
-    assert (
-        await repo.coordinator.redis.get(f"pending-variant-checkout:{actor_id}")
-        is None
-    )
-    assert await repo.coordinator.redis.get(f"pending-checkout:{actor_id}") is None
+    assert await repo.coordinator.redis.get(pending_key) is None
+    assert await repo.coordinator.redis.get(legacy_key) is None
