@@ -135,6 +135,7 @@ def build_admin_menu_router(repo: ShopRepository) -> Router:
     router = Router(name="admin-navigation")
 
     @router.message(Command("admin"))
+    @router.message(Command("setup"))
     async def admin_home(message: Message) -> None:
         if not message.from_user:
             return
