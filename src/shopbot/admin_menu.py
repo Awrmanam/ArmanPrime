@@ -57,6 +57,12 @@ ADMIN_SECTIONS: dict[str, tuple[str, str, tuple[tuple[str, str, str], ...]]] = {
     ),
 }
 
+ADMIN_HOME_TEXT = (
+    "⚙️ پنل مدیریت\n\n"
+    "بخش موردنظر را انتخاب کنید. تنظیمات مرتبط داخل همان بخش قرار دارند."
+)
+LEGACY_ADMIN_PREFIX = "پنل مدیریت\n\nوضعیت آمادگی فروشگاه:"
+
 
 async def _menu_token(repo: ShopRepository, actor_id: int, section: str) -> str:
     token = await repo.coordinator.issue_callback(
@@ -80,7 +86,9 @@ async def _legacy_token(repo: ShopRepository, actor_id: int, action: str) -> str
     return await repo.coordinator.issue_callback(action, actor_id, one_time=False)
 
 
-async def render_admin_home(message: Message, repo: ShopRepository, actor_id: int) -> None:
+async def admin_home_view(
+    repo: ShopRepository, actor_id: int
+) -> tuple[str, list[list[Button]]]:
     repo.owner(actor_id)
     rows: list[list[Button]] = []
     section_styles = {
@@ -96,16 +104,17 @@ async def render_admin_home(message: Message, repo: ShopRepository, actor_id: in
         [
             Button(
                 "بازگشت به منوی اصلی",
-                await _legacy_token(repo, actor_id, "admin.close"),
+                await _legacy_token(repo, actor_id, "nav.home"),
                 "danger",
             )
         ]
     )
-    await runtime_module.answer_keyboard(
-        message,
-        "⚙️ پنل مدیریت\n\nبخش موردنظر را انتخاب کنید. تنظیمات مرتبط داخل همان بخش قرار دارند.",
-        rows,
-    )
+    return ADMIN_HOME_TEXT, rows
+
+
+async def render_admin_home(message: Message, repo: ShopRepository, actor_id: int) -> None:
+    text, rows = await admin_home_view(repo, actor_id)
+    await runtime_module.answer_keyboard(message, text, rows)
 
 
 async def render_admin_section(
