@@ -37,6 +37,9 @@ def _install_transport_patch() -> None:
 
     async def send_message(self, chat_id, text, *args, **kwargs):
         repo = _BOT_REPOS.get(id(self))
+        generic_delivery = "یک رویداد جدید فروشگاه ثبت شد.\n\n"
+        if isinstance(text, str) and text.startswith(generic_delivery):
+            text = "✅ سفارش شما آماده شد\n\n" + text[len(generic_delivery) :]
         if repo and isinstance(text, str) and "{emoji:" in text and "parse_mode" not in kwargs:
             rendered = await render_rich_text(text, repo.resolve_rich_emoji)
             try:
@@ -101,6 +104,9 @@ def create_app(settings):
     repo = runtime.repo
     store = VariantStore(repo)
 
+    from .delivery_router import DeliveryFlow
+
+    delivery_flow = DeliveryFlow(repo, store)
     legacy_issue_callback = repo.coordinator.issue_callback
 
     async def variant_legacy_issue_callback(
@@ -115,9 +121,23 @@ def create_app(settings):
         # Variant checkout should open the card center first. This prevents a
         # second registration flow when the customer already has a pending or
         # verified card, while the legacy storefront keeps its original behavior.
-        routed_action = "customer.cards" if action == "begin_card" else action
+        if action == "begin_card":
+            return await legacy_issue_callback(
+                "customer.cards",
+                actor_id,
+                object_id,
+                version,
+                one_time=one_time,
+                ttl=ttl,
+            )
+        if action == "admin.order.deliver" and object_id:
+            with contextlib.suppress(ValueError):
+                if await store.order_context(UUID(object_id)):
+                    return await delivery_flow.issue(
+                        "start", actor_id, object_id, ttl=ttl
+                    )
         return await legacy_issue_callback(
-            routed_action,
+            action,
             actor_id,
             object_id,
             version,
@@ -268,6 +288,7 @@ def create_app(settings):
     from .variant_router import build_variant_router
 
     dispatcher = Dispatcher()
+    dispatcher.include_router(delivery_flow.router)
     dispatcher.include_router(build_variant_router(repo, store))
     dispatcher.include_router(runtime_module.persistent_router(repo))
     runtime.dispatcher = dispatcher
