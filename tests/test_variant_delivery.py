@@ -16,6 +16,7 @@ def test_activation_code_delivery_is_contextual():
     assert "کد فعال‌سازی" in body
     assert "ABC-123" in body
     assert "30 روز" in body
+    assert "یک رویداد جدید فروشگاه ثبت شد" not in body
     assert link is None
 
 
