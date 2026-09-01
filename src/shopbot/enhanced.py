@@ -285,10 +285,12 @@ def create_app(settings):
 
     runtime_module.answer_keyboard = rich_answer_keyboard
 
+    from .admin_menu import build_admin_menu_router
     from .variant_router import build_variant_router
 
     dispatcher = Dispatcher()
     dispatcher.include_router(delivery_flow.router)
+    dispatcher.include_router(build_admin_menu_router(repo))
     dispatcher.include_router(build_variant_router(repo, store))
     dispatcher.include_router(runtime_module.persistent_router(repo))
     runtime.dispatcher = dispatcher
