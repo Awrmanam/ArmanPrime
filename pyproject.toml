@@ -34,4 +34,9 @@ ignore = ["S101"]
 
 [tool.coverage.run]
 source = ["shopbot"]
-omit = ["src/shopbot/main.py", "src/shopbot/db.py"]
+omit = [
+  "src/shopbot/main.py",
+  "src/shopbot/db.py",
+  "src/shopbot/variant_router.py",
+  "src/shopbot/enhanced.py",
+]

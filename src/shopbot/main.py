@@ -3,7 +3,7 @@ import asyncio
 import uvicorn
 
 from .config import settings
-from .runtime import create_app
+from .enhanced import create_app
 
 
 async def polling() -> None:
@@ -25,7 +25,6 @@ def run() -> None:
     if settings.run_mode == "webhook":
         uvicorn.run("shopbot.api:app", host="0.0.0.0", port=8080)  # noqa: S104
     else:
-        # Polling owns Telegram updates; a companion health server is started by Compose.
         asyncio.run(polling())
 
 
