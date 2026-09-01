@@ -4,7 +4,6 @@ from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
 
-from . import runtime as runtime_module
 from .repository import AccessDenied, ShopRepository
 from .telegram_adapter import Button
 
@@ -113,6 +112,8 @@ async def admin_home_view(
 
 
 async def render_admin_home(message: Message, repo: ShopRepository, actor_id: int) -> None:
+    from . import runtime as runtime_module
+
     text, rows = await admin_home_view(repo, actor_id)
     await runtime_module.answer_keyboard(message, text, rows)
 
@@ -120,6 +121,8 @@ async def render_admin_home(message: Message, repo: ShopRepository, actor_id: in
 async def render_admin_section(
     message: Message, repo: ShopRepository, actor_id: int, section: str
 ) -> None:
+    from . import runtime as runtime_module
+
     repo.owner(actor_id)
     definition = ADMIN_SECTIONS.get(section)
     if not definition:
