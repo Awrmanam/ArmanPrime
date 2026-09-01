@@ -32,11 +32,25 @@ def _install_transport_patch() -> None:
         return
 
     original_send_message = Bot.send_message
+    original_edit_message_text = Bot.edit_message_text
     original_send_photo = Bot.send_photo
     original_send_document = Bot.send_document
 
+    async def rewrite_legacy_admin(repo, text, kwargs):
+        if not repo or not isinstance(text, str):
+            return text, kwargs
+        from .admin_menu import LEGACY_ADMIN_PREFIX, admin_home_view
+
+        if not text.startswith(LEGACY_ADMIN_PREFIX):
+            return text, kwargs
+        value, rows = await admin_home_view(repo, repo.owner_id)
+        rewritten = dict(kwargs)
+        rewritten["reply_markup"] = runtime_module.markup(rows)
+        return value, rewritten
+
     async def send_message(self, chat_id, text, *args, **kwargs):
         repo = _BOT_REPOS.get(id(self))
+        text, kwargs = await rewrite_legacy_admin(repo, text, kwargs)
         generic_delivery = "یک رویداد جدید فروشگاه ثبت شد.\n\n"
         if isinstance(text, str) and text.startswith(generic_delivery):
             text = "✅ سفارش شما آماده شد\n\n" + text[len(generic_delivery) :]
@@ -58,6 +72,11 @@ def _install_transport_patch() -> None:
                     self, chat_id, rendered.fallback, *args, **kwargs
                 )
         return await original_send_message(self, chat_id, text, *args, **kwargs)
+
+    async def edit_message_text(self, text, *args, **kwargs):
+        repo = _BOT_REPOS.get(id(self))
+        text, kwargs = await rewrite_legacy_admin(repo, text, kwargs)
+        return await original_edit_message_text(self, text, *args, **kwargs)
 
     async def _media_call(original, self, chat_id, media, *args, **kwargs):
         repo = _BOT_REPOS.get(id(self))
@@ -93,6 +112,7 @@ def _install_transport_patch() -> None:
         )
 
     Bot.send_message = send_message
+    Bot.edit_message_text = edit_message_text
     Bot.send_photo = send_photo
     Bot.send_document = send_document
     _TRANSPORT_PATCHED = True
