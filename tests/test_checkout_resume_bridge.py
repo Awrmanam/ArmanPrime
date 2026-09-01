@@ -97,6 +97,11 @@ async def test_verification_gate_keeps_exact_variant_checkout(monkeypatch):
     app = SimpleNamespace(state=SimpleNamespace(runtime=runtime))
 
     monkeypatch.setattr(enhanced.runtime_module, "create_app", lambda settings: app)
+    monkeypatch.setattr(
+        enhanced.runtime_module,
+        "answer_keyboard",
+        enhanced.runtime_module.answer_keyboard,
+    )
     monkeypatch.setattr(enhanced, "VariantStore", lambda value: store)
     monkeypatch.setattr(enhanced, "_install_transport_patch", lambda: None)
     monkeypatch.setattr(
