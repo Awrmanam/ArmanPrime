@@ -61,7 +61,6 @@ ADMIN_HOME_TEXT = (
 LEGACY_ADMIN_PREFIX = "پنل مدیریت"
 
 _MESSAGE_BRIDGE_INSTALLED = False
-_ACTIVE_ADMIN_REPO: ShopRepository | None = None
 _ORIGINAL_MESSAGE_ANSWER = Message.answer
 _ORIGINAL_MESSAGE_EDIT_TEXT = Message.edit_text
 
@@ -112,10 +111,23 @@ async def admin_home_view(repo: ShopRepository, actor_id: int) -> tuple[str, lis
     return ADMIN_HOME_TEXT, rows
 
 
+def _repo_for_message(message: Message) -> ShopRepository | None:
+    """Resolve only the repository bound to this exact enhanced bot instance."""
+    try:
+        from .enhanced import _BOT_REPOS
+
+        bot = message.bot
+    except (AttributeError, LookupError, RuntimeError):
+        return None
+    return _BOT_REPOS.get(id(bot))
+
+
 async def _rewrite_legacy_admin_message(
-    text: object, kwargs: dict, actor_id: int | None = None
+    repo: ShopRepository | None,
+    text: object,
+    kwargs: dict,
+    actor_id: int | None = None,
 ) -> tuple[object, dict]:
-    repo = _ACTIVE_ADMIN_REPO
     if repo is None or not isinstance(text, str) or not text.startswith(LEGACY_ADMIN_PREFIX):
         return text, kwargs
 
@@ -134,22 +146,23 @@ async def _rewrite_legacy_admin_message(
     return value, rewritten
 
 
-def _install_message_admin_bridge(repo: ShopRepository) -> None:
-    global _ACTIVE_ADMIN_REPO, _MESSAGE_BRIDGE_INSTALLED
-    _ACTIVE_ADMIN_REPO = repo
+def _install_message_admin_bridge() -> None:
+    global _MESSAGE_BRIDGE_INSTALLED
     if _MESSAGE_BRIDGE_INSTALLED:
         return
 
     async def bridged_answer(self: Message, text: str, *args, **kwargs):
+        repo = _repo_for_message(self)
         source = getattr(self, "from_user", None)
         actor_id = None if getattr(source, "is_bot", False) else getattr(source, "id", None)
-        text, kwargs = await _rewrite_legacy_admin_message(text, kwargs, actor_id)
+        text, kwargs = await _rewrite_legacy_admin_message(repo, text, kwargs, actor_id)
         return await _ORIGINAL_MESSAGE_ANSWER(self, text, *args, **kwargs)
 
     async def bridged_edit_text(self: Message, text: str, *args, **kwargs):
+        repo = _repo_for_message(self)
         source = getattr(self, "from_user", None)
         actor_id = None if getattr(source, "is_bot", False) else getattr(source, "id", None)
-        text, kwargs = await _rewrite_legacy_admin_message(text, kwargs, actor_id)
+        text, kwargs = await _rewrite_legacy_admin_message(repo, text, kwargs, actor_id)
         return await _ORIGINAL_MESSAGE_EDIT_TEXT(self, text, *args, **kwargs)
 
     Message.answer = bridged_answer
@@ -182,7 +195,7 @@ async def render_admin_section(
 
 
 def build_admin_menu_router(repo: ShopRepository) -> Router:
-    _install_message_admin_bridge(repo)
+    _install_message_admin_bridge()
     router = Router(name="admin-navigation")
 
     @router.message(Command("admin"))
