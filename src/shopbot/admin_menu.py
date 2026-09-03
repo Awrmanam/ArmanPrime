@@ -178,8 +178,7 @@ async def store_admin_home_view(
     create = await store.issue_callback("admin.family.new", actor_id, one_time=True)
     orders = await store.issue_callback("admin.orders", actor_id, one_time=False)
     return (
-        "🛍 مدیریت فروشگاه\n\n"
-        "محصولات، پلن‌ها و سفارش‌های فروشگاه را از اینجا مدیریت کنید.",
+        "🛍 مدیریت فروشگاه\n\nمحصولات، پلن‌ها و سفارش‌های فروشگاه را از اینجا مدیریت کنید.",
         [
             [Button("📦 محصولات من", products, "primary")],
             [Button("➕ افزودن محصول جدید", create, "success")],
@@ -189,9 +188,7 @@ async def store_admin_home_view(
     )
 
 
-async def products_view(
-    repo: ShopRepository, actor_id: int
-) -> tuple[str, list[list[Button]]]:
+async def products_view(repo: ShopRepository, actor_id: int) -> tuple[str, list[list[Button]]]:
     repo.owner(actor_id)
     store = VariantStore(repo)
     families = await store.owner_families()
@@ -220,10 +217,7 @@ async def products_view(
     if not families:
         text = "📦 محصولات من\n\nهنوز محصولی نساخته‌اید."
     else:
-        text = (
-            "📦 محصولات من\n\n"
-            f"{len(families)} محصول ثبت شده • {active_count} محصول فعال"
-        )
+        text = f"📦 محصولات من\n\n{len(families)} محصول ثبت شده • {active_count} محصول فعال"
     return text, rows
 
 
@@ -327,9 +321,7 @@ async def plan_view(
     except InvalidState:
         price_text = "هنوز قابل محاسبه نیست"
     status = "فعال ✅" if item["active"] else "غیرفعال ⏸"
-    payment = (
-        "کارت‌به‌کارت" if item["payment_method"] == "card_to_card" else item["payment_method"]
-    )
+    payment = "کارت‌به‌کارت" if item["payment_method"] == "card_to_card" else item["payment_method"]
     text = (
         f"💳 {item['family_title']} • {item['title']}\n\n"
         f"وضعیت: {status}\n"
