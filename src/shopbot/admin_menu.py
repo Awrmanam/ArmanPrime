@@ -112,14 +112,22 @@ async def admin_home_view(repo: ShopRepository, actor_id: int) -> tuple[str, lis
     return ADMIN_HOME_TEXT, rows
 
 
-async def _rewrite_legacy_admin_message(text: object, kwargs: dict) -> tuple[object, dict]:
+async def _rewrite_legacy_admin_message(
+    text: object, kwargs: dict, actor_id: int | None = None
+) -> tuple[object, dict]:
     repo = _ACTIVE_ADMIN_REPO
     if repo is None or not isinstance(text, str) or not text.startswith(LEGACY_ADMIN_PREFIX):
         return text, kwargs
 
+    resolved_actor = actor_id
+    if resolved_actor is None:
+        resolved_actor = getattr(repo, "owner_id", None)
+    if resolved_actor is None:
+        return text, kwargs
+
     from . import runtime as runtime_module
 
-    value, rows = await admin_home_view(repo, repo.owner_id)
+    value, rows = await admin_home_view(repo, int(resolved_actor))
     rewritten = dict(kwargs)
     rewritten["reply_markup"] = runtime_module.markup(rows)
     rewritten.pop("parse_mode", None)
@@ -133,11 +141,15 @@ def _install_message_admin_bridge(repo: ShopRepository) -> None:
         return
 
     async def bridged_answer(self: Message, text: str, *args, **kwargs):
-        text, kwargs = await _rewrite_legacy_admin_message(text, kwargs)
+        source = getattr(self, "from_user", None)
+        actor_id = None if getattr(source, "is_bot", False) else getattr(source, "id", None)
+        text, kwargs = await _rewrite_legacy_admin_message(text, kwargs, actor_id)
         return await _ORIGINAL_MESSAGE_ANSWER(self, text, *args, **kwargs)
 
     async def bridged_edit_text(self: Message, text: str, *args, **kwargs):
-        text, kwargs = await _rewrite_legacy_admin_message(text, kwargs)
+        source = getattr(self, "from_user", None)
+        actor_id = None if getattr(source, "is_bot", False) else getattr(source, "id", None)
+        text, kwargs = await _rewrite_legacy_admin_message(text, kwargs, actor_id)
         return await _ORIGINAL_MESSAGE_EDIT_TEXT(self, text, *args, **kwargs)
 
     Message.answer = bridged_answer
