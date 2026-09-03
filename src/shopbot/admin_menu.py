@@ -304,10 +304,9 @@ async def plans_view(
     create = await store.issue_callback(
         "admin.variant.new", actor_id, str(family_id), one_time=True
     )
+    back = await _ux_token(repo, actor_id, "store.product", str(family_id))
     rows.append([Button("➕ افزودن پلن جدید", create, "primary")])
-    rows.append(
-        [Button("⬅️ بازگشت به محصول", await _ux_token(repo, actor_id, "store.product", str(family_id)))]
-    )
+    rows.append([Button("⬅️ بازگشت به محصول", back)])
     text = f"💳 پلن‌های {family['title']}\n\n"
     text += f"{len(plans)} پلن ثبت شده" if plans else "هنوز پلنی برای این محصول نساخته‌اید."
     return text, rows
@@ -328,7 +327,9 @@ async def plan_view(
     except InvalidState:
         price_text = "هنوز قابل محاسبه نیست"
     status = "فعال ✅" if item["active"] else "غیرفعال ⏸"
-    payment = "کارت‌به‌کارت" if item["payment_method"] == "card_to_card" else item["payment_method"]
+    payment = (
+        "کارت‌به‌کارت" if item["payment_method"] == "card_to_card" else item["payment_method"]
+    )
     text = (
         f"💳 {item['family_title']} • {item['title']}\n\n"
         f"وضعیت: {status}\n"
@@ -390,11 +391,12 @@ async def plan_fields_view(
     else:
         body = "برای این پلن اطلاعاتی از مشتری دریافت نمی‌شود."
     add = await store.issue_callback("admin.field.new", actor_id, str(variant_id), one_time=True)
+    back = await _ux_token(repo, actor_id, "store.plan", str(variant_id))
     return (
         f"👤 اطلاعات موردنیاز مشتری\n\n{item['family_title']} • {item['title']}\n\n{body}",
         [
             [Button("➕ افزودن فیلد", add, "primary")],
-            [Button("⬅️ بازگشت به پلن", await _ux_token(repo, actor_id, "store.plan", str(variant_id)))],
+            [Button("⬅️ بازگشت به پلن", back)],
         ],
     )
 
@@ -417,11 +419,12 @@ async def plan_offers_view(
     else:
         body = "هنوز تأمین‌کننده‌ای برای این پلن ثبت نشده است."
     add = await store.issue_callback("admin.offer.new", actor_id, str(variant_id), one_time=True)
+    back = await _ux_token(repo, actor_id, "store.plan", str(variant_id))
     return (
         f"🏪 تأمین‌کننده‌ها\n\n{item['family_title']} • {item['title']}\n\n{body}",
         [
             [Button("➕ افزودن تأمین‌کننده", add, "primary")],
-            [Button("⬅️ بازگشت به پلن", await _ux_token(repo, actor_id, "store.plan", str(variant_id)))],
+            [Button("⬅️ بازگشت به پلن", back)],
         ],
     )
 
@@ -492,7 +495,11 @@ async def _rewrite_legacy_admin_message(
     elif text.startswith("محصولات و گزینه‌های خرید") or "ساختار جدید: محصول ← گزینه خرید" in text:
         view = await store_admin_home_view(repo, actor)
     elif "هر گزینه خرید قیمت، روش فعال‌سازی" in text:
-        family_raw = await _object_from_markup(repo, kwargs.get("reply_markup"), "admin.variant.new")
+        family_raw = await _object_from_markup(
+            repo,
+            kwargs.get("reply_markup"),
+            "admin.variant.new",
+        )
         if family_raw:
             view = await product_view(repo, actor, UUID(family_raw))
     elif "اطلاعات مشتری:" in text and "تأمین‌کننده‌ها:" in text:
