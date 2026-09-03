@@ -60,6 +60,11 @@ ADMIN_HOME_TEXT = (
 )
 LEGACY_ADMIN_PREFIX = "پنل مدیریت"
 
+_MESSAGE_BRIDGE_INSTALLED = False
+_ACTIVE_ADMIN_REPO: ShopRepository | None = None
+_ORIGINAL_MESSAGE_ANSWER = Message.answer
+_ORIGINAL_MESSAGE_EDIT_TEXT = Message.edit_text
+
 
 async def _menu_token(repo: ShopRepository, actor_id: int, section: str) -> str:
     token = await repo.coordinator.issue_callback(
@@ -107,6 +112,39 @@ async def admin_home_view(repo: ShopRepository, actor_id: int) -> tuple[str, lis
     return ADMIN_HOME_TEXT, rows
 
 
+async def _rewrite_legacy_admin_message(text: object, kwargs: dict) -> tuple[object, dict]:
+    repo = _ACTIVE_ADMIN_REPO
+    if repo is None or not isinstance(text, str) or not text.startswith(LEGACY_ADMIN_PREFIX):
+        return text, kwargs
+
+    from . import runtime as runtime_module
+
+    value, rows = await admin_home_view(repo, repo.owner_id)
+    rewritten = dict(kwargs)
+    rewritten["reply_markup"] = runtime_module.markup(rows)
+    rewritten.pop("parse_mode", None)
+    return value, rewritten
+
+
+def _install_message_admin_bridge(repo: ShopRepository) -> None:
+    global _ACTIVE_ADMIN_REPO, _MESSAGE_BRIDGE_INSTALLED
+    _ACTIVE_ADMIN_REPO = repo
+    if _MESSAGE_BRIDGE_INSTALLED:
+        return
+
+    async def bridged_answer(self: Message, text: str, *args, **kwargs):
+        text, kwargs = await _rewrite_legacy_admin_message(text, kwargs)
+        return await _ORIGINAL_MESSAGE_ANSWER(self, text, *args, **kwargs)
+
+    async def bridged_edit_text(self: Message, text: str, *args, **kwargs):
+        text, kwargs = await _rewrite_legacy_admin_message(text, kwargs)
+        return await _ORIGINAL_MESSAGE_EDIT_TEXT(self, text, *args, **kwargs)
+
+    Message.answer = bridged_answer
+    Message.edit_text = bridged_edit_text
+    _MESSAGE_BRIDGE_INSTALLED = True
+
+
 async def render_admin_home(message: Message, repo: ShopRepository, actor_id: int) -> None:
     from . import runtime as runtime_module
 
@@ -132,6 +170,7 @@ async def render_admin_section(
 
 
 def build_admin_menu_router(repo: ShopRepository) -> Router:
+    _install_message_admin_bridge(repo)
     router = Router(name="admin-navigation")
 
     @router.message(Command("admin"))
