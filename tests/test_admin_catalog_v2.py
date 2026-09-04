@@ -33,7 +33,7 @@ def test_app_v2_puts_catalog_router_before_existing_routers(monkeypatch):
     runtime = SimpleNamespace(repo=repo, dispatcher=dispatcher)
     app = SimpleNamespace(state=SimpleNamespace(runtime=runtime))
 
-    monkeypatch.setattr(app_v2, "create_base_app", lambda _settings: app)
+    monkeypatch.setattr(app_v2.enhanced_module, "create_app", lambda _settings: app)
     monkeypatch.setattr(
         app_v2,
         "build_admin_catalog_v2_router",
