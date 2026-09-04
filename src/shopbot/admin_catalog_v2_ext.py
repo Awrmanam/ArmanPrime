@@ -21,7 +21,11 @@ class CatalogAdminV2Extended(CatalogAdminV2):
             "🛍 مدیریت فروشگاه\n\nمحصولات و پلن‌های فروش را از اینجا مدیریت کنید.",
             [
                 [Button("📦 محصولات من", await self._token(actor, "products"), "primary")],
-                [Button("➕ افزودن محصول جدید", await self._token(actor, "product.new"), "success")],
+                [
+                    Button(
+                        "➕ افزودن محصول جدید", await self._token(actor, "product.new"), "success"
+                    )
+                ],
                 [
                     Button(
                         "🧾 سفارش‌ها",
