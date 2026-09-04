@@ -264,10 +264,7 @@ def _classify_message(text: str) -> str | None:
         return "success"
     if "به فروشگاه خوش آمدید" in value or "به فروشگاه خوش آمد" in value:
         return "welcome"
-    if any(
-        word in value
-        for word in ("تحویل", "فعال سازی", "فعال‌سازی", "سفارش شما آماده")
-    ):
+    if any(word in value for word in ("تحویل", "فعال سازی", "فعال‌سازی", "سفارش شما آماده")):
         return "delivery"
     if any(word in value for word in ("پرداخت", "رسید", "کارت مقصد")):
         return "payment"
@@ -322,10 +319,7 @@ def _classify_button(text: str, *, admin: bool) -> str | None:
         return "system"
     if any(word in value for word in ("ظاهر", "محتوا", "قوانین", "صفحات", "emoji")):
         return "content"
-    if any(
-        word in value
-        for word in ("مالی", "نرخ ارز", "قیمت گذاری", "قیمت‌گذاری", "کارت مقصد")
-    ):
+    if any(word in value for word in ("مالی", "نرخ ارز", "قیمت گذاری", "قیمت‌گذاری", "کارت مقصد")):
         return "finance"
     if any(
         word in value
@@ -337,10 +331,7 @@ def _classify_button(text: str, *, admin: bool) -> str | None:
         )
     ):
         return "operations"
-    if any(
-        word in value
-        for word in ("فروشگاه", "محصول", "دسته بندی", "دسته‌بندی", "پلن")
-    ):
+    if any(word in value for word in ("فروشگاه", "محصول", "دسته بندی", "دسته‌بندی", "پلن")):
         return "catalog"
     return None
 
@@ -504,7 +495,7 @@ async def _token(
 async def _resolve_token(repo: ShopRepository, token: str, actor: int) -> dict:
     if not token.startswith(CALLBACK_PREFIX) or len(token.encode()) > 64:
         raise AccessDenied("APPEARANCE_CALLBACK_INVALID")
-    key = f"appearance:cb:{token[len(CALLBACK_PREFIX):]}"
+    key = f"appearance:cb:{token[len(CALLBACK_PREFIX) :]}"
     raw = await repo.coordinator.redis.get(key)
     if not raw:
         raise AccessDenied("APPEARANCE_CALLBACK_EXPIRED")
@@ -716,9 +707,7 @@ async def _premium_text(
     emojis = await _active_emojis(repo)
     by_name = {item["name"]: item for item in emojis}
     replacements = [
-        item
-        for item in emojis
-        if item.get("fallback") and item["fallback"] not in {"•", "-", "."}
+        item for item in emojis if item.get("fallback") and item["fallback"] not in {"•", "-", "."}
     ]
     slot = _classify_message(re.sub(r"<[^>]+>", " ", text))
     name = theme.get("messages", {}).get(slot) if slot else None
@@ -1053,8 +1042,7 @@ async def _render_content_section(
     ]
     await _render(
         message,
-        "🎨 ظاهر و محتوا\n\n"
-        "متن‌های فروشگاه و تمام Premium Emojiهای ربات را از اینجا مدیریت کنید.",
+        "🎨 ظاهر و محتوا\n\nمتن‌های فروشگاه و تمام Premium Emojiهای ربات را از اینجا مدیریت کنید.",
         rows,
     )
 
@@ -1183,8 +1171,7 @@ async def _render_chooser(
         emojis = [
             item
             for item in emojis
-            if needle in _norm(item["name"])
-            or needle in _norm(item["fallback"])
+            if needle in _norm(item["name"]) or needle in _norm(item["fallback"])
         ]
     rows: list[list[Button]] = []
     for item in emojis[:24]:
@@ -1268,9 +1255,7 @@ async def _render_library(
     if query:
         needle = _norm(query)
         rows_data = [
-            row
-            for row in rows_data
-            if needle in _norm(row.name) or needle in _norm(row.fallback)
+            row for row in rows_data if needle in _norm(row.name) or needle in _norm(row.fallback)
         ]
     rows: list[list[Button]] = []
     for emoji in rows_data[:24]:
@@ -1304,8 +1289,7 @@ async def _render_library(
     rows.append([Button("⬅️ بازگشت", await _token(repo, actor, "home"))])
     await _render(
         message,
-        "😀 کتابخانه Premium Emoji\n\n"
-        "Emoji را بزنید تا وضعیت یا نماد جایگزین آن را تغییر دهید.",
+        "😀 کتابخانه Premium Emoji\n\nEmoji را بزنید تا وضعیت یا نماد جایگزین آن را تغییر دهید.",
         rows,
     )
 
@@ -1413,28 +1397,24 @@ def _custom_emoji_sample(message: Message) -> tuple[str, str, str] | None:
             for entity in list(getattr(source, attr, None) or []):
                 if str(getattr(entity, "type", "")) != "custom_emoji":
                     continue
-                custom_id = str(
-                    getattr(entity, "custom_emoji_id", "") or ""
-                )
+                custom_id = str(getattr(entity, "custom_emoji_id", "") or "")
                 if not custom_id.isdigit():
                     continue
-                sample = _utf16_slice(
-                    text,
-                    int(entity.offset),
-                    int(entity.length),
-                ) or "•"
+                sample = (
+                    _utf16_slice(
+                        text,
+                        int(entity.offset),
+                        int(entity.length),
+                    )
+                    or "•"
+                )
                 current_text = message.text or message.caption or ""
                 if source is message:
                     total = len(text.encode("utf-16-le")) // 2
-                    current_text = (
-                        _utf16_slice(text, 0, int(entity.offset))
-                        + _utf16_slice(
-                            text,
-                            int(entity.offset) + int(entity.length),
-                            total
-                            - int(entity.offset)
-                            - int(entity.length),
-                        )
+                    current_text = _utf16_slice(text, 0, int(entity.offset)) + _utf16_slice(
+                        text,
+                        int(entity.offset) + int(entity.length),
+                        total - int(entity.offset) - int(entity.length),
                     )
                 return custom_id, sample[:16], current_text.strip()
     return None
@@ -1541,8 +1521,7 @@ async def _handle_text(message: Message, repo: ShopRepository) -> None:
         )
         await _render(
             message,
-            "یک نام کوتاه و قابل جستجو برای این Emoji بنویسید؛ "
-            "مثلاً shop، orders یا فروشگاه.",
+            "یک نام کوتاه و قابل جستجو برای این Emoji بنویسید؛ مثلاً shop، orders یا فروشگاه.",
             [[Button("⬅️ بازگشت", await _token(repo, actor, "library"))]],
         )
         return
@@ -1556,9 +1535,7 @@ async def _handle_text(message: Message, repo: ShopRepository) -> None:
                 state["fallback"],
             )
         except (IntegrityError, ValueError):
-            await message.answer(
-                "نام معتبر نیست یا قبلاً ثبت شده. یک نام کوتاه دیگر بفرستید."
-            )
+            await message.answer("نام معتبر نیست یا قبلاً ثبت شده. یک نام کوتاه دیگر بفرستید.")
             return
         await repo.coordinator.redis.delete(FSM_KEY)
         await _render_library(message, repo, actor)
