@@ -59,21 +59,23 @@ class CatalogArchiveService:
         self.repo.owner(actor)
         async with self.repo.sessions.begin() as session:
             row = (
-                await session.execute(
-                    select(
-                        variants.c.family_id,
-                        variants.c.legacy_product_id,
-                    ).where(variants.c.id == variant_id)
+                (
+                    await session.execute(
+                        select(
+                            variants.c.family_id,
+                            variants.c.legacy_product_id,
+                        ).where(variants.c.id == variant_id)
+                    )
                 )
-            ).mappings().first()
+                .mappings()
+                .first()
+            )
             if not row:
                 raise InvalidState("VARIANT_NOT_FOUND")
 
             await self._record(session, "variant", variant_id, actor)
             await session.execute(
-                update(variants)
-                .where(variants.c.id == variant_id)
-                .values(active=False)
+                update(variants).where(variants.c.id == variant_id).values(active=False)
             )
             product = await session.get(
                 ProductRow,
@@ -95,27 +97,27 @@ class CatalogArchiveService:
         self.repo.owner(actor)
         async with self.repo.sessions.begin() as session:
             family = (
-                await session.execute(
-                    select(families.c.id).where(families.c.id == family_id)
-                )
+                await session.execute(select(families.c.id).where(families.c.id == family_id))
             ).first()
             if not family:
                 raise InvalidState("PRODUCT_FAMILY_NOT_FOUND")
 
             plan_rows = (
-                await session.execute(
-                    select(
-                        variants.c.id,
-                        variants.c.legacy_product_id,
-                    ).where(variants.c.family_id == family_id)
+                (
+                    await session.execute(
+                        select(
+                            variants.c.id,
+                            variants.c.legacy_product_id,
+                        ).where(variants.c.family_id == family_id)
+                    )
                 )
-            ).mappings().all()
+                .mappings()
+                .all()
+            )
 
             await self._record(session, "family", family_id, actor)
             await session.execute(
-                update(families)
-                .where(families.c.id == family_id)
-                .values(active=False)
+                update(families).where(families.c.id == family_id).values(active=False)
             )
 
             if plan_rows:
@@ -124,14 +126,10 @@ class CatalogArchiveService:
                 for variant_id in variant_ids:
                     await self._record(session, "variant", variant_id, actor)
                 await session.execute(
-                    update(variants)
-                    .where(variants.c.id.in_(variant_ids))
-                    .values(active=False)
+                    update(variants).where(variants.c.id.in_(variant_ids)).values(active=False)
                 )
                 await session.execute(
-                    update(ProductRow)
-                    .where(ProductRow.id.in_(product_ids))
-                    .values(active=False)
+                    update(ProductRow).where(ProductRow.id.in_(product_ids)).values(active=False)
                 )
 
             await self.repo.audit(
