@@ -6,6 +6,7 @@ from aiogram.types import CallbackQuery, Message
 from sqlalchemy import func, select
 
 from .admin_catalog_v2 import CatalogAdminV2
+from .catalog_archive import get_catalog_archive, install_catalog_archive
 from .repository import InvalidState, ShopRepository
 from .telegram_adapter import Button
 from .variant_store import VariantStore, checkout_values
@@ -40,6 +41,60 @@ class CatalogAdminV2Extended(CatalogAdminV2):
         actor = query.from_user.id
         action = state["a"]
         obj = str(state.get("o") or "")
+
+        if action == "product.delete.ask":
+            item = await self._product(UUID(obj))
+            await self._render(
+                query.message,
+                (
+                    f"🗑 حذف محصول\n\nآیا «{item['title']}» حذف شود؟\n\n"
+                    "محصول و همه پلن‌های زیرمجموعه از فروشگاه و لیست مدیریت حذف می‌شوند. "
+                    "سوابق سفارش‌ها و پرداخت‌های قبلی برای گزارش و پشتیبانی محفوظ می‌ماند."
+                ),
+                [
+                    [
+                        Button(
+                            "بله، حذف شود",
+                            await self._token(actor, "product.delete", obj, once=True),
+                            "danger",
+                        )
+                    ],
+                    [Button("انصراف", await self._token(actor, "product", obj))],
+                ],
+            )
+            return
+
+        if action == "product.delete":
+            await get_catalog_archive(self.store).archive_family(actor, UUID(obj))
+            await self.products(query.message, actor)
+            return
+
+        if action == "plan.delete.ask":
+            item, _ = await self._plan(UUID(obj))
+            await self._render(
+                query.message,
+                (
+                    f"🗑 حذف پلن\n\nآیا «{item['title']}» حذف شود؟\n\n"
+                    "پلن از فروشگاه و لیست مدیریت حذف می‌شود. "
+                    "اگر سابقه سفارش یا قیمت داشته باشد، سوابق قبلی بدون نمایش در کاتالوگ حفظ می‌شوند."
+                ),
+                [
+                    [
+                        Button(
+                            "بله، حذف شود",
+                            await self._token(actor, "plan.delete", obj, once=True),
+                            "danger",
+                        )
+                    ],
+                    [Button("انصراف", await self._token(actor, "plan", obj))],
+                ],
+            )
+            return
+
+        if action == "plan.delete":
+            family_id = await get_catalog_archive(self.store).archive_variant(actor, UUID(obj))
+            await self.plans(query.message, actor, family_id)
+            return
 
         if action == "product.new.description.skip":
             data = await self._draft(actor)
@@ -216,4 +271,5 @@ class CatalogAdminV2Extended(CatalogAdminV2):
 
 
 def build_admin_catalog_v2_router(repo: ShopRepository, store: VariantStore):
+    install_catalog_archive(repo, store)
     return CatalogAdminV2Extended(repo, store).router
