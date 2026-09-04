@@ -182,7 +182,7 @@ def install_catalog_archive(repo: ShopRepository, store: VariantStore) -> Catalo
     store.owner_families = MethodType(owner_families_filtered, store)
     store.storefront_families = MethodType(storefront_families_filtered, store)
     store.family_variants = MethodType(family_variants_filtered, store)
-    setattr(store, "_catalog_archive_service", service)
+    store._catalog_archive_service = service
     return service
 
 
