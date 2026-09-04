@@ -2,8 +2,8 @@ import asyncio
 
 import uvicorn
 
+from .app_v2 import create_app
 from .config import settings
-from .enhanced import create_app
 
 
 async def polling() -> None:
