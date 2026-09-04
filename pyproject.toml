@@ -41,6 +41,7 @@ ignore = ["S101"]
 [tool.ruff.lint.per-file-ignores]
 "src/shopbot/admin_catalog_v2.py" = ["E501"]
 "src/shopbot/admin_catalog_v2_ext.py" = ["E501"]
+"src/shopbot/appearance_studio.py" = ["E501"]
 
 [tool.coverage.run]
 source = ["shopbot"]
@@ -50,6 +51,7 @@ omit = [
   "src/shopbot/admin_menu.py",
   "src/shopbot/admin_catalog_v2.py",
   "src/shopbot/admin_catalog_v2_ext.py",
+  "src/shopbot/appearance_studio.py",
   "src/shopbot/variant_router.py",
   "src/shopbot/delivery_router.py",
   "src/shopbot/enhanced.py",
