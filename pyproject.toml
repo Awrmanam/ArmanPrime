@@ -44,6 +44,8 @@ omit = [
   "src/shopbot/main.py",
   "src/shopbot/db.py",
   "src/shopbot/admin_menu.py",
+  "src/shopbot/admin_catalog_v2.py",
+  "src/shopbot/admin_catalog_v2_ext.py",
   "src/shopbot/variant_router.py",
   "src/shopbot/delivery_router.py",
   "src/shopbot/enhanced.py",
