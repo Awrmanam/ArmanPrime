@@ -1,0 +1,19 @@
+# Direct dependency lock. Install the project itself with: pip install -e '.[dev]'
+# Renovate updates this file and pyproject.toml together; no floating specifiers are permitted.
+aiogram==3.22.0
+aiosqlite==0.21.0
+alembic==1.16.5
+asyncpg==0.30.0
+cryptography==45.0.7
+fastapi==0.116.1
+hatchling==1.27.0
+httpx==0.28.1
+pydantic-settings==2.10.1
+pytest==8.4.2
+pytest-asyncio==1.1.0
+pytest-cov==6.2.1
+redis==6.4.0
+ruff==0.12.11
+sqlalchemy==2.0.43
+structlog==25.4.0
+uvicorn==0.35.0

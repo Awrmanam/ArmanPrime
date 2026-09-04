@@ -1,0 +1,2733 @@
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import html
+import json
+import logging
+import re
+from datetime import timedelta
+from decimal import Decimal, InvalidOperation
+from types import SimpleNamespace
+from uuid import UUID, uuid4
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message, Update
+from fastapi import FastAPI, Header, HTTPException, Request, status
+from redis.asyncio import Redis
+from sqlalchemy import text
+
+from .config import Settings
+from .db import create_engine_and_session
+from .fx import NavasanRateProvider
+from .repository import AccessDenied, RedisCoordinator, ShopRepository
+from .rich_text import render_rich_text
+from .security import Vault, mask_pan
+from .telegram_adapter import Button, extract_message_custom_emoji
+
+log = logging.getLogger(__name__)
+
+
+class EditablePanel:
+    """Minimal message facade used to edit the actor's single admin panel."""
+
+    def __init__(self, source: Message, chat_id: int, message_id: int):
+        self.bot = source.bot
+        self.chat = SimpleNamespace(id=chat_id)
+        self.message_id = message_id
+        self.from_user = SimpleNamespace(is_bot=True)
+
+    async def edit_text(self, text_value: str, **kwargs):
+        return await self.bot.edit_message_text(
+            chat_id=self.chat.id, message_id=self.message_id, text=text_value, **kwargs
+        )
+
+
+def markup(rows: list[list[Button]]) -> InlineKeyboardMarkup:
+    # aiogram currently drops new Bot API button fields, so validate centrally and preserve payload.
+    return InlineKeyboardMarkup.model_validate(
+        {"inline_keyboard": [[button.payload() for button in row] for row in rows]}
+    )
+
+
+def _button_feature_rejected(exc: TelegramBadRequest) -> bool:
+    detail = str(exc).lower()
+    return "style" in detail or "icon_custom_emoji_id" in detail or "custom emoji" in detail
+
+
+async def answer_keyboard(message: Message, text_value: str, rows: list[list[Button]]) -> Message:
+    """Send a rich keyboard, retrying once only for unsupported Bot API button fields."""
+
+    async def send(reply_markup: InlineKeyboardMarkup) -> Message:
+        if getattr(getattr(message, "from_user", None), "is_bot", False):
+            return await message.edit_text(text_value, reply_markup=reply_markup)
+        return await message.answer(text_value, reply_markup=reply_markup)
+
+    try:
+        return await send(markup(rows))
+    except TelegramBadRequest as exc:
+        if not _button_feature_rejected(exc):
+            raise
+        plain_rows = [[Button(button.text, button.callback_data) for button in row] for row in rows]
+        return await send(markup(plain_rows))
+
+
+def persistent_router(repo: ShopRepository) -> Router:
+    router = Router(name="persistent-commerce")
+    pricing_fields = ["percent"]
+
+    async def answer_rich_keyboard(
+        message: Message, text_value: str, rows: list[list[Button]]
+    ) -> Message:
+        async def resolver(key: str):
+            return (
+                await repo.resolve_rich_emoji(key) if hasattr(repo, "resolve_rich_emoji") else None
+            )
+
+        rendered = await render_rich_text(text_value, resolver)
+        try:
+            if getattr(getattr(message, "from_user", None), "is_bot", False):
+                return await message.edit_text(
+                    rendered.html, parse_mode="HTML", reply_markup=markup(rows)
+                )
+            return await message.answer(rendered.html, parse_mode="HTML", reply_markup=markup(rows))
+        except TelegramBadRequest as exc:
+            detail = str(exc).lower()
+            if "custom emoji" not in detail and "tg-emoji" not in detail:
+                raise
+            if getattr(getattr(message, "from_user", None), "is_bot", False):
+                return await message.edit_text(rendered.fallback, reply_markup=markup(rows))
+            return await message.answer(rendered.fallback, reply_markup=markup(rows))
+
+    async def clear_actor_state(actor_id: int) -> None:
+        keys = [
+            f"fsm:{actor_id}",
+            f"terms-title:{actor_id}",
+            f"card-bank:{actor_id}",
+            f"card-pan:{actor_id}",
+            f"receipt-order:{actor_id}",
+            f"admin-draft:{actor_id}",
+        ]
+        scan_iter = getattr(repo.coordinator.redis, "scan_iter", None)
+        if scan_iter:
+            async for key in scan_iter(match=f"delivery-draft:{actor_id}:*"):
+                keys.append(key)
+        await repo.coordinator.redis.delete(*keys)
+
+    def normalize_digits(value: str) -> str:
+        table = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+        return value.translate(table).strip()
+
+    def valid_card_number(digits: str) -> bool:
+        if len(digits) != 16 or not digits.isdigit():
+            return False
+        total = 0
+        for index, char in enumerate(digits):
+            value = int(char) * (2 if index % 2 == 0 else 1)
+            total += value - 9 if value > 9 else value
+        return total % 10 == 0
+
+    async def load_draft(actor: int) -> dict:
+        raw = await repo.coordinator.redis.get(f"admin-draft:{actor}")
+        return json.loads(raw) if raw else {}
+
+    async def save_draft(actor: int, draft: dict) -> None:
+        current = await load_draft(actor)
+        draft["version"] = int(current.get("version", 0)) + 1
+        await repo.coordinator.redis.set(
+            f"admin-draft:{actor}", json.dumps(draft, ensure_ascii=False), ex=900
+        )
+
+    async def wizard_buttons(actor: int, *, skip: bool = False) -> list[Button]:
+        draft = await load_draft(actor)
+        version = int(draft.get("version", 0))
+        result = []
+        if skip:
+            token = await repo.coordinator.issue_callback(
+                "admin.wizard.skip", actor, version=version, one_time=True
+            )
+            result.append(Button("رد کردن", token))
+        back = await repo.coordinator.issue_callback(
+            "admin.wizard.back", actor, version=version, one_time=True
+        )
+        cancel = await repo.coordinator.issue_callback(
+            "admin.wizard.cancel", actor, version=version, one_time=True
+        )
+        result.extend((Button("بازگشت", back), Button("لغو", cancel, "danger")))
+        return result
+
+    async def set_wizard(message: Message, actor: int, kind: str, step: int, data: dict) -> None:
+        repo.owner(actor)
+        await save_draft(actor, {"kind": kind, "step": step, "data": data})
+        await repo.coordinator.redis.set(f"fsm:{actor}", "admin.wizard", ex=900)
+        target = message
+        if getattr(getattr(message, "from_user", None), "is_bot", False):
+            if getattr(message, "message_id", None) and getattr(message, "chat", None):
+                await repo.coordinator.redis.set(
+                    f"admin-panel:{actor}",
+                    json.dumps({"chat": message.chat.id, "message": message.message_id}),
+                    ex=86400,
+                )
+        elif getattr(message, "bot", None):
+            stored_panel = await repo.coordinator.redis.get(f"admin-panel:{actor}")
+            if stored_panel:
+                panel = json.loads(stored_panel)
+                target = EditablePanel(message, panel["chat"], panel["message"])
+        await render_wizard(target, actor)
+
+    async def choice_rows(actor: int, choices: list[tuple[str, str]]) -> list[list[Button]]:
+        draft = await load_draft(actor)
+        version = int(draft.get("version", 0))
+        rows = []
+        for label, value in choices:
+            token = await repo.coordinator.issue_callback(
+                "admin.wizard.choice", actor, value, version=version, one_time=True
+            )
+            rows.append([Button(label, token)])
+        rows.append(await wizard_buttons(actor))
+        return rows
+
+    async def render_wizard(message: Message, actor: int) -> None:
+        draft = await load_draft(actor)
+        kind, step, data = draft["kind"], draft["step"], draft["data"]
+        pricing_complete = {"percent", "rounding_increment_toman"}.issubset(data)
+        if kind == "pricing" and (
+            (step == 1 and "percent" not in data) or (step == 2 and not pricing_complete)
+        ):
+            await save_draft(actor, {"kind": "pricing", "step": 0, "data": {}})
+            await answer_keyboard(
+                message,
+                "اطلاعات قیمت‌گذاری ناقص بود. لطفاً درصد سود را دوباره وارد کنید.",
+                [await wizard_buttons(actor)],
+            )
+            return
+        if kind == "rate" and step == 0:
+            currencies = ("USD", "RUB", "EUR", "TRY", "AED", "GBP", "CNY", "INR", "SGD", "EGP")
+            await answer_keyboard(
+                message,
+                "مرحله ۱ از ۴\nارز را انتخاب کنید.",
+                await choice_rows(actor, [(code, code) for code in currencies]),
+            )
+            return
+        if kind in {"merchant", "merchant_edit"} and step == 40:
+            await answer_keyboard(
+                message,
+                "مرحله ۵ از ۷\nسقف روزانه را به تومان وارد کنید.",
+                [await wizard_buttons(actor)],
+            )
+            return
+        if kind == "product" and step == 5:
+            await answer_keyboard(
+                message,
+                "مرحله ۷ از ۱۰\nنوع موجودی را انتخاب کنید.",
+                await choice_rows(
+                    actor, [("موجودی نامحدود", "unlimited"), ("موجودی محدود", "limited")]
+                ),
+            )
+            return
+        if kind == "product" and step == 120:
+            await answer_keyboard(
+                message,
+                "مرحله ۷ از ۱۰\nتعداد موجودی محدود را وارد کنید.",
+                [await wizard_buttons(actor)],
+            )
+            return
+        if kind == "product" and step == 3:
+            choices = [
+                ("🇺🇸 دلار آمریکا — USD", "USD"),
+                ("🇪🇺 یورو — EUR", "EUR"),
+                ("🇬🇧 پوند بریتانیا — GBP", "GBP"),
+                ("🇹🇷 لیر ترکیه — TRY", "TRY"),
+                ("🇦🇪 درهم امارات — AED", "AED"),
+                ("🇷🇺 روبل روسیه — RUB", "RUB"),
+                ("🇨🇳 یوان چین — CNY", "CNY"),
+                ("🇮🇳 روپیه هند — INR", "INR"),
+                ("🇸🇬 دلار سنگاپور — SGD", "SGD"),
+                ("🇪🇬 پوند مصر — EGP", "EGP"),
+            ]
+            await answer_keyboard(
+                message,
+                "مرحله ۵ از ۱۰\nارز هزینه تأمین‌کننده را انتخاب کنید.",
+                await choice_rows(actor, choices),
+            )
+            return
+        if kind == "product" and step == 160:
+            await answer_keyboard(
+                message,
+                "تنظیمات تکمیلی محصول\nمقدار قیمت‌گذاری اختصاصی را وارد کنید.",
+                [await wizard_buttons(actor)],
+            )
+            return
+        if kind == "button" and step == 20:
+            await answer_keyboard(
+                message,
+                "مرحله ۳ از ۷\nنشانی کامل HTTPS را وارد کنید.",
+                [await wizard_buttons(actor)],
+            )
+            return
+        definitions = {
+            "terms": [("عنوان قوانین", False), ("متن کامل قوانین", False), ("صفحه تکمیلی", True)],
+            "rate": [
+                ("انتخاب ارز", False),
+                ("نرخ هر یک واحد ارز را به تومان وارد کنید.", False),
+                ("درصد حاشیه تبدیل ارز", True),
+            ],
+            "merchant": [("شماره کارت مقصد", False), ("نام بانک", False), ("نام صاحب کارت", False)],
+            "merchant_edit": [("نام بانک", False), ("نام صاحب کارت", False)],
+            "category": [("عنوان دسته‌بندی", False), ("توضیح دسته‌بندی", True)],
+            "page": [("عنوان نمایشی صفحه", False), ("متن صفحه", False)],
+            "delivery": [("متن تحویل", False), ("پیوند فعال‌سازی", True)],
+            "button": [("متن دکمه", False)],
+            "appearance": [("برچسب فارسی دکمه", False)],
+            "product": [
+                ("عنوان محصول", False),
+                ("توضیح کامل محصول", False),
+                ("مبلغ خرید از تأمین‌کننده", False),
+                ("انتخاب ارز", False),
+                ("مدت یا نوع پلن", False),
+            ],
+            "pricing": [("درصد سود روی هزینه خرید", False)],
+            "kyc_page": [
+                ("عنوان صفحه احراز هویت", False),
+                ("توضیح فرایند", False),
+                ("مدارک موردنیاز", False),
+                ("دلیل نیاز به احراز هویت", False),
+                ("هشدار حریم خصوصی", False),
+                ("زمان تقریبی بررسی", False),
+                ("نشانی پشتیبانی", True),
+                ("متن دکمه شروع", False),
+            ],
+        }
+        text_steps = definitions.get(kind, [])
+        text_index = step
+        if 0 <= text_index < len(text_steps):
+            title, optional = text_steps[text_index]
+            if kind == "product":
+                logical_step = {0: 2, 1: 3, 2: 4, 4: 6}[step]
+                progress = f"مرحله {logical_step} از ۱۰"
+            else:
+                progress = f"مرحله {step + 1} از {len(text_steps) + 2}"
+            await answer_keyboard(
+                message,
+                f"{title}\n\n{progress}\nهر بار فقط همین مقدار را ارسال کنید.",
+                [await wizard_buttons(actor, skip=optional)],
+            )
+            return
+        await render_wizard_choice_or_preview(message, actor, kind, step, data)
+
+    async def render_wizard_choice_or_preview(
+        message: Message, actor: int, kind: str, step: int, data: dict
+    ) -> None:
+        if kind in {"merchant", "merchant_edit"}:
+            offset = 3 if kind == "merchant" else 2
+            choices = {
+                offset: [("اولویت ۱", "1"), ("اولویت ۲", "2"), ("اولویت ۳", "3")],
+                offset + 1: [("بدون سقف", "0"), ("تعیین سقف روزانه", "limit")],
+                offset + 2: [("فعال", "1"), ("غیرفعال", "0")],
+                offset + 3: [("تأیید و ثبت", "confirm")],
+            }
+        elif kind == "category":
+            choices = {
+                2: [("فعال", "1"), ("غیرفعال", "0")],
+                3: [("انتهای فهرست", "0"), ("ابتدای فهرست", "1")],
+                4: [("بدون آیکون", "")],
+                5: [("تأیید و ثبت", "confirm")],
+            }
+        elif kind == "pricing":
+            choices = {2: [("تأیید و ثبت", "confirm")]}
+        elif kind == "kyc_page":
+            choices = {
+                8: [
+                    ("پیش‌فرض", "default"),
+                    ("اصلی", "primary"),
+                    ("موفق", "success"),
+                    ("هشدار", "danger"),
+                ],
+                9: [("بدون آیکون", "")],
+                10: [("انتشار صفحه", "confirm")],
+            }
+        elif kind == "rate":
+            choices = {3: [("تأیید نرخ", "confirm")]}
+        elif kind == "terms":
+            choices = {3: [("انتشار قوانین", "confirm")]}
+        elif kind in {"page", "delivery", "button", "appearance", "product"}:
+            choices = {}
+        else:
+            choices = {}
+        if kind == "category" and step == 4:
+            choices[4] += [
+                (emoji.name, emoji.name) for emoji in await repo.emojis(actor, active_only=True)
+            ]
+        if kind == "kyc_page" and step == 9:
+            choices[9] += [
+                (emoji.name, emoji.name) for emoji in await repo.emojis(actor, active_only=True)
+            ]
+        if step in choices and choices[step]:
+            if step == max(choices):
+                preview = wizard_preview(kind, data)
+                await answer_keyboard(message, preview, await choice_rows(actor, choices[step]))
+            else:
+                await answer_keyboard(
+                    message, "گزینه مناسب را انتخاب کنید.", await choice_rows(actor, choices[step])
+                )
+            return
+        # Wizard-specific continuations with inline choices.
+        if kind == "pricing" and step == 1:
+            await answer_keyboard(
+                message,
+                "مرحله ۲ از ۴\nنحوه گرد کردن قیمت نهایی را انتخاب کنید.",
+                await choice_rows(
+                    actor,
+                    [
+                        ("بدون گرد کردن", "1"),
+                        ("گرد کردن به ۱٬۰۰۰ تومان", "1000"),
+                        ("گرد کردن به ۵٬۰۰۰ تومان", "5000"),
+                        ("گرد کردن به ۱۰٬۰۰۰ تومان", "10000"),
+                    ],
+                ),
+            )
+        elif kind == "product" and step == 7:
+            await answer_keyboard(
+                message,
+                "مرحله ۸ از ۱۰\nآیا احراز هویت لازم است؟",
+                await choice_rows(actor, [("لازم است", "1"), ("لازم نیست", "0")]),
+            )
+        elif kind == "product" and step == 8:
+            preview = await product_preview(data, actor)
+            draft = await load_draft(actor)
+            confirm = await repo.coordinator.issue_callback(
+                "admin.product.confirm",
+                actor,
+                str(draft["version"]),
+                one_time=True,
+            )
+            await answer_keyboard(
+                message,
+                f"مرحله ۹ از ۱۰\n\n{preview}",
+                [[Button("تأیید و ثبت", confirm, "success")], await wizard_buttons(actor)],
+            )
+        elif kind == "page" and step == 2:
+            await answer_keyboard(
+                message,
+                "مرحله ۳ از ۶\nوضعیت صفحه",
+                await choice_rows(actor, [("فعال", "1"), ("غیرفعال", "0")]),
+            )
+        elif kind == "page" and step == 3:
+            await answer_keyboard(
+                message,
+                wizard_preview(kind, data),
+                await choice_rows(actor, [("تأیید و ثبت", "confirm")]),
+            )
+        elif kind == "appearance" and step == 1:
+            await answer_keyboard(
+                message,
+                "مرحله ۲ از ۶\nرنگ رسمی تلگرام",
+                await choice_rows(
+                    actor,
+                    [
+                        ("پیش‌فرض", "default"),
+                        ("اصلی", "primary"),
+                        ("موفق", "success"),
+                        ("خطر", "danger"),
+                    ],
+                ),
+            )
+        elif kind == "appearance" and step == 2:
+            emoji_choices = [("بدون آیکون", "")] + [
+                (item.name, item.name) for item in await repo.emojis(actor, active_only=True)
+            ]
+            await answer_keyboard(
+                message, "مرحله ۳ از ۶\nآیکون Registry", await choice_rows(actor, emoji_choices)
+            )
+        elif kind == "appearance" and step == 3:
+            await answer_keyboard(
+                message,
+                "مرحله ۴ از ۶\nردیف نمایش",
+                await choice_rows(actor, [(str(i + 1), str(i)) for i in range(6)]),
+            )
+        elif kind == "appearance" and step == 4:
+            await answer_keyboard(
+                message,
+                "مرحله ۵ از ۶\nترتیب در ردیف",
+                await choice_rows(actor, [(str(i + 1), str(i)) for i in range(4)]),
+            )
+        elif kind == "appearance" and step == 5:
+            await answer_keyboard(
+                message,
+                wizard_preview(kind, data),
+                await choice_rows(actor, [("تأیید و ثبت", "confirm")]),
+            )
+        elif kind == "button" and step == 1:
+            await answer_keyboard(
+                message,
+                "مرحله ۲ از ۷\nهدف دکمه",
+                await choice_rows(
+                    actor,
+                    [
+                        ("فروشگاه", "catalog"),
+                        ("حساب کاربری", "account"),
+                        ("سفارش‌های من", "my_orders"),
+                        ("نشانی اینترنتی امن", "url"),
+                    ],
+                ),
+            )
+        elif kind == "button" and step == 2:
+            await answer_keyboard(
+                message,
+                "مرحله ۴ از ۷\nسبک رسمی تلگرام",
+                await choice_rows(
+                    actor,
+                    [
+                        ("پیش‌فرض", "default"),
+                        ("اصلی", "primary"),
+                        ("موفق", "success"),
+                        ("خطر", "danger"),
+                    ],
+                ),
+            )
+        elif kind == "button" and step == 3:
+            emoji_choices = [("بدون آیکون", "")] + [
+                (item.name, item.name) for item in await repo.emojis(actor, active_only=True)
+            ]
+            await answer_keyboard(
+                message, "مرحله ۵ از ۷\nآیکون Registry", await choice_rows(actor, emoji_choices)
+            )
+        elif kind == "button" and step == 4:
+            await answer_keyboard(
+                message,
+                "مرحله ۶ از ۷\nجایگاه دکمه",
+                await choice_rows(actor, [("ردیف اول", "0"), ("ردیف بعد", "1")]),
+            )
+        elif kind == "button" and step == 5:
+            await answer_keyboard(
+                message,
+                wizard_preview(kind, data),
+                await choice_rows(actor, [("تأیید و ثبت", "confirm")]),
+            )
+        else:
+            preview = wizard_preview(kind, data)
+            await answer_keyboard(
+                message, preview, await choice_rows(actor, [("تأیید و ثبت", "confirm")])
+            )
+
+    def wizard_preview(kind: str, data: dict) -> str:
+        if kind == "pricing":
+            rounding = {
+                1: "بدون گرد کردن",
+                1000: "نزدیک‌ترین ۱٬۰۰۰ تومان",
+                5000: "نزدیک‌ترین ۵٬۰۰۰ تومان",
+                10000: "نزدیک‌ترین ۱۰٬۰۰۰ تومان",
+            }[int(data["rounding_increment_toman"])]
+            return (
+                "پیش‌نمایش قیمت‌گذاری\n\n"
+                f"درصد سود روی هزینه خرید: {data['percent']}٪\n"
+                f"نحوه گرد کردن قیمت نهایی: {rounding}\n\n"
+                "هزینه خرید پس از تبدیل ارز و حاشیه تبدیل، در درصد سود ضرب می‌شود."
+            )
+        if kind == "kyc_page":
+            return (
+                "پیش‌نمایش صفحه احراز هویت\n\n"
+                f"عنوان: {data['title']}\n"
+                f"توضیحات: {data['explanation']}\n"
+                f"مدارک موردنیاز: {data['documents']}\n"
+                f"دلیل بررسی: {data['reason']}\n"
+                f"حریم خصوصی: {data['privacy']}\n"
+                f"زمان بررسی: {data['review_time']}\n"
+                f"متن دکمه: {data['start_label']}"
+            )
+        safe = {key: value for key, value in data.items() if key not in {"encrypted_pan"}}
+        labels = {
+            "terms": "پیش‌نمایش قوانین",
+            "rate": "پیش‌نمایش نرخ",
+            "pricing": "پیش‌نمایش فرمول قیمت‌گذاری",
+            "merchant": "پیش‌نمایش کارت مقصد",
+            "category": "پیش‌نمایش دسته‌بندی",
+            "product": "پیش‌نمایش محصول",
+            "page": "پیش‌نمایش صفحه سفارشی",
+            "button": "پیش‌نمایش دکمه",
+            "delivery": "پیش‌نمایش تحویل",
+            "appearance": "پیش‌نمایش ظاهر پنل",
+        }
+        return (
+            labels.get(kind, "پیش‌نمایش")
+            + "\n\n"
+            + "\n".join(f"{key}: {value}" for key, value in safe.items())
+        )
+
+    async def product_preview(data: dict, actor: int) -> str:
+        commercial = await repo.product_commercial_preview(actor, data)
+        names = {
+            "USD": "دلار آمریکا",
+            "RUB": "روبل روسیه",
+            "EUR": "یورو",
+            "TRY": "لیر ترکیه",
+            "AED": "درهم امارات",
+            "GBP": "پوند بریتانیا",
+            "CNY": "یوان چین",
+            "INR": "روپیه هند",
+            "SGD": "دلار سنگاپور",
+            "EGP": "پوند مصر",
+        }
+        rate = commercial["rate"]
+        currency = data["base_cost_currency"]
+        stock = "نامحدود" if data.get("unlimited_stock") else f"{data.get('stock', 0):,} عدد"
+        return (
+            "پیش‌نمایش محصول\n\n"
+            f"دسته‌بندی: {commercial['category']}\n"
+            f"نام محصول: {data['title']}\n"
+            f"هزینه خرید: {Decimal(data['base_cost_amount']):,} {names.get(currency, currency)}\n"
+            f"نرخ فعلی: هر ۱ {names.get(currency, currency)} = {rate.toman_per_unit:,.0f} تومان\n"
+            f"زمان دریافت نرخ: {rate.provider_timestamp.isoformat()}\n"
+            f"هزینه خرید به تومان: {commercial['purchase_cost_toman']:,.0f} تومان\n"
+            f"حاشیه تبدیل ارز: {commercial['buffer_percent']}٪\n"
+            f"درصد سود: {commercial['markup_percent']}٪\n"
+            f"قیمت نهایی فروش: {commercial['final_toman']:,} تومان\n"
+            f"مدت: {data['duration']}\n"
+            f"موجودی: {stock}\n"
+            f"احراز هویت: {'لازم است' if data.get('requires_kyc') else 'لازم نیست'}\n"
+            "وضعیت: فعال"
+        )
+
+    async def finish_wizard(message: Message, actor: int, draft: dict) -> None:
+        kind, data = draft["kind"], draft["data"]
+        if kind == "terms":
+            body = data["body"] + (f"\f{data['extra']}" if data.get("extra") else "")
+            await repo.publish_terms(actor, data["title"], body)
+        elif kind == "rate":
+            await repo.set_currency_rate(
+                actor,
+                data["currency_code"],
+                data["rate"],
+                buffer_percent=data.get("buffer_percent", "0"),
+            )
+            suspended = await repo.coordinator.redis.get(f"suspended-product:{actor}")
+            if suspended:
+                await repo.coordinator.redis.delete(f"suspended-product:{actor}")
+                product_draft = json.loads(suspended)
+                await set_wizard(message, actor, "product", 3, product_draft["data"])
+                return
+        elif kind == "pricing":
+            config = {
+                "mode": "markup",
+                "markup": data["percent"],
+                "target_margin": "0",
+                "platform_fee": "0",
+                "payment_fee": "0",
+                "warranty_reserve": "0",
+                "fixed_cost_toman": 0,
+                "rounding_increment_toman": int(data["rounding_increment_toman"]),
+            }
+            if data.get("product_id"):
+                await repo.set_product_pricing_override(actor, UUID(data["product_id"]), config)
+            else:
+                await repo.set_pricing(actor, config)
+        elif kind == "kyc_page":
+            await repo.set_kyc_page(actor, data)
+        elif kind == "merchant":
+            await repo.create_merchant_card_encrypted(
+                actor,
+                data["bank"],
+                data["holder"],
+                data["encrypted_pan"],
+                data["masked_pan"],
+                int(data["priority"]),
+                int(data.get("daily_limit", 0)),
+                bool(data["active"]),
+            )
+        elif kind == "merchant_edit":
+            await repo.update_merchant_card(
+                actor,
+                UUID(data["editing_id"]),
+                bank_name=data["bank"],
+                holder_name=data["holder"],
+                priority=int(data["priority"]),
+                daily_limit=int(data.get("daily_limit", 0)),
+                active=bool(data["active"]),
+            )
+        elif kind == "category":
+            if data.get("editing_id"):
+                row = await repo.update_category(
+                    actor,
+                    UUID(data["editing_id"]),
+                    title=data["title"],
+                    description=data.get("description"),
+                    position=int(data["position"]),
+                    active=bool(data["active"]),
+                )
+            else:
+                row = await repo.create_category(
+                    actor, data["title"], data.get("description"), int(data["position"])
+                )
+            await repo.set_entity_emoji(actor, "category", row.id, data.get("emoji"))
+            if not data["active"]:
+                await repo.update_category(actor, row.id, active=False)
+        elif kind == "product":
+            values = {
+                "title": data["title"],
+                "description": data["description"],
+                "base_cost_amount": data["base_cost_amount"],
+                "base_cost_currency": data["base_cost_currency"],
+                "currency_buffer_percent": data.get("currency_buffer_percent", "0"),
+                "fixed_price_toman": data.get("fixed_price_toman"),
+                "duration": data.get("duration"),
+                "plan_type": data.get("plan_type"),
+                "activation_method": None,
+                "warranty_text": data.get("warranty_text"),
+                "warranty_days": 0,
+                "delivery_minutes": 0,
+                "stock": int(data.get("stock", 0)),
+                "unlimited_stock": bool(data.get("unlimited_stock")),
+                "requires_kyc": bool(data.get("requires_kyc", True)),
+                "position": 0,
+            }
+            pricing_mode = data.get("pricing_mode", "inherit")
+            if pricing_mode == "fixed":
+                values["fixed_price_toman"] = int(data["pricing_value"])
+            elif pricing_mode in {"markup", "target_margin"}:
+                values["pricing_override"] = {
+                    "mode": pricing_mode,
+                    "markup": data["pricing_value"] if pricing_mode == "markup" else "0",
+                    "target_margin": (
+                        data["pricing_value"] if pricing_mode == "target_margin" else "0"
+                    ),
+                    "platform_fee": "0",
+                    "payment_fee": "0",
+                    "warranty_reserve": "0",
+                    "fixed_cost_toman": 0,
+                }
+            if data.get("editing_id"):
+                values["category_id"] = UUID(data["category_id"])
+                values["active"] = bool(data.get("active", True))
+                row = await repo.update_product(actor, UUID(data["editing_id"]), values)
+            else:
+                row = await repo.create_product(actor, UUID(data["category_id"]), values)
+                if not data.get("active", True):
+                    row = await repo.update_product(actor, row.id, {"active": False})
+            await repo.set_entity_emoji(actor, "product", row.id, None)
+        elif kind == "page":
+            # The internal key is generated and is never requested from the owner.
+            slug = "page-" + re.sub(r"[^a-z0-9]+", "-", data["title"].lower()).strip("-")
+            if slug == "page-":
+                slug += uuid4().hex[:10]
+            await repo.create_page(
+                actor, slug[:100], data["title"], data["content"], bool(data["active"])
+            )
+        elif kind == "button":
+            values = {
+                "text": data["text"],
+                "action": data.get("action", "catalog"),
+                "row": int(data.get("row", 0)),
+                "position": int(data.get("position", 0)),
+                "style": data.get("style", "default"),
+                "custom_emoji_id": data.get("emoji"),
+            }
+            if data.get("button_id"):
+                await repo.update_page_button(actor, UUID(data["button_id"]), values)
+            else:
+                await repo.create_page_button(
+                    actor,
+                    UUID(data["page_id"]),
+                    values["text"],
+                    values["action"],
+                    values["row"],
+                    values["position"],
+                    values["style"],
+                    values["custom_emoji_id"],
+                )
+        elif kind == "delivery":
+            await repo.deliver(
+                actor, UUID(data["order_id"]), data["content"], data.get("activation_link")
+            )
+        elif kind == "appearance":
+            await repo.set_admin_button_preference(actor, data["action"], data)
+        await clear_actor_state(actor)
+        await admin_home(message, actor)
+
+    async def handle_wizard_choice(message: Message, actor: int, value: str) -> None:
+        repo.owner(actor)
+        draft = await load_draft(actor)
+        if not draft:
+            raise AccessDenied("FORM_EXPIRED")
+        kind, step, data = draft["kind"], draft["step"], draft["data"]
+        if value == "confirm":
+            await finish_wizard(message, actor, draft)
+            return
+        if kind == "pricing" and step == 1:
+            data["rounding_increment_toman"], step = int(value), 2
+        elif kind == "rate" and step == 0:
+            data["currency_code"], step = value, 1
+        elif kind == "merchant" and step == 3:
+            data["priority"], step = int(value), 4
+        elif kind == "merchant" and step == 4:
+            if value == "limit":
+                step = 40
+            else:
+                data["daily_limit"], step = 0, 5
+        elif kind == "merchant" and step == 5:
+            data["active"], step = bool(int(value)), 6
+        elif kind == "merchant_edit" and step == 2:
+            data["priority"], step = int(value), 3
+        elif kind == "merchant_edit" and step == 3:
+            if value == "limit":
+                step = 40
+            else:
+                data["daily_limit"], step = 0, 4
+        elif kind == "merchant_edit" and step == 4:
+            data["active"], step = bool(int(value)), 5
+        elif kind == "category" and step == 2:
+            data["active"], step = bool(int(value)), 3
+        elif kind == "category" and step == 3:
+            data["position"], step = int(value), 4
+        elif kind == "category" and step == 4:
+            data["emoji"], step = value or None, 5
+        elif kind == "kyc_page" and step == 8:
+            data["style"], step = value, 9
+        elif kind == "kyc_page" and step == 9:
+            data["emoji"], step = value or None, 10
+        elif kind == "product" and step == 3:
+            rates = {item.currency_code for item in await repo.active_currency_rates(actor)}
+            if value not in rates:
+                configure = await repo.coordinator.issue_callback(
+                    "admin.product.configure_rate", actor, value, one_time=True
+                )
+                await answer_keyboard(
+                    message,
+                    f"برای ارز {value} هنوز نرخ معتبر فعالی وجود ندارد. "
+                    "ابتدا نرخ را ثبت یا دریافت کنید؛ پیش‌نویس محصول حفظ می‌شود.",
+                    [
+                        [Button("تنظیم نرخ این ارز", configure, "primary")],
+                        await wizard_buttons(actor),
+                    ],
+                )
+                return
+            data["base_cost_currency"] = value
+            data["currency_buffer_percent"] = "0"
+            step = 4
+        elif kind == "product" and step == 5:
+            data["unlimited_stock"] = value == "unlimited"
+            step = 7 if value == "unlimited" else 120
+        elif kind == "product" and step == 7:
+            data["requires_kyc"], step = bool(int(value)), 8
+        elif kind == "page" and step == 2:
+            data["active"], step = bool(int(value)), 3
+        elif kind == "appearance" and step == 1:
+            data["style"], step = value, 2
+        elif kind == "appearance" and step == 2:
+            data["emoji"], step = value or None, 3
+        elif kind == "appearance" and step == 3:
+            data["row"], step = int(value), 4
+        elif kind == "appearance" and step == 4:
+            data["order"], step = int(value), 5
+        elif kind == "button" and step == 1:
+            step = 20 if value == "url" else 2
+            if value != "url":
+                data["action"] = value
+        elif kind == "button" and step == 2:
+            data["style"], step = value, 3
+        elif kind == "button" and step == 3:
+            data["emoji"], step = value or None, 4
+        elif kind == "button" and step == 4:
+            data["row"], data["position"], step = int(value), 0, 5
+        else:
+            data["choice"], step = value, step + 1
+        await set_wizard(message, actor, kind, step, data)
+
+    async def require_current_wizard_callback(actor: int, state: dict) -> dict:
+        draft = await load_draft(actor)
+        if not draft or int(state.get("v", -1)) != int(draft.get("version", -2)):
+            raise AccessDenied("WIZARD_DRAFT_CHANGED")
+        return draft
+
+    async def admin_home(message: Message, actor_id: int) -> None:
+        repo.owner(actor_id)
+        status = await repo.setup_status(actor_id)
+        preferences = (
+            await repo.admin_button_preferences(actor_id)
+            if hasattr(repo, "admin_button_preferences")
+            else {}
+        )
+
+        def mark(ready: bool) -> str:
+            return "کامل" if ready else "نیازمند تنظیم"
+
+        names = (
+            "terms",
+            "rate",
+            "pricing",
+            "category",
+            "product",
+            "merchant",
+            "kyc",
+            "cards",
+            "orders",
+            "page",
+            "emoji",
+            "appearance",
+            "kyc_page",
+            "management",
+            "audit",
+            "close",
+        )
+        actions = [
+            await repo.coordinator.issue_callback(f"admin.{name}", actor_id, one_time=False)
+            for name in names
+        ]
+        defaults = {
+            "terms": (f"قوانین فروشگاه — {mark(status['terms'])}", "primary", 0),
+            "rate": (f"نرخ ارزها — {mark(status['rate'])}", "default", 1),
+            "pricing": (f"فرمول قیمت‌گذاری — {mark(status['pricing'])}", "default", 2),
+            "merchant": (f"کارت مقصد — {mark(status['merchant'])}", "default", 3),
+            "category": (f"دسته‌بندی — {mark(status['category'])}", "default", 4),
+            "product": (f"محصول — {mark(status['product'])}", "default", 5),
+            "kyc": ("احراز هویت", "default", 6),
+            "cards": ("کارت‌ها", "default", 6),
+            "orders": ("سفارش‌ها", "success", 7),
+            "page": ("صفحات سفارشی", "default", 8),
+            "emoji": ("Premium Emoji", "default", 9),
+            "appearance": ("ظاهر پنل", "primary", 10),
+            "kyc_page": ("صفحه احراز هویت", "primary", 11),
+            "management": ("مرکز بررسی و اعلان‌ها", "primary", 12),
+            "audit": ("گزارش فعالیت‌ها", "default", 13),
+            "close": ("بازگشت", "danger", 14),
+        }
+        grouped: dict[int, list[tuple[int, Button]]] = {}
+        for index, name in enumerate(names):
+            label, style, row = defaults[name]
+            pref = preferences.get(name, {})
+            icon = await repo.resolve_emoji_key(pref.get("emoji")) if pref.get("emoji") else None
+            button = Button(
+                pref.get("label", label), actions[index], pref.get("style", style), icon
+            )
+            grouped.setdefault(int(pref.get("row", row)), []).append(
+                (int(pref.get("order", index)), button)
+            )
+        rows = [[item[1] for item in sorted(grouped[row])] for row in sorted(grouped)]
+        fx_label = (
+            "Navasan خودکار"
+            if getattr(repo, "fx_mode", "manual") == "navasan"
+            else "حالت دستی اضطراری"
+        )
+        await answer_rich_keyboard(
+            message,
+            "پنل مدیریت\n\n"
+            f"وضعیت آمادگی فروشگاه: {'آماده فروش' if all(status.values()) else 'نیازمند تکمیل'}\n"
+            f"نرخ ارز: {fx_label}",
+            rows,
+        )
+
+    async def home(message: Message, actor_id: int) -> None:
+        config = await repo.storefront_config() if hasattr(repo, "storefront_config") else {}
+        actions = {}
+        for action in ("catalog", "account", "support", "my_orders", "begin_kyc", "begin_card"):
+            actions[action] = await repo.coordinator.issue_callback(action, actor_id)
+        labels = config.get("labels", {})
+        button_config = config.get("buttons", {})
+
+        async def storefront_button(slot: str, label: str, action: str, style: str = "default"):
+            configured = button_config.get(slot, {})
+            icon = (
+                await repo.resolve_emoji_key(configured.get("emoji"))
+                if configured.get("emoji")
+                else None
+            )
+            return Button(
+                configured.get("label", label),
+                actions[action],
+                configured.get("style", style),
+                icon,
+            )
+
+        await answer_rich_keyboard(
+            message,
+            (
+                f"{config.get('title', 'به فروشگاه خوش آمدید')}\n\n"
+                f"{config.get('introduction', 'محصول موردنظر خود را از فروشگاه انتخاب کنید.')}\n"
+                f"{config.get('benefits', '')}"
+            ).strip(),
+            [
+                [
+                    await storefront_button(
+                        "catalog",
+                        labels.get("catalog", "فروشگاه و خرید اشتراک"),
+                        "catalog",
+                        "primary",
+                    )
+                ],
+                [
+                    await storefront_button(
+                        "orders", labels.get("orders", "سفارش‌های من"), "my_orders"
+                    ),
+                    await storefront_button(
+                        "account", labels.get("account", "حساب کاربری"), "account"
+                    ),
+                ],
+                [await storefront_button("kyc", "احراز هویت", "begin_kyc")],
+                [await storefront_button("support", labels.get("support", "پشتیبانی"), "support")],
+            ],
+        )
+
+    async def customer_navigation(actor: int, parent: str = "home") -> list[Button]:
+        back = await repo.coordinator.issue_callback(f"nav.{parent}", actor, one_time=False)
+        main = await repo.coordinator.issue_callback("nav.home", actor, one_time=False)
+        return [Button("بازگشت", back), Button("منوی اصلی", main, "primary")]
+
+    async def kyc_page_config() -> dict:
+        if hasattr(repo, "kyc_page"):
+            return await repo.kyc_page()
+        return {
+            "title": "احراز هویت",
+            "explanation": "برای تکمیل خرید، مدرک هویتی خود را ارسال کنید.",
+            "privacy": "اطلاعات فقط برای بررسی درخواست استفاده می‌شود.",
+            "review_time": "درخواست پس از بررسی دستی نتیجه‌گیری می‌شود.",
+            "start_label": "شروع احراز هویت",
+            "style": "primary",
+        }
+
+    @router.message(Command("start"))
+    async def start(message: Message) -> None:
+        await clear_actor_state(message.from_user.id)
+        if not await repo.coordinator.rate_limit("start", message.from_user.id, 10, 60):
+            await message.answer("درخواست‌های شما بیش از حد مجاز است.")
+            return
+        async with repo.sessions.begin() as session:
+            await repo.user(
+                message.from_user.id,
+                session,
+                username=getattr(message.from_user, "username", None),
+                display_name=getattr(message.from_user, "full_name", None),
+            )
+            terms = await repo.current_terms(session)
+            accepted = terms and await repo.has_current_consent(message.from_user.id, session)
+        if not terms:
+            await message.answer("فروشگاه هنوز راه‌اندازی نشده است.")
+            return
+        if accepted:
+            await home(message, message.from_user.id)
+            return
+        token = await repo.coordinator.issue_callback(
+            "consent",
+            message.from_user.id,
+            str(terms.id),
+            terms.version,
+            one_time=True,
+        )
+        await answer_rich_keyboard(
+            message,
+            f"{terms.title}\n\n{terms.pages[0]}",
+            [[Button("تأیید قوانین", token, "success")]],
+        )
+
+    @router.message(Command("setup_admin_group"))
+    async def setup_admin_group(message: Message) -> None:
+        try:
+            repo.owner(message.from_user.id)
+            if message.chat.type != "supergroup":
+                await message.answer("این دستور باید داخل یک سوپرگروه خصوصی اجرا شود.")
+                return
+            if getattr(message.chat, "username", None):
+                await message.answer(
+                    "مرکز بررسی باید یک سوپرگروه خصوصی و بدون نام کاربری عمومی باشد."
+                )
+                return
+            if not getattr(message.chat, "is_forum", False):
+                await message.answer("ابتدا Topics را در تنظیمات این سوپرگروه فعال کنید.")
+                return
+            me = await message.bot.get_me()
+            membership = await message.bot.get_chat_member(message.chat.id, me.id)
+            member_status = getattr(membership.status, "value", membership.status)
+            if member_status not in {"administrator", "creator"} or not getattr(
+                membership, "can_manage_topics", False
+            ):
+                await message.answer(
+                    "ربات باید مدیر گروه باشد و اجازه مدیریت Topic، "
+                    "ارسال رسانه و پیام را داشته باشد."
+                )
+                return
+            existing = await repo.management_group(message.from_user.id)
+            topics = (
+                dict(existing.get("topics", {}))
+                if existing and int(existing["chat_id"]) == message.chat.id
+                else {}
+            )
+            names = {
+                "orders": "سفارش‌ها و پرداخت‌ها",
+                "kyc": "احراز هویت کاربران",
+                "cards": "بررسی کارت‌های بانکی",
+                "system": "هشدارهای سیستم",
+                "users": "کاربران و ورودهای جدید",
+            }
+            for key, title in names.items():
+                if not topics.get(key):
+                    created = await message.bot.create_forum_topic(message.chat.id, title)
+                    topics[key] = created.message_thread_id
+            await repo.configure_management_group(message.from_user.id, message.chat.id, topics)
+            await message.answer("مرکز مدیریت و چهار Topic بررسی با موفقیت متصل شدند.")
+        except AccessDenied:
+            await message.answer("فقط مالک فروشگاه اجازه راه‌اندازی مرکز مدیریت را دارد.")
+        except TelegramBadRequest:
+            await message.answer(
+                "ساخت Topic انجام نشد؛ دسترسی‌های ربات و فعال بودن Forum را بررسی کنید."
+            )
+
+    @router.callback_query(F.data.startswith("c1."))
+    async def callback(query: CallbackQuery) -> None:
+        try:
+            state = await repo.coordinator.resolve_callback(query.data, query.from_user.id)
+            if state["a"] == "consent":
+                await repo.accept_terms(query.from_user.id, UUID(state["o"]))
+                await home(query.message, query.from_user.id)
+            elif state["a"] == "admin.wizard.choice":
+                await require_current_wizard_callback(query.from_user.id, state)
+                await handle_wizard_choice(query.message, query.from_user.id, state["o"])
+            elif state["a"] == "admin.product.confirm":
+                draft = await load_draft(query.from_user.id)
+                if (
+                    not draft
+                    or draft.get("kind") != "product"
+                    or draft.get("step") != 8
+                    or int(state["o"]) != int(draft.get("version", -1))
+                ):
+                    raise AccessDenied("PRODUCT_DRAFT_CHANGED")
+                await finish_wizard(query.message, query.from_user.id, draft)
+            elif state["a"] == "admin.wizard.skip":
+                draft = await require_current_wizard_callback(query.from_user.id, state)
+                kind, step, data = draft["kind"], draft["step"], draft["data"]
+                fields = {
+                    "terms": ["title", "body", "extra"],
+                    "rate": [None, "rate", "buffer_percent"],
+                    "pricing": pricing_fields,
+                    "category": ["title", "description"],
+                    "product": [
+                        "title",
+                        "description",
+                        "base_cost_amount",
+                        None,
+                        "duration",
+                    ],
+                    "delivery": ["content", "activation_link"],
+                    "button": ["text"],
+                    "kyc_page": [
+                        "title",
+                        "explanation",
+                        "documents",
+                        "reason",
+                        "privacy",
+                        "review_time",
+                        "support_target",
+                        "start_label",
+                    ],
+                }
+                if kind == "product" and step == 31:
+                    data["currency_buffer_percent"] = "0"
+                    await set_wizard(query.message, query.from_user.id, kind, 4, data)
+                    return
+                index = step
+                field = fields.get(kind, [])[index]
+                if field:
+                    data[field] = "0" if kind in {"pricing", "rate"} else None
+                await set_wizard(query.message, query.from_user.id, kind, step + 1, data)
+            elif state["a"] == "admin.wizard.back":
+                draft = await require_current_wizard_callback(query.from_user.id, state)
+                if draft["step"] == 40:
+                    draft["step"] = 4 if draft["kind"] == "merchant" else 3
+                elif draft["step"] == 31:
+                    draft["step"] = 3
+                elif draft["step"] == 120:
+                    draft["step"] = 5
+                elif draft["step"] == 160:
+                    draft["step"] = 17
+                else:
+                    draft["step"] = max(0, draft["step"] - 1)
+                await set_wizard(
+                    query.message, query.from_user.id, draft["kind"], draft["step"], draft["data"]
+                )
+            elif state["a"] == "admin.wizard.cancel":
+                repo.owner(query.from_user.id)
+                await clear_actor_state(query.from_user.id)
+                await admin_home(query.message, query.from_user.id)
+            elif state["a"] == "catalog":
+                rows = []
+                for category in await repo.categories():
+                    token = await repo.coordinator.issue_callback(
+                        "category", query.from_user.id, str(category.id)
+                    )
+                    icon = await repo.resolve_emoji_key(category.custom_emoji_id)
+                    rows.append([Button(category.title, token, "default", icon)])
+                if rows:
+                    rows.append(await customer_navigation(query.from_user.id))
+                    await answer_keyboard(query.message, "دسته‌بندی‌ها", rows)
+                else:
+                    await query.message.answer("دسته فعالی وجود ندارد.")
+            elif state["a"] == "account":
+                if hasattr(repo, "account_summary"):
+                    summary = await repo.account_summary(query.from_user.id)
+                else:
+                    async with repo.sessions.begin() as session:
+                        user = await repo.user(query.from_user.id, session)
+                    cards = await repo.verified_cards(query.from_user.id)
+                    orders = await repo.customer_orders(query.from_user.id)
+                    summary = {
+                        "public_code": "ثبت‌شده",
+                        "kyc_status": user.kyc_status,
+                        "verified_cards": len(cards),
+                        "total_orders": len(orders),
+                        "active_orders": len(orders),
+                        "created_at": None,
+                    }
+                statuses = {
+                    "NOT_STARTED": "شروع نشده",
+                    "PENDING": "در انتظار بررسی",
+                    "UNDER_REVIEW": "در حال بررسی",
+                    "REJECTED": "رد شده",
+                    "VERIFIED": "تأیید شده",
+                    "BLOCKED": "مسدود",
+                }
+                registered_at = (
+                    summary["created_at"].date().isoformat() if summary["created_at"] else "ثبت‌شده"
+                )
+                await answer_keyboard(
+                    query.message,
+                    "حساب کاربری\n\n"
+                    f"نام: {getattr(query.from_user, 'full_name', 'کاربر فروشگاه')}\n"
+                    f"شماره مشتری: {summary['public_code']}\n"
+                    f"احراز هویت: {statuses.get(summary['kyc_status'], 'نامشخص')}\n"
+                    f"کارت‌های تأییدشده: {summary['verified_cards']}\n"
+                    f"همه سفارش‌ها: {summary['total_orders']}\n"
+                    f"سفارش‌های فعال: {summary['active_orders']}\n"
+                    f"تاریخ عضویت: {registered_at}",
+                    [
+                        [
+                            Button(
+                                "سفارش‌های من",
+                                await repo.coordinator.issue_callback(
+                                    "my_orders", query.from_user.id
+                                ),
+                            ),
+                            Button(
+                                "کارت‌های بانکی من",
+                                await repo.coordinator.issue_callback(
+                                    "customer.cards", query.from_user.id
+                                ),
+                            ),
+                        ],
+                        [
+                            Button(
+                                "احراز هویت",
+                                await repo.coordinator.issue_callback(
+                                    "begin_kyc", query.from_user.id
+                                ),
+                            ),
+                            Button(
+                                "پشتیبانی",
+                                await repo.coordinator.issue_callback(
+                                    "support", query.from_user.id
+                                ),
+                            ),
+                        ],
+                        await customer_navigation(query.from_user.id),
+                    ],
+                )
+            elif state["a"] == "my_orders":
+                orders = await repo.customer_orders(query.from_user.id)
+                text_value = (
+                    "\n".join(
+                        f"{getattr(item, 'public_code', 'سفارش')} — {item.amount_toman:,} تومان"
+                        for item in orders
+                    )
+                    or "سفارشی وجود ندارد."
+                )
+                await answer_keyboard(
+                    query.message, text_value, [await customer_navigation(query.from_user.id)]
+                )
+            elif state["a"] == "customer.cards":
+                cards = await repo.customer_cards(query.from_user.id)
+                card_status = {
+                    "PENDING_VERIFICATION": "در انتظار بررسی",
+                    "VERIFIED": "تأیید شده",
+                    "REJECTED": "رد شده",
+                }
+                text_value = (
+                    "\n".join(
+                        f"{item.bank_name} — {item.masked_pan} — "
+                        f"{card_status.get(item.status, 'در حال بررسی')}"
+                        for item in cards
+                    )
+                    or "هنوز کارت بانکی ثبت نشده است."
+                )
+                add = await repo.coordinator.issue_callback("begin_card", query.from_user.id)
+                await answer_keyboard(
+                    query.message,
+                    f"کارت‌های بانکی من\n\n{text_value}",
+                    [
+                        [Button("ثبت کارت جدید", add, "primary")],
+                        await customer_navigation(query.from_user.id, "account"),
+                    ],
+                )
+            elif state["a"] in {"nav.home", "nav.catalog", "nav.account"}:
+                if state["a"] == "nav.home":
+                    await home(query.message, query.from_user.id)
+                elif state["a"] == "nav.account":
+                    account = await repo.coordinator.issue_callback("account", query.from_user.id)
+                    await answer_keyboard(
+                        query.message,
+                        "بازگشت به حساب کاربری",
+                        [
+                            [Button("نمایش حساب کاربری", account, "primary")],
+                            await customer_navigation(query.from_user.id),
+                        ],
+                    )
+                else:
+                    categories_token = await repo.coordinator.issue_callback(
+                        "catalog", query.from_user.id
+                    )
+                    await answer_keyboard(
+                        query.message,
+                        "بازگشت به فروشگاه",
+                        [
+                            [Button("مشاهده دسته‌بندی‌ها", categories_token, "primary")],
+                            await customer_navigation(query.from_user.id),
+                        ],
+                    )
+            elif state["a"] == "support":
+                config = (
+                    await repo.storefront_config() if hasattr(repo, "storefront_config") else {}
+                )
+                await answer_keyboard(
+                    query.message,
+                    config.get(
+                        "support_text", "برای دریافت راهنمایی با پشتیبانی فروشگاه تماس بگیرید."
+                    ),
+                    [await customer_navigation(query.from_user.id)],
+                )
+            elif state["a"] == "admin.management":
+                repo.owner(query.from_user.id)
+                group = await repo.management_group(query.from_user.id)
+                test = await repo.coordinator.issue_callback(
+                    "admin.management.test", query.from_user.id, one_time=True
+                )
+                disconnect = await repo.coordinator.issue_callback(
+                    "admin.management.disconnect", query.from_user.id, one_time=True
+                )
+                await answer_keyboard(
+                    query.message,
+                    "مرکز بررسی و اعلان‌ها\n\n"
+                    + (
+                        "اتصال برقرار است و Topicهای بررسی ذخیره شده‌اند."
+                        if group
+                        else "هنوز متصل نشده است. دستور /setup_admin_group را "
+                        "در سوپرگروه اجرا کنید."
+                    ),
+                    [
+                        [Button("ارسال اعلان آزمایشی", test, "primary")],
+                        [
+                            Button(
+                                "بازسازی Topic گم‌شده",
+                                await repo.coordinator.issue_callback(
+                                    "admin.management.rebuild", query.from_user.id
+                                ),
+                            )
+                        ],
+                        [Button("قطع اتصال", disconnect, "danger")],
+                    ],
+                )
+            elif state["a"] == "admin.management.test":
+                await repo.enqueue_management_test(query.from_user.id)
+                await query.message.answer("اعلان آزمایشی در صف ارسال قرار گرفت.")
+            elif state["a"] == "admin.management.disconnect":
+                await repo.disconnect_management_group(query.from_user.id)
+                await query.message.answer("اتصال مرکز مدیریت قطع شد.")
+            elif state["a"] == "admin.management.rebuild":
+                repo.owner(query.from_user.id)
+                await query.message.answer(
+                    "برای بازسازی Topic گم‌شده، /setup_admin_group را همین‌جا اجرا کنید."
+                )
+            elif state["a"] in {"begin_kyc", "begin_card"}:
+                target = "kyc.document" if state["a"] == "begin_kyc" else "card.bank"
+                if target == "kyc.document":
+                    async with repo.sessions.begin() as session:
+                        user = await repo.user(query.from_user.id, session)
+                    if user.kyc_status in {"PENDING", "UNDER_REVIEW"}:
+                        await answer_keyboard(
+                            query.message,
+                            "مدرک شما ثبت شده و در انتظار بررسی است. ارسال دوباره لازم نیست.",
+                            [await customer_navigation(query.from_user.id)],
+                        )
+                        return
+                await repo.coordinator.redis.set(f"fsm:{query.from_user.id}", target, ex=900)
+                if target == "kyc.document":
+                    page = await kyc_page_config()
+                    await answer_keyboard(
+                        query.message,
+                        f"{page['title']}\n\n{page['explanation']}\n\n{page['privacy']}\n{page['review_time']}\n\n"
+                        "اکنون تصویر یا فایل مدرک هویتی را ارسال کنید.",
+                        [await customer_navigation(query.from_user.id)],
+                    )
+                else:
+                    await query.message.answer("نام بانک را ارسال کنید.")
+            elif state["a"] == "category":
+                rows = []
+                for product in await repo.products(UUID(state["o"])):
+                    token = await repo.coordinator.issue_callback(
+                        "product", query.from_user.id, str(product.id)
+                    )
+                    icon = await repo.resolve_emoji_key(product.custom_emoji_id)
+                    rows.append([Button(product.title, token, "default", icon)])
+                if rows:
+                    rows.append(await customer_navigation(query.from_user.id, "catalog"))
+                    await answer_keyboard(query.message, "محصولات", rows)
+                else:
+                    await query.message.answer("محصول فعالی وجود ندارد.")
+            elif state["a"] == "product":
+                product = await repo.product(UUID(state["o"]))
+                if not product:
+                    raise AccessDenied("PRODUCT_NOT_FOUND")
+                buy = await repo.coordinator.issue_callback(
+                    "buy", query.from_user.id, str(product.id)
+                )
+                await answer_keyboard(
+                    query.message,
+                    f"{product.title}\n\n{product.description}\nمدت: {product.duration or '-'}\n"
+                    f"پلن: {product.plan_type or '-'}\n"
+                    f"فعال‌سازی: {product.activation_method or '-'}\n"
+                    f"گارانتی: {product.warranty_text or '-'}\n"
+                    f"زمان تحویل: {product.delivery_minutes} دقیقه",
+                    [
+                        [Button("خرید", buy, "success")],
+                        await customer_navigation(query.from_user.id, "catalog"),
+                    ],
+                )
+            elif state["a"] == "resume_checkout":
+                product = await repo.product(UUID(state["o"]))
+                if not product:
+                    catalog = await repo.coordinator.issue_callback("catalog", query.from_user.id)
+                    await answer_keyboard(
+                        query.message,
+                        "محصول قبلی دیگر در دسترس نیست؛ دوباره از فروشگاه انتخاب کنید.",
+                        [[Button("بازگشت به فروشگاه", catalog, "primary")]],
+                    )
+                    return
+                buy = await repo.coordinator.issue_callback(
+                    "buy", query.from_user.id, str(product.id), one_time=True
+                )
+                await answer_keyboard(
+                    query.message,
+                    f"ادامه خرید\n\n{product.title}\n{product.description}",
+                    [
+                        [Button("ادامه خرید", buy, "primary")],
+                        await customer_navigation(query.from_user.id, "catalog"),
+                    ],
+                )
+            elif state["a"] == "buy":
+                await repo.coordinator.redis.set(
+                    f"pending-checkout:{query.from_user.id}", state["o"], ex=86400
+                )
+                async with repo.sessions.begin() as session:
+                    user = await repo.user(query.from_user.id, session)
+                if user.risk_status == "BLOCKED":
+                    await answer_keyboard(
+                        query.message,
+                        "امکان خرید برای این حساب وجود ندارد.",
+                        [await customer_navigation(query.from_user.id)],
+                    )
+                    return
+                if user.kyc_status != "VERIFIED":
+                    page = await kyc_page_config()
+                    begin = await repo.coordinator.issue_callback("begin_kyc", query.from_user.id)
+                    detail = (
+                        await repo.kyc_status_detail(query.from_user.id)
+                        if hasattr(repo, "kyc_status_detail")
+                        else {"reason": None}
+                    )
+                    if user.kyc_status in {"PENDING", "UNDER_REVIEW"}:
+                        text_value = "مدرک شما در انتظار بررسی است."
+                    elif user.kyc_status == "REJECTED":
+                        rejection_reason = detail.get("reason") or (
+                            "برای اطلاعات بیشتر با پشتیبانی تماس بگیرید."
+                        )
+                        text_value = (
+                            "درخواست قبلی تأیید نشد. دلیل: "
+                            f"{rejection_reason}\n"
+                            "می‌توانید مدرک اصلاح‌شده را دوباره ارسال کنید."
+                        )
+                    else:
+                        text_value = page["explanation"]
+                    await answer_keyboard(
+                        query.message,
+                        f"{page['title']}\n\n{text_value}",
+                        [
+                            [
+                                Button(
+                                    page.get("start_label", "شروع احراز هویت"),
+                                    begin,
+                                    page.get("style", "primary"),
+                                )
+                            ],
+                            await customer_navigation(query.from_user.id, "catalog"),
+                        ],
+                    )
+                    return
+                rows = []
+                for card in await repo.verified_cards(query.from_user.id):
+                    token = await repo.coordinator.issue_callback(
+                        "quote", query.from_user.id, f"{state['o']}:{card.id}", one_time=True
+                    )
+                    rows.append([Button(f"{card.bank_name} — {card.masked_pan}", token)])
+                has_verified_cards = bool(rows)
+                if not has_verified_cards:
+                    card = await repo.coordinator.issue_callback(
+                        "begin_card", query.from_user.id, one_time=False
+                    )
+                    rows = [[Button("ثبت کارت بانکی", card, "primary")]]
+                await answer_keyboard(
+                    query.message,
+                    "کارت مبدأ تأییدشده را انتخاب کنید."
+                    if has_verified_cards
+                    else "برای ادامه خرید، یک کارت بانکی تأییدشده ثبت کنید.",
+                    rows,
+                )
+            elif state["a"] == "quote":
+                product_id, card_id = map(UUID, state["o"].split(":"))
+                quote = await repo.create_quote(query.from_user.id, product_id, card_id)
+                final = await repo.coordinator.issue_callback(
+                    "final", query.from_user.id, str(quote.id), quote.version, one_time=True
+                )
+                await answer_keyboard(
+                    query.message,
+                    f"چک نهایی\n{quote.snapshot['title']}\nمبلغ: {quote.final_toman} تومان\n"
+                    f"کارت مبدأ: {quote.snapshot['selected_card_bank']} — "
+                    f"{quote.snapshot['selected_card_masked']}\nاعتبار قیمت: ۳۰ دقیقه",
+                    [[Button("تأیید و ادامه", final, "success")]],
+                )
+            elif state["a"] == "final":
+                quote_id = UUID(state["o"])
+                try:
+                    order = await repo.final_check(query.from_user.id, quote_id)
+                except AccessDenied:
+                    requote = await repo.coordinator.issue_callback(
+                        "requote", query.from_user.id, str(quote_id), one_time=True
+                    )
+                    await answer_keyboard(
+                        query.message,
+                        "اعتبار قیمت تمام شده است.",
+                        [[Button("محاسبه قیمت جدید", requote, "primary")]],
+                    )
+                    await query.answer()
+                    return
+                pan, holder = await repo.reveal_destination(query.from_user.id, order.id)
+                await repo.coordinator.redis.set(
+                    f"receipt-order:{query.from_user.id}", str(order.id), ex=1800
+                )
+                await query.message.answer(
+                    f"کارت مقصد: {pan}\nصاحب کارت: {holder}\nمبلغ: {order.amount_toman} تومان\n"
+                    "اکنون تصویر یا فایل رسید را ارسال کنید. رسید به‌تنهایی اثبات پرداخت نیست.",
+                )
+            elif state["a"] == "requote":
+                quote = await repo.requote(query.from_user.id, UUID(state["o"]))
+                final = await repo.coordinator.issue_callback(
+                    "final", query.from_user.id, str(quote.id), quote.version, one_time=True
+                )
+                await answer_keyboard(
+                    query.message,
+                    f"چک نهایی جدید\n{quote.snapshot['title']}\n"
+                    f"مبلغ: {quote.final_toman} تومان\nاعتبار: ۳۰ دقیقه",
+                    [[Button("تأیید و ادامه", final, "success")]],
+                )
+            elif state["a"] in {"admin.kyc", "admin.cards", "admin.orders", "admin.audit"}:
+                repo.owner(query.from_user.id)
+                rows = []
+                if state["a"] == "admin.kyc":
+                    for item in await repo.kyc_queue(query.from_user.id):
+                        approve = await repo.coordinator.issue_callback(
+                            "admin.kyc.approve", query.from_user.id, str(item.id), one_time=True
+                        )
+                        reject = await repo.coordinator.issue_callback(
+                            "admin.kyc.reject", query.from_user.id, str(item.id), one_time=True
+                        )
+                        rows.extend(
+                            [
+                                [
+                                    Button(
+                                        "تأیید احراز هویت "
+                                        f"{getattr(item, 'public_code', 'درخواست')}",
+                                        approve,
+                                        "success",
+                                    )
+                                ],
+                                [
+                                    Button(
+                                        f"رد {getattr(item, 'public_code', 'درخواست')}",
+                                        reject,
+                                        "danger",
+                                    )
+                                ],
+                            ]
+                        )
+                elif state["a"] == "admin.cards":
+                    for item in await repo.card_queue(query.from_user.id):
+                        approve = await repo.coordinator.issue_callback(
+                            "admin.card.approve", query.from_user.id, str(item.id), one_time=True
+                        )
+                        reject = await repo.coordinator.issue_callback(
+                            "admin.card.reject", query.from_user.id, str(item.id), one_time=True
+                        )
+                        rows.extend(
+                            [
+                                [
+                                    Button(
+                                        f"تأیید {item.bank_name} — {item.masked_pan}",
+                                        approve,
+                                        "success",
+                                    )
+                                ],
+                                [Button("رد کارت", reject, "danger")],
+                            ]
+                        )
+                elif state["a"] == "admin.orders":
+                    for item in await repo.order_queue(query.from_user.id):
+                        payment = await repo.payment_for_order(query.from_user.id, item.id)
+                        if payment and payment.receipt_file_id:
+                            await query.message.answer_photo(
+                                payment.receipt_file_id,
+                                caption=(
+                                    f"سفارش: {getattr(item, 'public_code', 'ثبت‌شده')}\n"
+                                    "وضعیت: در انتظار بررسی دستی\n"
+                                    "رسید به‌تنهایی اثبات پرداخت نیست."
+                                ),
+                            )
+                        if item.status in {"AWAITING_RECONCILIATION", "MANUAL_REVIEW"}:
+                            approve = await repo.coordinator.issue_callback(
+                                "admin.payment.approve",
+                                query.from_user.id,
+                                str(item.id),
+                                one_time=True,
+                            )
+                            reject = await repo.coordinator.issue_callback(
+                                "admin.payment.reject",
+                                query.from_user.id,
+                                str(item.id),
+                                one_time=True,
+                            )
+                            rows.extend(
+                                [
+                                    [
+                                        Button(
+                                            f"تأیید پرداخت {getattr(item, 'public_code', 'سفارش')}",
+                                            approve,
+                                            "success",
+                                        )
+                                    ],
+                                    [Button("رد پرداخت", reject, "danger")],
+                                ]
+                            )
+                        elif item.status == "READY_FOR_FULFILLMENT":
+                            claim = await repo.coordinator.issue_callback(
+                                "admin.order.claim", query.from_user.id, str(item.id), one_time=True
+                            )
+                            rows.append(
+                                [
+                                    Button(
+                                        f"دریافت سفارش {getattr(item, 'public_code', 'ثبت‌شده')}",
+                                        claim,
+                                        "primary",
+                                    )
+                                ]
+                            )
+                        elif (
+                            item.status == "PROCESSING"
+                            and item.assigned_admin_id == query.from_user.id
+                        ):
+                            deliver = await repo.coordinator.issue_callback(
+                                "admin.order.deliver",
+                                query.from_user.id,
+                                str(item.id),
+                                one_time=True,
+                            )
+                            rows.append(
+                                [
+                                    Button(
+                                        f"ثبت تحویل {getattr(item, 'public_code', 'سفارش ثبت‌شده')}",
+                                        deliver,
+                                        "success",
+                                    )
+                                ]
+                            )
+                else:
+                    events = await repo.audit_events(query.from_user.id)
+                    audit_labels = {
+                        "kyc.manual_review": "بررسی احراز هویت",
+                        "customer_card.manual_review": "بررسی کارت بانکی",
+                        "payment.manual_approve": "تأیید دستی پرداخت",
+                        "payment.manual_reject": "رد دستی پرداخت",
+                        "order.claim": "دریافت سفارش توسط مدیر",
+                        "order.deliver": "ثبت تحویل سفارش",
+                    }
+                    text = (
+                        "\n".join(
+                            f"{item.at.isoformat()} — "
+                            f"{audit_labels.get(item.action, 'فعالیت مدیریتی')}"
+                            for item in events
+                        )
+                        or "رویدادی وجود ندارد."
+                    )
+                    await query.message.answer(text)
+                if rows:
+                    await answer_keyboard(query.message, "صف بررسی", rows)
+                elif state["a"] != "admin.audit":
+                    await query.message.answer("صف بررسی خالی است.")
+            elif state["a"] == "admin.appearance":
+                repo.owner(query.from_user.id)
+                labels = {
+                    "terms": "قوانین",
+                    "rate": "نرخ ارزها",
+                    "pricing": "قیمت‌گذاری",
+                    "merchant": "کارت مقصد",
+                    "category": "دسته‌بندی",
+                    "product": "محصول",
+                    "kyc": "احراز هویت",
+                    "cards": "کارت‌ها",
+                    "orders": "سفارش‌ها",
+                    "page": "صفحات سفارشی",
+                    "emoji": "Premium Emoji",
+                    "audit": "Audit",
+                }
+                rows = []
+                for action, label in labels.items():
+                    token = await repo.coordinator.issue_callback(
+                        "admin.appearance.action", query.from_user.id, action, one_time=True
+                    )
+                    rows.append([Button(label, token)])
+                await answer_keyboard(
+                    query.message, "ظاهر پنل\nدکمه مورد نظر را انتخاب کنید.", rows
+                )
+            elif state["a"] == "admin.appearance.action":
+                await set_wizard(
+                    query.message, query.from_user.id, "appearance", 0, {"action": state["o"]}
+                )
+            elif state["a"] in {"admin.category", "admin.product", "admin.merchant"}:
+                repo.owner(query.from_user.id)
+                rows = []
+                entity = state["a"].split(".")[-1]
+                if entity == "category":
+                    items = await repo.owner_categories(query.from_user.id)
+                elif entity == "product":
+                    items = await repo.owner_products(query.from_user.id)
+                else:
+                    items = await repo.owner_merchant_cards(query.from_user.id)
+                for item in items:
+                    toggle = await repo.coordinator.issue_callback(
+                        f"admin.{entity}.toggle",
+                        query.from_user.id,
+                        f"{item.id}:{int(not item.active)}",
+                        one_time=True,
+                    )
+                    label = getattr(item, "title", None) or (
+                        f"{item.bank_name} — {item.masked_pan}"
+                    )
+                    rows.append(
+                        [
+                            Button(label, toggle, "success" if item.active else "danger"),
+                        ]
+                    )
+                    edit = await repo.coordinator.issue_callback(
+                        f"admin.{entity}.edit", query.from_user.id, str(item.id), one_time=True
+                    )
+                    rows.append([Button("ویرایش", edit)])
+                    if entity in {"category", "product"}:
+                        choose_emoji = await repo.coordinator.issue_callback(
+                            "admin.entity.emoji",
+                            query.from_user.id,
+                            f"{entity}:{item.id}",
+                            one_time=True,
+                        )
+                        rows.append([Button("انتخاب Premium Emoji", choose_emoji)])
+                    if entity == "product":
+                        pricing = await repo.coordinator.issue_callback(
+                            "admin.product.pricing",
+                            query.from_user.id,
+                            str(item.id),
+                            one_time=True,
+                        )
+                        current_mode = (item.pricing_override or {}).get("mode", "inherit")
+                        rows.append([Button(f"قیمت اختصاصی — {current_mode}", pricing, "primary")])
+                create = await repo.coordinator.issue_callback(
+                    f"admin.{entity}.create", query.from_user.id, one_time=True
+                )
+                rows.append([Button("ایجاد مورد جدید", create, "primary")])
+                await answer_keyboard(query.message, "مدیریت", rows)
+            elif state["a"] == "admin.page":
+                repo.owner(query.from_user.id)
+                rows = []
+                for page in await repo.pages(query.from_user.id):
+                    buttons = await repo.coordinator.issue_callback(
+                        "admin.page.buttons", query.from_user.id, str(page.id), one_time=False
+                    )
+                    rows.append([Button(f"{page.title} — مدیریت دکمه‌ها", buttons)])
+                create = await repo.coordinator.issue_callback(
+                    "admin.page.create", query.from_user.id, one_time=True
+                )
+                rows.append([Button("ایجاد/ویرایش صفحه", create, "primary")])
+                await answer_keyboard(query.message, "صفحه‌ها", rows)
+            elif state["a"] == "admin.entity.emoji":
+                repo.owner(query.from_user.id)
+                entity, object_id = state["o"].split(":", 1)
+                rows = []
+                for emoji in await repo.emojis(query.from_user.id, active_only=True):
+                    select_emoji = await repo.coordinator.issue_callback(
+                        "admin.entity.emoji.select",
+                        query.from_user.id,
+                        f"{entity}:{object_id}:{emoji.name}",
+                        one_time=True,
+                    )
+                    rows.append([Button(emoji.name, select_emoji)])
+                remove = await repo.coordinator.issue_callback(
+                    "admin.entity.emoji.select",
+                    query.from_user.id,
+                    f"{entity}:{object_id}:",
+                    one_time=True,
+                )
+                rows.append([Button("بدون آیکون", remove, "danger")])
+                await answer_keyboard(query.message, "انتخاب ایموجی Registry", rows)
+            elif state["a"] == "admin.entity.emoji.select":
+                repo.owner(query.from_user.id)
+                entity, object_id, emoji_name = state["o"].split(":", 2)
+                await repo.set_entity_emoji(
+                    query.from_user.id, entity, UUID(object_id), emoji_name or None
+                )
+                await query.message.answer("Premium Emoji انتخاب شد.")
+            elif state["a"] == "admin.page.create":
+                await set_wizard(query.message, query.from_user.id, "page", 0, {})
+            elif state["a"] == "admin.page.buttons":
+                repo.owner(query.from_user.id)
+                page_id = UUID(state["o"])
+                rows = []
+                for item in await repo.page_buttons(query.from_user.id, page_id):
+                    toggle = await repo.coordinator.issue_callback(
+                        "admin.button.toggle",
+                        query.from_user.id,
+                        f"{item.id}:{int(not item.active)}",
+                        one_time=True,
+                    )
+                    icon = await repo.resolve_emoji_key(item.custom_emoji_id)
+                    rows.append(
+                        [
+                            Button(
+                                item.text,
+                                toggle,
+                                "success" if item.active else "danger",
+                                icon,
+                            )
+                        ]
+                    )
+                    edit = await repo.coordinator.issue_callback(
+                        "admin.button.edit", query.from_user.id, str(item.id), one_time=True
+                    )
+                    rows.append([Button("ویرایش دکمه", edit)])
+                    emoji = await repo.coordinator.issue_callback(
+                        "admin.button.emoji", query.from_user.id, str(item.id), one_time=True
+                    )
+                    rows.append([Button("انتخاب Premium Emoji", emoji)])
+                create = await repo.coordinator.issue_callback(
+                    "admin.button.create", query.from_user.id, str(page_id), one_time=True
+                )
+                rows.append([Button("ساخت دکمه", create, "primary")])
+                await answer_keyboard(query.message, "دکمه‌های صفحه", rows)
+            elif state["a"] == "admin.button.create":
+                await set_wizard(
+                    query.message, query.from_user.id, "button", 0, {"page_id": state["o"]}
+                )
+            elif state["a"] == "admin.button.edit":
+                await set_wizard(
+                    query.message,
+                    query.from_user.id,
+                    "button",
+                    0,
+                    {"button_id": state["o"], "editing": True},
+                )
+            elif state["a"] == "admin.button.emoji":
+                repo.owner(query.from_user.id)
+                rows = []
+                for emoji in await repo.emojis(query.from_user.id, active_only=True):
+                    select_emoji = await repo.coordinator.issue_callback(
+                        "admin.button.emoji.select",
+                        query.from_user.id,
+                        f"{state['o']}:{emoji.name}",
+                        one_time=True,
+                    )
+                    rows.append([Button(emoji.name, select_emoji)])
+                remove = await repo.coordinator.issue_callback(
+                    "admin.button.emoji.select",
+                    query.from_user.id,
+                    f"{state['o']}:",
+                    one_time=True,
+                )
+                rows.append([Button("بدون آیکون", remove, "danger")])
+                await answer_keyboard(query.message, "انتخاب ایموجی Registry", rows)
+            elif state["a"] == "admin.button.emoji.select":
+                repo.owner(query.from_user.id)
+                button_id, emoji_name = state["o"].split(":", 1)
+                await repo.set_button_emoji(query.from_user.id, UUID(button_id), emoji_name or None)
+                await query.message.answer("Premium Emoji دکمه انتخاب شد.")
+            elif state["a"] == "admin.button.toggle":
+                repo.owner(query.from_user.id)
+                object_id, active_value = state["o"].split(":", 1)
+                await repo.update_page_button(
+                    query.from_user.id,
+                    UUID(object_id),
+                    {"active": bool(int(active_value))},
+                )
+                await query.message.answer("وضعیت دکمه تغییر کرد.")
+            elif state["a"] in {
+                "admin.category.create",
+                "admin.merchant.create",
+            }:
+                kind = state["a"].split(".")[1]
+                await set_wizard(query.message, query.from_user.id, kind, 0, {})
+            elif state["a"] == "admin.product.create":
+                repo.owner(query.from_user.id)
+                rows = []
+                for category in await repo.owner_categories(query.from_user.id):
+                    if not category.active:
+                        continue
+                    choose = await repo.coordinator.issue_callback(
+                        "admin.product.create.category",
+                        query.from_user.id,
+                        str(category.id),
+                        one_time=True,
+                    )
+                    rows.append([Button(category.title, choose)])
+                if rows:
+                    await answer_keyboard(
+                        query.message, "مرحله ۱ از ۱۰\nدسته محصول را انتخاب کنید.", rows
+                    )
+                else:
+                    await query.message.answer("ابتدا یک دسته فعال بسازید.")
+            elif state["a"] == "admin.product.create.category":
+                await set_wizard(
+                    query.message,
+                    query.from_user.id,
+                    "product",
+                    0,
+                    {"category_id": state["o"]},
+                )
+            elif state["a"] == "admin.product.pricing":
+                await set_wizard(
+                    query.message,
+                    query.from_user.id,
+                    "pricing",
+                    0,
+                    {"product_id": state["o"]},
+                )
+            elif state["a"].startswith(
+                ("admin.category.toggle", "admin.product.toggle", "admin.merchant.toggle")
+            ):
+                repo.owner(query.from_user.id)
+                object_id, active_value = state["o"].split(":", 1)
+                active = bool(int(active_value))
+                if state["a"].startswith("admin.category"):
+                    await repo.update_category(query.from_user.id, UUID(object_id), active=active)
+                elif state["a"].startswith("admin.product"):
+                    await repo.update_product(
+                        query.from_user.id, UUID(object_id), {"active": active}
+                    )
+                else:
+                    cards = await repo.owner_merchant_cards(query.from_user.id)
+                    current = next(item for item in cards if item.id == UUID(object_id))
+                    await repo.update_merchant_card(
+                        query.from_user.id,
+                        current.id,
+                        active=active,
+                        priority=current.priority,
+                        daily_limit=current.daily_limit,
+                    )
+                await query.message.answer("وضعیت با موفقیت تغییر کرد.")
+            elif state["a"].startswith(
+                ("admin.category.edit", "admin.product.edit", "admin.merchant.edit")
+            ):
+                repo.owner(query.from_user.id)
+                kind = state["a"].split(".")[1]
+                object_id = UUID(state["o"])
+                if kind == "category":
+                    item = next(
+                        x
+                        for x in await repo.owner_categories(query.from_user.id)
+                        if x.id == object_id
+                    )
+                    data = {
+                        "editing_id": state["o"],
+                        "title": item.title,
+                        "description": item.description or "",
+                        "active": item.active,
+                        "position": item.position,
+                        "emoji": item.custom_emoji_id,
+                    }
+                elif kind == "merchant":
+                    item = next(
+                        x
+                        for x in await repo.owner_merchant_cards(query.from_user.id)
+                        if x.id == object_id
+                    )
+                    data = {
+                        "editing_id": state["o"],
+                        "bank": item.bank_name,
+                        "holder": item.holder_name,
+                        "masked_pan": item.masked_pan,
+                        "active": item.active,
+                        "priority": item.priority,
+                        "daily_limit": item.daily_limit,
+                    }
+                    kind = "merchant_edit"
+                else:
+                    item = next(
+                        x
+                        for x in await repo.owner_products(query.from_user.id)
+                        if x.id == object_id
+                    )
+                    data = {
+                        "editing_id": state["o"],
+                        "category_id": str(item.category_id),
+                        "title": item.title,
+                        "description": item.description,
+                        "base_cost_amount": str(item.base_cost_amount),
+                        "base_cost_currency": item.base_cost_currency,
+                        "currency_buffer_percent": str(item.currency_buffer_percent),
+                        "fixed_price_toman": item.fixed_price_toman,
+                        "duration": item.duration,
+                        "plan_type": item.plan_type,
+                        "activation_method": item.activation_method,
+                        "warranty_text": item.warranty_text,
+                        "warranty_days": item.warranty_days,
+                        "delivery_minutes": item.delivery_minutes,
+                        "stock": item.stock,
+                        "unlimited_stock": item.unlimited_stock,
+                        "requires_kyc": item.requires_kyc,
+                        "active": item.active,
+                        "position": item.position,
+                        "emoji": item.custom_emoji_id,
+                    }
+                await set_wizard(query.message, query.from_user.id, kind, 0, data)
+            elif state["a"] == "admin.terms":
+                await set_wizard(query.message, query.from_user.id, "terms", 0, {})
+            elif state["a"] == "admin.product.configure_rate":
+                repo.owner(query.from_user.id)
+                draft = await load_draft(query.from_user.id)
+                if draft.get("kind") != "product" or draft.get("step") != 3:
+                    raise AccessDenied("PRODUCT_DRAFT_CHANGED")
+                await repo.coordinator.redis.set(
+                    f"suspended-product:{query.from_user.id}",
+                    json.dumps(draft, ensure_ascii=False),
+                    ex=900,
+                )
+                await set_wizard(
+                    query.message,
+                    query.from_user.id,
+                    "rate",
+                    1,
+                    {"currency_code": state["o"]},
+                )
+            elif state["a"] in {
+                "admin.rate",
+                "admin.pricing",
+                "admin.kyc_page",
+            }:
+                await set_wizard(query.message, query.from_user.id, state["a"].split(".")[1], 0, {})
+            elif state["a"].startswith(("admin.kyc.", "admin.card.", "admin.payment.")):
+                repo.owner(query.from_user.id)
+                await repo.coordinator.redis.set(
+                    f"fsm:{query.from_user.id}",
+                    f"{state['a']}:{state['o']}",
+                    ex=900,
+                )
+                await query.message.answer("دلیل تصمیم دستی را ارسال کنید.")
+            elif state["a"] == "admin.order.claim":
+                repo.owner(query.from_user.id)
+                await repo.claim(query.from_user.id, UUID(state["o"]))
+                await query.message.answer("سفارش به شما Assign و وارد PROCESSING شد.")
+            elif state["a"] == "admin.order.deliver":
+                await set_wizard(
+                    query.message,
+                    query.from_user.id,
+                    "delivery",
+                    0,
+                    {"order_id": state["o"]},
+                )
+            elif state["a"] == "admin.delivery.confirm":
+                repo.owner(query.from_user.id)
+                draft_key = f"delivery-draft:{query.from_user.id}:{state['o']}"
+                draft = await repo.coordinator.redis.get(draft_key)
+                if not draft:
+                    raise AccessDenied("DELIVERY_DRAFT_EXPIRED")
+                content, _, activation_link = draft.partition("\0")
+                await repo.deliver(
+                    query.from_user.id,
+                    UUID(state["o"]),
+                    content,
+                    activation_link or None,
+                )
+                await repo.coordinator.redis.delete(draft_key, f"fsm:{query.from_user.id}")
+                await query.message.answer("تحویل ثبت و اعلان مشتری در Outbox قرار گرفت.")
+            elif state["a"] == "admin.close":
+                repo.owner(query.from_user.id)
+                await clear_actor_state(query.from_user.id)
+                await admin_home(query.message, query.from_user.id)
+            elif state["a"] == "admin.emoji":
+                repo.owner(query.from_user.id)
+                rows = []
+                for emoji in await repo.emojis(query.from_user.id):
+                    toggle = await repo.coordinator.issue_callback(
+                        "admin.emoji.toggle",
+                        query.from_user.id,
+                        f"{emoji.id}:{int(not emoji.active)}",
+                        one_time=True,
+                    )
+                    rows.append(
+                        [Button(emoji.name, toggle, "success" if emoji.active else "danger")]
+                    )
+                register = await repo.coordinator.issue_callback(
+                    "admin.emoji.register", query.from_user.id, one_time=True
+                )
+                rows.append([Button("ثبت Premium Emoji", register, "primary")])
+                await answer_keyboard(query.message, "Premium Emoji Registry", rows)
+            elif state["a"] == "admin.emoji.register":
+                repo.owner(query.from_user.id)
+                await repo.coordinator.redis.set(
+                    f"fsm:{query.from_user.id}", "admin.emoji.name", ex=900
+                )
+                await query.message.answer("یک نام کوتاه برای آیکون ثبت کنید.")
+            elif state["a"] == "admin.emoji.toggle":
+                repo.owner(query.from_user.id)
+                emoji_id, active = state["o"].split(":", 1)
+                await repo.set_emoji_active(query.from_user.id, UUID(emoji_id), bool(int(active)))
+                await query.message.answer("وضعیت Premium Emoji تغییر کرد.")
+            await query.answer()
+        except AccessDenied:
+            log.info("callback expired or rejected", extra={"telegram_id": query.from_user.id})
+            draft = await load_draft(query.from_user.id)
+            if draft and draft.get("kind") == "product" and draft.get("step") == 8:
+                await set_wizard(
+                    query.message,
+                    query.from_user.id,
+                    "product",
+                    8,
+                    draft["data"],
+                )
+                await query.answer(
+                    "این دکمه منقضی شده بود؛ پیش‌نمایش با دکمه تازه نمایش داده شد.",
+                    show_alert=True,
+                )
+            else:
+                await query.answer("این درخواست منقضی شده است؛ دوباره تلاش کنید.", show_alert=True)
+        except Exception:
+            log.exception("callback rejected", extra={"telegram_id": query.from_user.id})
+            await query.answer("درخواست معتبر نیست.", show_alert=True)
+
+    @router.message(Command("admin"))
+    async def admin(message: Message) -> None:
+        try:
+            repo.owner(message.from_user.id)
+        except AccessDenied:
+            await message.answer("دسترسی مجاز نیست.")
+            return
+        await clear_actor_state(message.from_user.id)
+        await admin_home(message, message.from_user.id)
+
+    @router.message(Command("setup"))
+    async def setup(message: Message) -> None:
+        await admin(message)
+
+    @router.message(Command("cancel"))
+    async def cancel(message: Message) -> None:
+        await clear_actor_state(message.from_user.id)
+        try:
+            repo.owner(message.from_user.id)
+        except AccessDenied:
+            await start(message)
+        else:
+            await admin_home(message, message.from_user.id)
+
+    @router.message(Command("kyc"))
+    async def begin_kyc(message: Message) -> None:
+        if not await repo.coordinator.rate_limit("kyc", message.from_user.id, 3, 3600):
+            await message.answer("تعداد درخواست‌های KYC بیش از حد مجاز است.")
+            return
+        await repo.coordinator.redis.set(f"fsm:{message.from_user.id}", "kyc.document", ex=900)
+        await message.answer("تصویر یا فایل مدرک هویتی را ارسال کنید.")
+
+    @router.message(Command("admin_emoji"))
+    async def admin_emoji(message: Message) -> None:
+        try:
+            repo.owner(message.from_user.id)
+            parts = message.text.split(maxsplit=1)
+            source = message.reply_to_message
+            identifiers = extract_message_custom_emoji(source)
+            if len(parts) != 2 or not identifiers:
+                raise ValueError("NAME_AND_CUSTOM_EMOJI_REQUIRED")
+            emoji = await repo.register_emoji(message.from_user.id, parts[1], identifiers[0])
+            await message.answer(f"Premium Emoji ثبت شد: {emoji.name}")
+        except Exception:
+            log.exception("emoji registration failed")
+            await message.answer("فرمان را در پاسخ به پیام دارای Custom Emoji ارسال کنید.")
+
+    @router.message(Command("card"))
+    async def begin_card(message: Message) -> None:
+        if not await repo.coordinator.rate_limit("card", message.from_user.id, 3, 3600):
+            await message.answer("تعداد درخواست‌های کارت بیش از حد مجاز است.")
+            return
+        await repo.coordinator.redis.set(f"fsm:{message.from_user.id}", "card.bank", ex=900)
+        await message.answer("نام بانک را بدون اطلاعات محرمانه ارسال کنید.")
+
+    @router.message(F.text)
+    async def form_text(message: Message) -> None:
+        state = await repo.coordinator.redis.get(f"fsm:{message.from_user.id}")
+        if state == "admin.wizard":
+            try:
+                repo.owner(message.from_user.id)
+                draft = await load_draft(message.from_user.id)
+                if not draft:
+                    raise ValueError("FORM_EXPIRED")
+                kind, step, data = draft["kind"], draft["step"], draft["data"]
+                value = normalize_digits(message.text).strip()
+                fields = {
+                    "terms": ["title", "body", "extra"],
+                    "rate": [None, "rate", "buffer_percent"],
+                    "merchant": ["pan", "bank", "holder"],
+                    "merchant_edit": ["bank", "holder"],
+                    "category": ["title", "description"],
+                    "pricing": pricing_fields,
+                    "product": [
+                        "title",
+                        "description",
+                        "base_cost_amount",
+                        None,
+                        "duration",
+                    ],
+                    "page": ["title", "content"],
+                    "button": ["text", "url"],
+                    "delivery": ["content", "activation_link"],
+                    "appearance": ["label"],
+                    "kyc_page": [
+                        "title",
+                        "explanation",
+                        "documents",
+                        "reason",
+                        "privacy",
+                        "review_time",
+                        "support_target",
+                        "start_label",
+                    ],
+                }
+                if kind in {"merchant", "merchant_edit"} and step == 40:
+                    if not value.isdigit() or int(value) <= 0:
+                        raise ValueError("POSITIVE_AMOUNT_REQUIRED")
+                    data["daily_limit"] = int(value)
+                    next_step = 5 if kind == "merchant" else 4
+                elif kind == "product" and step == 160:
+                    number = Decimal(value)
+                    if number < 0 or (data.get("pricing_mode") != "fixed" and number >= 100):
+                        raise ValueError("INVALID_PRODUCT_PRICING")
+                    data["pricing_value"], next_step = str(number), 18
+                elif kind == "product" and step == 31:
+                    number = Decimal(value)
+                    if not Decimal("0") <= number < Decimal("100"):
+                        raise ValueError("INVALID_CURRENCY_BUFFER")
+                    data["currency_buffer_percent"], next_step = str(number), 4
+                elif kind == "button" and step == 20:
+                    if not value.startswith("https://"):
+                        raise ValueError("HTTPS_URL_REQUIRED")
+                    data["action"], next_step = value, 2
+                elif kind == "product" and step == 120:
+                    if not value.isdigit() or int(value) < 0:
+                        raise ValueError("NON_NEGATIVE_NUMBER_REQUIRED")
+                    data["stock"], next_step = int(value), 7
+                else:
+                    index = step
+                    field = fields.get(kind, [])[index]
+                    if not value:
+                        raise ValueError("VALUE_REQUIRED")
+                    if kind == "merchant" and field == "pan":
+                        digits = "".join(char for char in value if char.isdigit())
+                        if not valid_card_number(digits):
+                            raise ValueError("CARD_NUMBER_REQUIRED")
+                        data["encrypted_pan"] = repo.vault.encrypt(digits)
+                        data["masked_pan"] = mask_pan(digits)
+                        with contextlib.suppress(Exception):
+                            await message.delete()
+                    elif kind == "rate":
+                        amount = Decimal(value.replace(",", ""))
+                        if amount < 0 or (field == "rate" and amount == 0):
+                            raise ValueError("POSITIVE_RATE_REQUIRED")
+                        if field == "buffer_percent" and amount >= 100:
+                            raise ValueError("INVALID_CURRENCY_BUFFER")
+                        data[field] = str(amount)
+                    elif kind == "pricing":
+                        number = Decimal(value)
+                        if number < 0 or (field != "fixed_cost_toman" and number >= 100):
+                            raise ValueError("INVALID_PERCENT")
+                        data[field] = str(number)
+                    elif kind == "product" and field in {
+                        "base_cost_amount",
+                        "fixed_price_toman",
+                        "warranty_days",
+                        "delivery_minutes",
+                    }:
+                        number = Decimal(value)
+                        if number < 0:
+                            raise ValueError("NON_NEGATIVE_NUMBER_REQUIRED")
+                        data[field] = int(number) if field != "base_cost_amount" else str(number)
+                    else:
+                        data[field] = value
+                    next_step = step + 1
+                await save_draft(
+                    message.from_user.id, {"kind": kind, "step": next_step, "data": data}
+                )
+                with contextlib.suppress(Exception):
+                    await message.delete()
+                await set_wizard(message, message.from_user.id, kind, next_step, data)
+            except (ValueError, InvalidOperation, IndexError):
+                await message.answer(
+                    "این مقدار معتبر نیست. لطفاً فقط مقدار خواسته‌شده در همین مرحله "
+                    "را با قالب درست ارسال کنید."
+                )
+            except AccessDenied:
+                await message.answer("دسترسی مجاز نیست.")
+        elif state == "admin.emoji.name":
+            try:
+                repo.owner(message.from_user.id)
+                name = message.text.strip()
+                if not name or len(name) > 40:
+                    raise ValueError("INVALID_EMOJI_NAME")
+                await repo.coordinator.redis.set(f"emoji-name:{message.from_user.id}", name, ex=900)
+                await repo.coordinator.redis.set(
+                    f"fsm:{message.from_user.id}", "admin.emoji.media", ex=900
+                )
+                await message.answer(
+                    "اکنون یک پیام دارای Premium Custom Emoji ارسال کنید یا به آن پاسخ دهید."
+                )
+            except (AccessDenied, ValueError):
+                await message.answer("نام باید کوتاه و معتبر باشد.")
+        elif state in {"admin.emoji", "admin.emoji.media"}:
+            try:
+                repo.owner(message.from_user.id)
+                identifiers = extract_message_custom_emoji(message) or extract_message_custom_emoji(
+                    message.reply_to_message
+                )
+                stored_name = await repo.coordinator.redis.get(f"emoji-name:{message.from_user.id}")
+                name = stored_name or message.text.strip()
+                if not name or not identifiers:
+                    raise ValueError("NAME_AND_CUSTOM_EMOJI_REQUIRED")
+                emoji = await repo.register_emoji(message.from_user.id, name, identifiers[0])
+                await clear_actor_state(message.from_user.id)
+                await repo.coordinator.redis.delete(f"emoji-name:{message.from_user.id}")
+                await message.answer(f"Premium Emoji ثبت شد: {emoji.name}")
+            except Exception:
+                log.exception("emoji registration failed")
+                await message.answer("پیام باید پاسخ به یک Premium Custom Emoji معتبر باشد.")
+        elif state and state.startswith(("admin.kyc.", "admin.card.", "admin.payment.")):
+            try:
+                repo.owner(message.from_user.id)
+                action, object_id = state.rsplit(":", 1)
+                approved = action.endswith(".approve")
+                if action.startswith("admin.kyc."):
+                    if action.endswith(".resubmit"):
+                        await repo.request_kyc_resubmission(
+                            message.from_user.id, UUID(object_id), message.text
+                        )
+                    else:
+                        await repo.review_kyc(
+                            message.from_user.id, UUID(object_id), approved, message.text
+                        )
+                elif action.startswith("admin.card."):
+                    await repo.review_card(
+                        message.from_user.id, UUID(object_id), approved, message.text
+                    )
+                else:
+                    await repo.manual_reconcile(
+                        message.from_user.id, UUID(object_id), approved, message.text
+                    )
+                await repo.coordinator.redis.delete(f"fsm:{message.from_user.id}")
+                await message.answer("تصمیم دستی ثبت و Audit شد.")
+            except Exception:
+                log.exception("admin decision failed", extra={"telegram_id": message.from_user.id})
+                await message.answer("ثبت تصمیم انجام نشد.")
+        elif state == "card.bank":
+            await repo.coordinator.redis.set(
+                f"card-bank:{message.from_user.id}", message.text.strip(), ex=900
+            )
+            await repo.coordinator.redis.set(f"fsm:{message.from_user.id}", "card.pan", ex=900)
+            await message.answer(
+                "شماره ۱۶ رقمی کارت را ارسال کنید. CVV2، PIN، OTP یا رمز ارسال نکنید. "
+                "پیام شماره کارت پس از پردازش حذف می‌شود."
+            )
+        elif state == "card.pan":
+            digits = "".join(item for item in message.text if item.isdigit())
+            if len(digits) != 16:
+                await message.answer("شماره کارت باید دقیقاً ۱۶ رقم باشد.")
+                return
+            encrypted = repo.vault.encrypt(digits)
+            await repo.coordinator.redis.set(f"card-pan:{message.from_user.id}", encrypted, ex=900)
+            await repo.coordinator.redis.set(f"fsm:{message.from_user.id}", "card.evidence", ex=900)
+            with contextlib.suppress(Exception):
+                await message.delete()
+            await message.answer("تصویر یا فایل مدرک مالکیت کارت را ارسال کنید.")
+
+    @router.message(F.photo | F.document)
+    async def uploaded_file(message: Message) -> None:
+        if not await repo.coordinator.rate_limit("receipt", message.from_user.id, 5, 300):
+            await message.answer("تعداد ارسال فایل بیش از حد مجاز است.")
+            return
+        try:
+            stored_order = await repo.coordinator.redis.get(f"receipt-order:{message.from_user.id}")
+            obj = message.photo[-1] if message.photo else message.document
+            file_type = "photo" if message.photo else "document"
+            state = await repo.coordinator.redis.get(f"fsm:{message.from_user.id}")
+            if stored_order:
+                await repo.submit_receipt(
+                    message.from_user.id,
+                    UUID(stored_order),
+                    obj.file_id,
+                    obj.file_unique_id,
+                    file_type,
+                    html.escape(getattr(message.from_user, "full_name", "کاربر فروشگاه")),
+                )
+                await repo.coordinator.redis.delete(f"receipt-order:{message.from_user.id}")
+                await message.answer("رسید ثبت شد؛ رسید به‌تنهایی اثبات پرداخت نیست.")
+            elif state == "kyc.document":
+                await repo.submit_kyc(
+                    message.from_user.id,
+                    obj.file_id,
+                    obj.file_unique_id,
+                    file_type,
+                    html.escape(getattr(message.from_user, "full_name", "کاربر فروشگاه")),
+                )
+                await repo.coordinator.redis.delete(f"fsm:{message.from_user.id}")
+                await message.answer("مدرک KYC برای بررسی دستی ثبت شد.")
+            elif state == "card.evidence":
+                bank = await repo.coordinator.redis.get(f"card-bank:{message.from_user.id}")
+                envelope = await repo.coordinator.redis.get(f"card-pan:{message.from_user.id}")
+                if not bank or not envelope:
+                    raise ValueError("CARD_FORM_EXPIRED")
+                card = await repo.submit_customer_card(
+                    message.from_user.id,
+                    bank,
+                    repo.vault.decrypt(envelope),
+                    obj.file_id,
+                    obj.file_unique_id,
+                    file_type,
+                    html.escape(getattr(message.from_user, "full_name", "کاربر فروشگاه")),
+                )
+                await repo.coordinator.redis.delete(
+                    f"fsm:{message.from_user.id}",
+                    f"card-bank:{message.from_user.id}",
+                    f"card-pan:{message.from_user.id}",
+                )
+                await message.answer(
+                    f"کارت {card.bank_name} — {card.masked_pan} برای بررسی ثبت شد."
+                )
+            else:
+                await message.answer("برای این فایل درخواست فعالی وجود ندارد.")
+        except (ValueError, AccessDenied):
+            await message.answer("رسید یا شناسه سفارش معتبر نیست.")
+        except Exception:
+            log.exception("receipt submission failed", extra={"telegram_id": message.from_user.id})
+            await message.answer("ثبت رسید انجام نشد؛ بعداً دوباره تلاش کنید.")
+
+    @router.message()
+    async def unsupported_message(message: Message) -> None:
+        state = await repo.coordinator.redis.get(f"fsm:{message.from_user.id}")
+        receipt_order = await repo.coordinator.redis.get(f"receipt-order:{message.from_user.id}")
+        if state in {"kyc.document", "card.evidence"} or receipt_order:
+            await message.answer("فقط تصویر یا فایل Document پشتیبانی می‌شود.")
+
+    return router
+
+
+class Runtime:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.engine, sessions = create_engine_and_session(settings.database_url)
+        self.redis = Redis.from_url(settings.redis_url, decode_responses=True)
+        self.bot = Bot(settings.bot_token.get_secret_value())
+        self.dispatcher = Dispatcher()
+        vault = Vault({"v1": settings.encryption_key.get_secret_value().encode()}, "v1")
+        self.repo = ShopRepository(
+            sessions,
+            RedisCoordinator(self.redis),
+            vault,
+            settings.hmac_key.get_secret_value().encode(),
+            settings.admin_telegram_user_id,
+            settings.order_notification_chat_id,
+        )
+        self.repo.fx_mode = settings.fx_provider
+        self.dispatcher.include_router(persistent_router(self.repo))
+        self.worker: asyncio.Task | None = None
+        api_key = settings.navasan_api_key.get_secret_value()
+        self.fx_provider = (
+            NavasanRateProvider(
+                api_key,
+                settings.navasan_base_url,
+                connect_timeout=settings.fx_http_connect_timeout,
+                read_timeout=settings.fx_http_read_timeout,
+                retry_limit=settings.fx_retry_limit,
+            )
+            if settings.fx_provider == "navasan" and api_key
+            else None
+        )
+        self.repo.fx_provider = self.fx_provider
+        self.repo.fx_max_age_minutes = settings.fx_max_age_minutes
+        self.next_fx_refresh = self.repo.now()
+
+    async def outbox_worker(self) -> None:
+        from sqlalchemy import select
+
+        from .db import OutboxRow
+
+        while True:
+            try:
+                await self.process_outbox_once(select, OutboxRow)
+                await self.repo.expire_quotes()
+                if self.fx_provider and self.repo.now() >= self.next_fx_refresh:
+                    currencies = {
+                        item.currency_code for item in await self.repo.active_currency_rates()
+                    }
+                    if currencies:
+                        await self.repo.refresh_currency_rates(
+                            self.fx_provider, currencies, self.settings.fx_max_age_minutes
+                        )
+                    self.next_fx_refresh = self.repo.now() + timedelta(
+                        minutes=self.settings.fx_refresh_minutes
+                    )
+            except Exception:
+                log.exception("background worker iteration failed")
+            await asyncio.sleep(2)
+
+    async def process_outbox_once(self, select_fn=None, row_type=None) -> bool:
+        if select_fn is None or row_type is None:
+            from sqlalchemy import select as select_fn
+
+            from .db import OutboxRow as row_type
+        async with self.repo.sessions.begin() as session:
+            row = await session.scalar(
+                select_fn(row_type)
+                .where(
+                    row_type.sent_at.is_(None),
+                    row_type.dead_at.is_(None),
+                    row_type.available_at <= self.repo.now(),
+                )
+                .order_by(row_type.available_at)
+                .with_for_update(skip_locked=True)
+                .limit(1)
+            )
+            if not row:
+                return False
+            try:
+                payload = row.payload
+                message_thread_id = getattr(row, "message_thread_id", None)
+                thread = {"message_thread_id": message_thread_id} if message_thread_id else {}
+                file_id = payload.get("file_id") or payload.get("receipt_file_id")
+                keyboard = None
+                if row.kind in {"KYC_REVIEW", "CARD_REVIEW", "PAYMENT_REVIEW"}:
+                    action_type = {
+                        "KYC_REVIEW": "kyc",
+                        "CARD_REVIEW": "card",
+                        "PAYMENT_REVIEW": "payment",
+                    }[row.kind]
+                    labels = {
+                        "KYC_REVIEW": ("تأیید احراز هویت", "رد درخواست"),
+                        "CARD_REVIEW": ("تأیید کارت بانکی", "رد کارت"),
+                        "PAYMENT_REVIEW": ("تأیید دستی پرداخت", "رد پرداخت"),
+                    }[row.kind]
+                    approve = await self.repo.coordinator.issue_callback(
+                        f"admin.{action_type}.approve",
+                        self.repo.owner_id,
+                        str(getattr(row, "entity_id", "")),
+                        one_time=True,
+                    )
+                    reject = await self.repo.coordinator.issue_callback(
+                        f"admin.{action_type}.reject",
+                        self.repo.owner_id,
+                        str(getattr(row, "entity_id", "")),
+                        one_time=True,
+                    )
+                    review_rows = [
+                        [Button(labels[0], approve, "success"), Button(labels[1], reject, "danger")]
+                    ]
+                    if row.kind in {"KYC_REVIEW", "CARD_REVIEW"}:
+                        resubmit = await self.repo.coordinator.issue_callback(
+                            f"admin.{action_type}.resubmit",
+                            self.repo.owner_id,
+                            str(getattr(row, "entity_id", "")),
+                            one_time=True,
+                        )
+                        review_rows.append([Button("درخواست ارسال مجدد", resubmit, "primary")])
+                    keyboard = markup(review_rows)
+                if file_id:
+                    if row.kind == "KYC_REVIEW":
+                        caption = (
+                            f"درخواست احراز هویت {payload['public_code']}\n"
+                            f"شناسه تلگرام: {payload['telegram_id']}\n"
+                            f"کاربر: {payload.get('safe_identity') or 'ثبت‌نشده'}\n"
+                            f"زمان ثبت: {payload['submitted_at']}\n"
+                            f"وضعیت: {payload['status']}"
+                        )
+                    elif row.kind == "CARD_REVIEW":
+                        caption = (
+                            f"بررسی کارت {payload['public_code']}\n"
+                            f"شناسه تلگرام: {payload['telegram_id']}\n"
+                            f"کاربر: {payload.get('safe_identity') or 'ثبت‌نشده'}\n"
+                            f"زمان ثبت: {payload['submitted_at']}\n"
+                            f"بانک: {payload['bank_name']}\n"
+                            f"شماره کارت: {payload['masked_pan']}"
+                        )
+                    elif row.kind == "PAYMENT_REVIEW" and payload.get("public_code"):
+                        caption = (
+                            f"بررسی پرداخت سفارش {payload['public_code']}\n"
+                            f"محصول: {payload['product_title']}\n"
+                            f"مشتری: {payload.get('safe_identity') or 'ثبت‌نشده'}\n"
+                            f"زمان ارسال: {payload['submitted_at']}\n"
+                            f"مبلغ: {payload['amount_toman']:,} تومان\n"
+                            f"کارت مبدأ: {payload.get('source_bank') or 'نامشخص'} — "
+                            f"{payload.get('source_masked') or 'ثبت نشده'}\n"
+                            "وضعیت: "
+                            f"{'پرداخت دیرهنگام' if payload['late'] else 'در انتظار تطبیق دستی'}\n"
+                            f"{payload['warning']}"
+                        )
+                    else:
+                        caption = "رسید پرداخت ثبت‌شده\nرسید به‌تنهایی اثبات پرداخت نیست."
+                    sender = (
+                        self.bot.send_photo
+                        if payload.get("file_type", "photo") == "photo"
+                        else self.bot.send_document
+                    )
+                    await sender(
+                        row.chat_id, file_id, caption=caption, reply_markup=keyboard, **thread
+                    )
+                else:
+                    if row.kind == "FX_RATE_STALE":
+                        body = (
+                            "نرخ ارز منقضی شده است و فروش جدید آن ارز متوقف شد.\n"
+                            f"ارز: {row.payload['currency']}"
+                        )
+                    elif payload.get("text"):
+                        body = payload["text"]
+                    elif row.kind == "FULFILLMENT_READY":
+                        body = f"سفارش {payload['public_code']} آماده انجام است."
+                    elif row.kind == "ORDER_CLAIMED":
+                        body = f"سفارش {payload['public_code']} توسط مدیر دریافت شد."
+                    elif row.kind == "DELIVERY_RECORDED":
+                        body = f"تحویل سفارش {payload['public_code']} ثبت و برای مشتری ارسال شد."
+                    elif row.kind == "NEW_CUSTOMER":
+                        username = f"@{payload['username']}" if payload.get("username") else "ندارد"
+                        body = (
+                            "کاربر جدید\n"
+                            f"شماره مشتری: {payload['public_code']}\n"
+                            f"نام: {payload.get('display_name') or 'ثبت‌نشده'}\n"
+                            f"نام کاربری: {username}\n"
+                            f"شناسه تلگرام: {payload['telegram_id']}\n"
+                            f"زمان ثبت: {payload['created_at']}\n"
+                            f"احراز هویت: {payload['kyc_status']}"
+                        )
+                    elif row.kind in {"KYC_DECISION", "CARD_DECISION"}:
+                        body = (
+                            "درخواست شما تأیید شد."
+                            if payload["approved"]
+                            else "درخواست شما تأیید نشد. دلیل: "
+                            f"{payload.get('reason') or 'اعلام نشده'}"
+                        )
+                        pending = await self.repo.coordinator.redis.get(
+                            f"pending-checkout:{row.chat_id}"
+                        )
+                        if payload.get("resume") and pending:
+                            resume = await self.repo.coordinator.issue_callback(
+                                "resume_checkout", row.chat_id, pending, one_time=True
+                            )
+                            keyboard = markup([[Button("ادامه خرید", resume, "primary")]])
+                    else:
+                        body = "یک رویداد جدید فروشگاه ثبت شد."
+                    if row.kind == "ORDER_DELIVERED":
+                        body += f"\n\n{row.payload['content']}"
+                        if row.payload.get("activation_link"):
+                            body += f"\n{row.payload['activation_link']}"
+                    await self.bot.send_message(row.chat_id, body, reply_markup=keyboard, **thread)
+                row.sent_at = self.repo.now()
+            except Exception as exc:
+                row.attempts += 1
+                row.last_error = type(exc).__name__
+                if row.attempts >= 8:
+                    row.dead_at = self.repo.now()
+                else:
+                    delay = min(300, 2 ** min(row.attempts, 8))
+                    row.available_at = self.repo.now() + timedelta(seconds=delay)
+            return True
+
+    async def close(self) -> None:
+        if self.worker:
+            self.worker.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.worker
+        await self.bot.session.close()
+        await self.redis.aclose()
+        await self.engine.dispose()
+
+
+def create_app(settings: Settings) -> FastAPI:
+    runtime = Runtime(settings)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        runtime.worker = asyncio.create_task(runtime.outbox_worker())
+        if settings.run_mode == "webhook":
+            await runtime.bot.set_webhook(
+                settings.webhook_url, secret_token=settings.webhook_secret.get_secret_value()
+            )
+        try:
+            yield
+        finally:
+            if settings.run_mode == "webhook":
+                await runtime.bot.delete_webhook()
+            await runtime.close()
+
+    app = FastAPI(title="Telegram commerce core", docs_url=None, redoc_url=None, lifespan=lifespan)
+    app.state.runtime = runtime
+
+    @app.get("/health/live")
+    async def live() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/health/ready")
+    async def ready() -> dict[str, str]:
+        currency_status = "ok"
+        try:
+            async with runtime.repo.sessions() as session:
+                await session.execute(text("SELECT 1"))
+            if not await runtime.redis.ping():
+                raise RuntimeError("redis unavailable")
+            if not settings.bot_token.get_secret_value():
+                raise RuntimeError("bot not configured")
+            rates = await runtime.repo.active_currency_rates()
+            if runtime.fx_provider and (
+                not rates
+                or any(
+                    item.source == "api" and item.valid_until <= runtime.repo.now()
+                    for item in rates
+                )
+            ):
+                currency_status = "degraded"
+        except Exception as exc:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, "dependencies unavailable"
+            ) from exc
+        return {"status": "ready", "currency": currency_status}
+
+    @app.post("/telegram/webhook")
+    async def webhook(
+        request: Request, x_telegram_bot_api_secret_token: str | None = Header(default=None)
+    ) -> dict[str, bool]:
+        expected = settings.webhook_secret.get_secret_value()
+        if not expected or x_telegram_bot_api_secret_token != expected:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "forbidden")
+        update = Update.model_validate(await request.json(), context={"bot": runtime.bot})
+        await runtime.dispatcher.feed_update(runtime.bot, update)
+        return {"ok": True}
+
+    return app

@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+set -euo pipefail
+command -v docker >/dev/null || { echo "Docker is required" >&2; exit 1; }
+docker compose version >/dev/null
+if [[ -e .env ]]; then echo '.env already exists; refusing to overwrite' >&2; exit 1; fi
+NON_INTERACTIVE=${INSTALL_NON_INTERACTIVE:-false}
+if [[ $NON_INTERACTIVE == true ]]; then
+  : "${BOT_TOKEN:?BOT_TOKEN required}" "${ADMIN_ID:?ADMIN_ID required}"
+  ORDER_CHAT=${ORDER_CHAT:-$ADMIN_ID}; RUN_MODE=${RUN_MODE:-polling}
+  WEBHOOK_URL=${WEBHOOK_URL:-}
+  SECURE_PATH=${SECURE_PATH:-/var/lib/shopbot/secure}; BRAND_NAME=${BRAND_NAME:-}
+else
+read -rsp 'Bot token: ' BOT_TOKEN; echo
+fi
+if [[ ${SKIP_BOT_VALIDATION:-false} != true ]]; then python3 - "$BOT_TOKEN" <<'PY'
+import json, sys, urllib.request
+token=sys.argv[1]
+try:
+    data=json.load(urllib.request.urlopen(f"https://api.telegram.org/bot{token}/getMe", timeout=10))
+    if not data.get("ok"): raise RuntimeError
+except Exception:
+    raise SystemExit("Bot token validation failed")
+PY
+fi
+if [[ $NON_INTERACTIVE != true ]]; then
+read -rp 'Admin Telegram user ID: ' ADMIN_ID
+read -rsp 'Navasan API key [leave empty for manual emergency mode]: ' NAVASAN_API_KEY; echo
+RUN_MODE=polling; WEBHOOK_URL=''; SECURE_PATH=/var/lib/shopbot/secure; BRAND_NAME=''
+fi
+ORDER_CHAT=${ORDER_CHAT:-$ADMIN_ID}
+APP_HOST_PORT=${APP_HOST_PORT:-8080}
+SELECTED_PORT=$(python3 scripts/select_port.py "$APP_HOST_PORT")
+if [[ $SELECTED_PORT != "$APP_HOST_PORT" ]]; then
+  echo "Local port $APP_HOST_PORT is occupied; leaving its service untouched and using $SELECTED_PORT." >&2
+fi
+APP_HOST_PORT=$SELECTED_PORT
+FX_PROVIDER=${FX_PROVIDER:-$( [[ -n ${NAVASAN_API_KEY:-} ]] && echo navasan || echo manual )}
+secret(){ openssl rand -base64 48 | tr -d '\n'; }
+command -v openssl >/dev/null || { echo 'openssl is required' >&2; exit 1; }
+POSTGRES_PASSWORD=$(secret); ENCRYPTION_KEY=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '\n')
+umask 077
+cat >.env <<EOF
+BOT_TOKEN=$BOT_TOKEN
+ADMIN_TELEGRAM_USER_ID=$ADMIN_ID
+ORDER_NOTIFICATION_CHAT_ID=$ORDER_CHAT
+APP_HOST_PORT=$APP_HOST_PORT
+RUN_MODE=$RUN_MODE
+WEBHOOK_URL=$WEBHOOK_URL
+WEBHOOK_SECRET=$(secret)
+SECURE_FILE_PATH=$SECURE_PATH
+FX_PROVIDER=$FX_PROVIDER
+NAVASAN_API_KEY=${NAVASAN_API_KEY:-}
+NAVASAN_BASE_URL=${NAVASAN_BASE_URL:-https://api.navasan.tech/latest/}
+FX_REFRESH_MINUTES=${FX_REFRESH_MINUTES:-360}
+FX_MAX_AGE_MINUTES=${FX_MAX_AGE_MINUTES:-720}
+FX_HTTP_CONNECT_TIMEOUT=${FX_HTTP_CONNECT_TIMEOUT:-5}
+FX_HTTP_READ_TIMEOUT=${FX_HTTP_READ_TIMEOUT:-10}
+FX_RETRY_LIMIT=${FX_RETRY_LIMIT:-3}
+BRAND_NAME=$BRAND_NAME
+FEATURE_WALLET=false
+FEATURE_REFERRALS=false
+FEATURE_COOPERATION=false
+FEATURE_MEMBERSHIP_CHECK=false
+PRICE_QUOTE_TTL_MINUTES=30
+POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+DATABASE_URL=postgresql+asyncpg://shop:$POSTGRES_PASSWORD@db:5432/shop
+REDIS_URL=redis://redis:6379/0
+ENCRYPTION_KEY=$ENCRYPTION_KEY
+HMAC_KEY=$(secret)
+CALLBACK_KEY=$(secret)
+EOF
+chmod 600 .env
+docker compose build
+docker compose up -d db redis
+docker compose run --rm app alembic upgrade head
+docker compose run --rm app python -m shopbot.fx_bootstrap
+docker compose up -d
+for _ in {1..60}; do curl -fsS "http://127.0.0.1:$APP_HOST_PORT/health/ready" >/dev/null && break; sleep 2; done
+if ! curl -fsS "http://127.0.0.1:$APP_HOST_PORT/health/ready" >/dev/null; then
+  docker compose logs --tail=200 app >&2; exit 1
+fi
+echo "Installation complete at http://127.0.0.1:$APP_HOST_PORT. Send /admin to the bot."
+echo 'To resume safely after a failure, rerun: docker compose up -d && docker compose run --rm app python -m shopbot.fx_bootstrap'

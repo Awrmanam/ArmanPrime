@@ -1,0 +1,90 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env: {POSTGRES_DB: shop_test, POSTGRES_USER: shop, POSTGRES_PASSWORD: test-only}
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U shop" --health-interval 5s --health-timeout 3s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql+asyncpg://shop:test-only@localhost:5432/shop_test
+      REDIS_URL: redis://localhost:6379/0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12', cache: pip}
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e '.[dev]'
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: alembic upgrade head
+      - run: pytest -q
+      - run: pytest --cov=src --cov-report=term-missing --cov-report=xml --cov-fail-under=80
+      - run: python -m compileall -q src tests migrations
+      - run: alembic downgrade -1 && alembic upgrade head
+      - run: python -c "import redis; r=redis.Redis.from_url('$REDIS_URL'); assert r.ping()"
+      - name: Validate Docker Compose from a clean checkout
+        run: |
+          set -euo pipefail
+          trap 'rm -f .env' EXIT
+          cp .env.example .env
+          python - <<'PY'
+          from pathlib import Path
+          from cryptography.fernet import Fernet
+          import secrets
+
+          path = Path(".env")
+          values = {
+              "BOT_TOKEN": "123456:CI_ONLY_PLACEHOLDER_TOKEN_NOT_A_SECRET",
+              "ADMIN_TELEGRAM_USER_ID": "1",
+              "ORDER_NOTIFICATION_CHAT_ID": "-1",
+              "POSTGRES_PASSWORD": "ci-only-placeholder",
+              "ENCRYPTION_KEY": Fernet.generate_key().decode(),
+              "HMAC_KEY": secrets.token_urlsafe(32),
+              "CALLBACK_KEY": secrets.token_urlsafe(32),
+          }
+          lines = []
+          for line in path.read_text().splitlines():
+              key = line.split("=", 1)[0]
+              lines.append(f"{key}={values[key]}" if key in values else line)
+          path.write_text("\n".join(lines) + "\n")
+          PY
+          chmod 600 .env
+          docker compose config -q
+          rm -f .env
+          test ! -e .env
+      - run: docker build -t shopbot:test .
+      - name: Reject tracked secrets and local environment
+        run: |
+          test ! -e .env
+          ! git ls-files | grep -Fx .env
+          pattern='(^|[^0-9])[0-9]{16}([^0-9]|$)|BOT_TOKEN=[[:space:]]*[0-9]{5,15}:[A-Za-z0-9_-]{30,}|gh[pousr]_[A-Za-z0-9_]{20,}'
+          printf '%s\n' 'card=41111111''11111111' | grep -Eq "$pattern"
+          ! printf '%s\n' '01234567890123456789' | grep -Eq "$pattern"
+          printf '%s\n' 'BOT_TOKEN=123456:ABCDEFGHIJKLMNOP''QRSTUVWXYZabcdefgh' | grep -Eq "$pattern"
+          printf '%s\n' 'ghp_abcdefghijklmnop''qrstuvwxyz123456' | grep -Eq "$pattern"
+          ! git grep -nE "$pattern" -- ':!tests/**' ':!README.md'
+      - uses: gitleaks/gitleaks-action@v2
+        env: {GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'}
